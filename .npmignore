@@ -1,0 +1,16 @@
+# Source & dev files
+src/
+.nuxt/
+node_modules/
+test-results/
+
+# Config files
+tsconfig.json
+vitest.config.ts
+eslint.config.*
+.editorconfig
+.gitignore
+
+# Dev docs
+READ_ME.md
+AGENTS.md

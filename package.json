@@ -1,13 +1,30 @@
 {
     "name": "or3-provider-convex",
     "version": "0.0.1",
+    "description": "Convex sync, storage, and backend provider for OR3 Chat — real-time sync, cloud file storage, rate limiting, background jobs, and workspace management.",
+    "license": "MIT",
     "type": "module",
     "exports": {
-        "./nuxt": "./src/module.ts"
+        ".": {
+            "types": "./dist/types.d.mts",
+            "import": "./dist/module.mjs"
+        },
+        "./nuxt": {
+            "types": "./dist/types.d.mts",
+            "import": "./dist/module.mjs"
+        }
     },
-    "main": "./src/module.ts",
+    "main": "./dist/module.mjs",
+    "types": "./dist/types.d.mts",
+    "typesVersions": {
+        "*": {
+            ".": [
+                "./dist/types.d.mts"
+            ]
+        }
+    },
     "files": [
-        "src",
+        "dist",
         "templates",
         "scripts"
     ],
@@ -15,6 +32,8 @@
         "or3-provider-convex": "./scripts/init.ts"
     },
     "scripts": {
+        "prepack": "nuxt-module-build build",
+        "build": "nuxt-module-build build",
         "type-check": "tsc --noEmit",
         "init": "bun scripts/init.ts",
         "test": "vitest run"
@@ -30,6 +49,7 @@
         "zod": "^3.0.0 || ^4.0.0"
     },
     "devDependencies": {
+        "@nuxt/module-builder": "^1.0.2",
         "@types/node": "^25.2.1",
         "h3": "^1.15.4",
         "pathe": "^2.0.0",
