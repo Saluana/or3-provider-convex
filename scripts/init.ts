@@ -11,9 +11,11 @@
  */
 import { existsSync, cpSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const hostConvexDir = resolve(process.cwd(), 'convex');
-const templateDir = resolve(dirname(import.meta.dir), 'templates', 'convex');
+const templateDir = resolve(__dirname, '..', 'templates', 'convex');
 
 if (!existsSync(templateDir)) {
     console.error('❌ Template directory not found:', templateDir);
