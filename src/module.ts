@@ -2,8 +2,17 @@ import { defineNuxtModule, installModule, addPlugin, addServerPlugin, createReso
 
 export default defineNuxtModule({
     meta: { name: 'or3-provider-convex' },
-    async setup() {
+    async setup(_options, nuxt) {
         const { resolve } = createResolver(import.meta.url);
+        const currentConvex = (nuxt.options as { convex?: { url?: string; manualInit?: boolean } }).convex ?? {};
+        const url = currentConvex.url ?? process.env.VITE_CONVEX_URL ?? '';
+
+        // Keep convex-nuxt config provider-local so host nuxt.config stays provider-agnostic.
+        (nuxt.options as { convex?: { url: string; manualInit: boolean } }).convex = {
+            ...currentConvex,
+            url,
+            manualInit: currentConvex.manualInit ?? !url,
+        };
 
         await installModule('convex-nuxt');
 
