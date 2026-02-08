@@ -9,8 +9,9 @@
  */
 import type { AuthWorkspaceStore } from '~~/server/auth/store/types';
 import type { WorkspaceRole } from '~~/app/core/hooks/hook-types';
-import type { Id } from '~~/convex/_generated/dataModel';
+import type { GenericId as Id } from 'convex/values';
 import { ConvexHttpClient } from 'convex/browser';
+import { convexApi as api } from '../../utils/convex-api';
 import { useRuntimeConfig } from '#imports';
 import {
     isLegacyClerkOnlyError,
@@ -74,7 +75,6 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         email?: string;
         displayName?: string;
     }): Promise<void> {
-        const { api } = await import('~~/convex/_generated/api');
         const convex = getAdminConvexClient(input.provider, input.providerUserId);
 
         const resolved = await convex.query(api.workspaces.resolveSession, {
@@ -122,7 +122,6 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
     async getOrCreateDefaultWorkspace(
         userId: string
     ): Promise<{ workspaceId: string; workspaceName: string }> {
-        const { api } = await import('~~/convex/_generated/api');
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, userId);
 
@@ -144,7 +143,6 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         userId: string;
         workspaceId: string;
     }): Promise<WorkspaceRole | null> {
-        const { api } = await import('~~/convex/_generated/api');
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.userId);
 
@@ -172,7 +170,6 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
             isActive?: boolean;
         }>
     > {
-        const { api } = await import('~~/convex/_generated/api');
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, userId);
 
@@ -199,7 +196,6 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         name: string;
         description?: string | null;
     }): Promise<{ workspaceId: string }> {
-        const { api } = await import('~~/convex/_generated/api');
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.userId);
 
@@ -217,7 +213,6 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         name: string;
         description?: string | null;
     }): Promise<void> {
-        const { api } = await import('~~/convex/_generated/api');
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.userId);
 
@@ -229,7 +224,6 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
     }
 
     async removeWorkspace(input: { userId: string; workspaceId: string }): Promise<void> {
-        const { api } = await import('~~/convex/_generated/api');
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.userId);
 
@@ -242,7 +236,6 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         userId: string;
         workspaceId: string;
     }): Promise<void> {
-        const { api } = await import('~~/convex/_generated/api');
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.userId);
 

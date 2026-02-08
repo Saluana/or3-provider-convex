@@ -23,8 +23,8 @@ vi.mock('#imports', () => ({
     useRuntimeConfig: (...args: unknown[]) => useRuntimeConfig(...args),
 }));
 
-vi.mock('~~/convex/_generated/api', () => ({
-    api: {
+vi.mock('convex/server', () => ({
+    anyApi: {
         admin: {
             listWorkspaceMembers: 'admin.listWorkspaceMembers',
         },

@@ -24,8 +24,8 @@
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
 import { createHmac } from 'crypto';
-import { api } from '~~/convex/_generated/api';
-import type { Id } from '~~/convex/_generated/dataModel';
+import { convexApi as api } from '../../../utils/convex-api';
+import type { GenericId as Id } from 'convex/values';
 import type {
     WorkspaceAccessStore,
     WorkspaceSettingsStore,

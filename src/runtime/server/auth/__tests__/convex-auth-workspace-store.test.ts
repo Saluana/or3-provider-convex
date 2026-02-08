@@ -11,8 +11,8 @@ vi.mock('#imports', () => ({
     useRuntimeConfig: () => runtimeConfig,
 }));
 
-vi.mock('~~/convex/_generated/api', () => ({
-    api: {
+vi.mock('convex/server', () => ({
+    anyApi: {
         workspaces: {
             resolveSession: 'workspaces.resolveSession',
             ensure: 'workspaces.ensure',

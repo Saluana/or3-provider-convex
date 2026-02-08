@@ -11,8 +11,8 @@ vi.mock('#imports', () => ({
     useRuntimeConfig: () => runtimeConfig,
 }));
 
-vi.mock('~~/convex/_generated/api', () => ({
-    api: {
+vi.mock('convex/server', () => ({
+    anyApi: {
         storage: {
             generateUploadUrl: 'storage.generateUploadUrl',
             getFileUrl: 'storage.getFileUrl',
@@ -47,8 +47,11 @@ vi.mock('../../utils/convex-gateway', () => ({
         query: queryMock as any,
         mutation: mutationMock as any,
     }),
-    getConvexAdminGatewayClient: (...args: unknown[]) =>
-        getConvexAdminGatewayClientMock(...args),
+    getConvexAdminGatewayClient: (
+        event: unknown,
+        adminKey: string,
+        identity: unknown
+    ) => (getConvexAdminGatewayClientMock as any)(event, adminKey, identity),
     buildGatewayAdminIdentity: (provider: string, providerUserId: string) => ({
         provider,
         providerUserId,

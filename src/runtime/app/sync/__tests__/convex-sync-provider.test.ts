@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createConvexSyncProvider } from '../../sync/convex-sync-provider';
 
-vi.mock('~~/convex/_generated/api', () => ({
-    api: {
+vi.mock('convex/server', () => ({
+    anyApi: {
         sync: {
             watchChanges: 'sync.watchChanges',
             pull: 'sync.pull',

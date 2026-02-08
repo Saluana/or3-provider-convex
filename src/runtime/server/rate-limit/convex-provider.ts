@@ -14,7 +14,7 @@
  */
 
 import { ConvexHttpClient } from 'convex/browser';
-import { api } from '~~/convex/_generated/api';
+import { convexApi as api } from '../../utils/convex-api';
 import type {
     RateLimitProvider,
     RateLimitConfig,

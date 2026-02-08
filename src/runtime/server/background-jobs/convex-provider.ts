@@ -22,8 +22,8 @@ import type {
     JobUpdate,
 } from '~~/server/utils/background-jobs/types';
 import { getJobConfig } from '~~/server/utils/background-jobs/store';
-import { api } from '~~/convex/_generated/api';
-import type { Id } from '~~/convex/_generated/dataModel';
+import { convexApi as api } from '../../utils/convex-api';
+import type { GenericId as Id } from 'convex/values';
 import { getConvexClient } from '../utils/convex-client';
 import { CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 

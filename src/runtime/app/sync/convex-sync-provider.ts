@@ -25,7 +25,7 @@
  * @see shared/cloud/provider-ids for provider/JWT constants
  */
 import { useConvexClient } from 'convex-vue';
-import { api } from '~~/convex/_generated/api';
+import { convexApi as api } from '../../utils/convex-api';
 import type {
     SyncProvider,
     SyncScope,
@@ -39,7 +39,7 @@ import type {
 } from '~~/shared/sync/types';
 import { PullResponseSchema, SyncChangeSchema, PushResultSchema } from '~~/shared/sync/schemas';
 import { z } from 'zod';
-import type { Id } from '~~/convex/_generated/dataModel';
+import type { GenericId as Id } from 'convex/values';
 import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 
 /** Tables to sync */

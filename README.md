@@ -28,10 +28,10 @@ export const or3ProviderModules = [
 
 ### 2. Initialize Convex backend
 
-Copy the Convex backend templates into your host project:
+Scaffold the Convex backend templates into your host project:
 
 ```bash
-cp -r node_modules/or3-provider-convex/templates/convex ./convex
+bunx or3-provider-convex init
 ```
 
 Then run codegen:

@@ -17,8 +17,8 @@ import type {
     PushBatch,
     PushResult,
 } from '~~/shared/sync/types';
-import type { Id } from '~~/convex/_generated/dataModel';
-import { api } from '~~/convex/_generated/api';
+import type { GenericId as Id } from 'convex/values';
+import { convexApi as api } from '../../utils/convex-api';
 import {
     buildGatewayAdminIdentity,
     getConvexAdminGatewayClient,

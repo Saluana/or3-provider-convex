@@ -25,8 +25,8 @@ vi.mock('../../utils/convex-client', () => ({
     getConvexClient: (...args: unknown[]) => getConvexClientMock(...args as []),
 }));
 
-vi.mock('~~/convex/_generated/api', () => ({
-    api: { notifications: { create: 'notifications.create' } },
+vi.mock('convex/server', () => ({
+    anyApi: { notifications: { create: 'notifications.create' } },
 }));
 
 describe('notification emit helpers', () => {
