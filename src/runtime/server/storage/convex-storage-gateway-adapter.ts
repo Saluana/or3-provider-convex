@@ -9,6 +9,7 @@
  */
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
+import { z } from 'zod';
 import type {
     StorageGatewayAdapter,
     PresignUploadRequest,
@@ -22,6 +23,40 @@ import { getConvexGatewayClient } from '../utils/convex-gateway';
 import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 import { resolvePresignExpiresAt } from '~~/server/utils/storage/presign-expiry';
 import { resolveProviderToken } from '~~/server/auth/token-broker/resolve';
+
+const CommitInputSchema = z.object({
+    workspace_id: z.string().min(1),
+    hash: z.string().min(1),
+    storage_id: z.string().min(1),
+    storage_provider_id: z.string().min(1),
+    mime_type: z.string().min(1),
+    size_bytes: z.number().int().nonnegative(),
+    name: z.string().min(1),
+    kind: z.enum(['image', 'pdf']),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+    page_count: z.number().int().positive().optional(),
+});
+
+const GcInputSchema = z.object({
+    workspace_id: z.string().min(1),
+    retention_seconds: z.number().int().nonnegative(),
+    limit: z.number().int().positive().optional(),
+});
+
+function toWorkspaceId(workspaceId: string): Id<'workspaces'> {
+    if (!workspaceId.trim()) {
+        throw createError({ statusCode: 400, statusMessage: 'workspace_id is required' });
+    }
+    return workspaceId as Id<'workspaces'>;
+}
+
+function toStorageId(storageId: string): Id<'_storage'> {
+    if (!storageId.trim()) {
+        throw createError({ statusCode: 400, statusMessage: 'storage_id is required' });
+    }
+    return storageId as Id<'_storage'>;
+}
 
 /**
  * Convex-backed StorageGatewayAdapter implementation.
@@ -45,7 +80,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
 
         const client = getConvexGatewayClient(event, token);
         const result = await client.mutation(api.storage.generateUploadUrl, {
-            workspace_id: input.workspaceId as Id<'workspaces'>,
+            workspace_id: toWorkspaceId(input.workspaceId),
             hash: input.hash,
             mime_type: input.mimeType,
             size_bytes: input.sizeBytes,
@@ -70,7 +105,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
 
         const client = getConvexGatewayClient(event, token);
         const result = await client.query(api.storage.getFileUrl, {
-            workspace_id: input.workspaceId as Id<'workspaces'>,
+            workspace_id: toWorkspaceId(input.workspaceId),
             hash: input.hash,
         });
 
@@ -96,26 +131,16 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
         }
 
         const client = getConvexGatewayClient(event, token);
-        
-        // Parse input for commit
-        const commitInput = input as {
-            workspace_id: string;
-            hash: string;
-            storage_id: string;
-            storage_provider_id: string;
-            mime_type: string;
-            size_bytes: number;
-            name: string;
-            kind: 'image' | 'pdf';
-            width?: number;
-            height?: number;
-            page_count?: number;
-        };
-        
+        const parsed = CommitInputSchema.safeParse(input);
+        if (!parsed.success) {
+            throw createError({ statusCode: 400, statusMessage: 'Invalid commit payload' });
+        }
+        const commitInput = parsed.data;
+
         await client.mutation(api.storage.commitUpload, {
-            workspace_id: commitInput.workspace_id as Id<'workspaces'>,
+            workspace_id: toWorkspaceId(commitInput.workspace_id),
             hash: commitInput.hash,
-            storage_id: commitInput.storage_id as Id<'_storage'>,
+            storage_id: toStorageId(commitInput.storage_id),
             storage_provider_id: commitInput.storage_provider_id,
             mime_type: commitInput.mime_type,
             size_bytes: commitInput.size_bytes,
@@ -137,11 +162,13 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
         }
 
         const client = getConvexGatewayClient(event, token);
-        
-        // Parse input to get workspace_id, retention_seconds, and limit
-        const gcInput = input as { workspace_id: string; retention_seconds: number; limit?: number };
+        const parsed = GcInputSchema.safeParse(input);
+        if (!parsed.success) {
+            throw createError({ statusCode: 400, statusMessage: 'Invalid gc payload' });
+        }
+        const gcInput = parsed.data;
         const result = await client.mutation(api.storage.gcDeletedFiles, {
-            workspace_id: gcInput.workspace_id as Id<'workspaces'>,
+            workspace_id: toWorkspaceId(gcInput.workspace_id),
             retention_seconds: gcInput.retention_seconds,
             limit: gcInput.limit,
         });

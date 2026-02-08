@@ -20,6 +20,7 @@
  * - Cache is process-local and bounded by an LRU policy.
  */
 
+import { createHash } from 'node:crypto';
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
 import { ConvexHttpClient } from 'convex/browser';
@@ -51,6 +52,10 @@ interface CacheEntry {
 
 const gatewayClientCache = new Map<string, CacheEntry>();
 const MAX_GATEWAY_CLIENTS = 50;
+
+function hashSecretForCache(value: string): string {
+    return createHash('sha256').update(value).digest('base64url');
+}
 
 function evictLRU(): void {
     let oldestKey: string | null = null;
@@ -99,7 +104,7 @@ function resolveConvexUrl(event: H3Event): string {
  */
 export function getConvexGatewayClient(event: H3Event, token: string): ConvexHttpClient {
     const url = resolveConvexUrl(event);
-    const cacheKey = `user:${url}:${token}`;
+    const cacheKey = `user:${url}:${hashSecretForCache(token)}`;
     const cached = gatewayClientCache.get(cacheKey);
     if (cached) {
         // Update last accessed time for LRU
@@ -136,7 +141,7 @@ export function getConvexAdminGatewayClient(
     identity: UserIdentityAttributes
 ): ConvexHttpClient {
     const url = resolveConvexUrl(event);
-    const cacheKey = `admin:${url}:${adminKey}:${identity.subject}:${identity.issuer}`;
+    const cacheKey = `admin:${url}:${hashSecretForCache(adminKey)}:${identity.subject}:${identity.issuer}`;
     const cached = gatewayClientCache.get(cacheKey);
     if (cached) {
         cached.lastAccessed = Date.now();

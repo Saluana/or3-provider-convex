@@ -22,6 +22,38 @@ import { getConvexGatewayClient } from '../utils/convex-gateway';
 import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 import { resolveProviderToken } from '~~/server/auth/token-broker/resolve';
 
+type ConvexPullChange = {
+    serverVersion: number;
+    tableName: string;
+    pk: string;
+    op: string;
+    payload?: unknown;
+    stamp: {
+        clock: number;
+        hlc: string;
+        deviceId: string;
+        opId: string;
+    };
+};
+
+function toWorkspaceId(workspaceId: string): Id<'workspaces'> {
+    if (!workspaceId.trim()) {
+        throw createError({
+            statusCode: 400,
+            statusMessage: 'workspaceId is required',
+        });
+    }
+    return workspaceId as Id<'workspaces'>;
+}
+
+function toGatewayOperation(op: string): 'put' | 'delete' {
+    if (op === 'put' || op === 'delete') return op;
+    throw createError({
+        statusCode: 502,
+        statusMessage: `Invalid sync operation "${op}" from Convex`,
+    });
+}
+
 /**
  * Convex-backed SyncGatewayAdapter implementation.
  *
@@ -44,7 +76,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 
         const client = getConvexGatewayClient(event, token);
         const result = await client.query(api.sync.pull, {
-            workspace_id: input.scope.workspaceId as Id<'workspaces'>,
+            workspace_id: toWorkspaceId(input.scope.workspaceId),
             cursor: input.cursor,
             limit: input.limit,
             tables: input.tables,
@@ -53,23 +85,11 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         // Map Convex result to PullResponse type
         // Convex returns op as string, but we need 'put' | 'delete'
         return {
-            changes: result.changes.map((change: {
-                serverVersion: number;
-                tableName: string;
-                pk: string;
-                op: string;
-                payload?: unknown;
-                stamp: {
-                    clock: number;
-                    hlc: string;
-                    deviceId: string;
-                    opId: string;
-                };
-            }) => ({
+            changes: result.changes.map((change: ConvexPullChange) => ({
                 serverVersion: change.serverVersion,
                 tableName: change.tableName,
                 pk: change.pk,
-                op: change.op as 'put' | 'delete',
+                op: toGatewayOperation(change.op),
                 payload: change.payload,
                 stamp: change.stamp,
             })),
@@ -89,7 +109,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 
         const client = getConvexGatewayClient(event, token);
         const result = await client.mutation(api.sync.push, {
-            workspace_id: input.scope.workspaceId as Id<'workspaces'>,
+            workspace_id: toWorkspaceId(input.scope.workspaceId),
             ops: input.ops.map((op) => ({
                 op_id: op.stamp.opId,
                 table_name: op.tableName,
@@ -119,7 +139,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 
         const client = getConvexGatewayClient(event, token);
         await client.mutation(api.sync.updateDeviceCursor, {
-            workspace_id: input.scope.workspaceId as Id<'workspaces'>,
+            workspace_id: toWorkspaceId(input.scope.workspaceId),
             device_id: input.deviceId,
             last_seen_version: input.version,
         });
@@ -139,7 +159,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 
         const client = getConvexGatewayClient(event, token);
         await client.mutation(api.sync.gcTombstones, {
-            workspace_id: input.scope.workspaceId as Id<'workspaces'>,
+            workspace_id: toWorkspaceId(input.scope.workspaceId),
             retention_seconds: input.retentionSeconds,
         });
     }
@@ -158,7 +178,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 
         const client = getConvexGatewayClient(event, token);
         await client.mutation(api.sync.gcChangeLog, {
-            workspace_id: input.scope.workspaceId as Id<'workspaces'>,
+            workspace_id: toWorkspaceId(input.scope.workspaceId),
             retention_seconds: input.retentionSeconds,
         });
     }
