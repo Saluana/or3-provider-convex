@@ -7,12 +7,31 @@ import {
 import { useAuthTokenBroker } from '~/composables/auth/useAuthTokenBroker.client';
 import { useSessionContext } from '~/composables/auth/useSessionContext';
 
+function patchConvexSetAuth(client: {
+    setAuth: (
+        fetchToken: () => Promise<string | null>,
+        onChange?: (isAuthenticated: boolean) => void
+    ) => void;
+    __or3SetAuthPatched?: boolean;
+}): void {
+    if (client.__or3SetAuthPatched) return;
+    const originalSetAuth = client.setAuth.bind(client);
+    client.setAuth = (
+        fetchToken: () => Promise<string | null>,
+        onChange?: (isAuthenticated: boolean) => void
+    ) => originalSetAuth(fetchToken, onChange ?? (() => {}));
+    client.__or3SetAuthPatched = true;
+}
+
 export default defineNuxtPlugin(() => {
     if (import.meta.server) return;
 
     const config = useRuntimeConfig();
-    if (!config.public.ssrAuthEnabled || !config.public.sync.enabled) return;
+    if (!config.public.sync.enabled) return;
     if (config.public.sync.provider !== CONVEX_PROVIDER_ID) return;
+    // In SSR auth mode, sync/storage/auth run through gateway APIs.
+    // Do not configure direct Convex client auth to avoid auth-manager conflicts.
+    if (config.public.ssrAuthEnabled) return;
 
     let client: ReturnType<typeof useConvexClient>;
     try {
@@ -34,15 +53,21 @@ export default defineNuxtPlugin(() => {
             template: CONVEX_JWT_TEMPLATE,
         });
 
+    patchConvexSetAuth(client);
+
     // Register token fetcher so direct Convex queries/mutations include identity.
-    client.setAuth(getToken);
+    client.setAuth(getToken, () => {
+        // Gateway mode reads auth state from SSR session; no-op for Convex client hook.
+    });
 
     const { data: sessionData } = useSessionContext();
     watch(
         () => sessionData.value?.session?.authenticated,
         () => {
             // Force Convex auth refresh when session state flips.
-            client.setAuth(getToken);
+            client.setAuth(getToken, () => {
+                // Gateway mode reads auth state from SSR session; no-op for Convex client hook.
+            });
         }
     );
 });

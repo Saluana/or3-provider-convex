@@ -10,6 +10,7 @@
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
 import { z } from 'zod';
+import { useRuntimeConfig } from '#imports';
 import type {
     StorageGatewayAdapter,
     PresignUploadRequest,
@@ -19,10 +20,16 @@ import type {
 } from '~~/server/storage/gateway/types';
 import type { Id } from '~~/convex/_generated/dataModel';
 import { api } from '~~/convex/_generated/api';
-import { getConvexGatewayClient } from '../utils/convex-gateway';
+import {
+    buildGatewayAdminIdentity,
+    getConvexAdminGatewayClient,
+    getConvexGatewayClient,
+} from '../utils/convex-gateway';
+import { resolveConvexAuthProvider } from '../utils/provider-compat';
 import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 import { resolvePresignExpiresAt } from '~~/server/utils/storage/presign-expiry';
 import { resolveProviderToken } from '~~/server/auth/token-broker/resolve';
+import { resolveSessionContext } from '~~/server/auth/session';
 
 const CommitInputSchema = z.object({
     workspace_id: z.string().min(1),
@@ -58,6 +65,36 @@ function toStorageId(storageId: string): Id<'_storage'> {
     return storageId as Id<'_storage'>;
 }
 
+async function getStorageGatewayClient(event: H3Event) {
+    const token = await resolveProviderToken(event, {
+        providerId: CONVEX_PROVIDER_ID,
+        template: CONVEX_JWT_TEMPLATE,
+    });
+    if (token) {
+        return getConvexGatewayClient(event, token);
+    }
+
+    const config = useRuntimeConfig(event);
+    const adminKey = config.sync?.convexAdminKey;
+    if (!adminKey) {
+        throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
+    }
+
+    const session = await resolveSessionContext(event);
+    if (!session.authenticated || !session.provider || !session.providerUserId) {
+        throw createError({ statusCode: 401, statusMessage: 'Unauthorized' });
+    }
+
+    return getConvexAdminGatewayClient(
+        event,
+        adminKey,
+        buildGatewayAdminIdentity(
+            resolveConvexAuthProvider(session.provider),
+            session.providerUserId
+        )
+    );
+}
+
 /**
  * Convex-backed StorageGatewayAdapter implementation.
  *
@@ -70,15 +107,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
     id = 'convex';
 
     async presignUpload(event: H3Event, input: PresignUploadRequest): Promise<PresignUploadResponse> {
-        const token = await resolveProviderToken(event, {
-            providerId: CONVEX_PROVIDER_ID,
-            template: CONVEX_JWT_TEMPLATE,
-        });
-        if (!token) {
-            throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-        }
-
-        const client = getConvexGatewayClient(event, token);
+        const client = await getStorageGatewayClient(event);
         const result = await client.mutation(api.storage.generateUploadUrl, {
             workspace_id: toWorkspaceId(input.workspaceId),
             hash: input.hash,
@@ -95,15 +124,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
     }
 
     async presignDownload(event: H3Event, input: PresignDownloadRequest): Promise<PresignDownloadResponse> {
-        const token = await resolveProviderToken(event, {
-            providerId: CONVEX_PROVIDER_ID,
-            template: CONVEX_JWT_TEMPLATE,
-        });
-        if (!token) {
-            throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-        }
-
-        const client = getConvexGatewayClient(event, token);
+        const client = await getStorageGatewayClient(event);
         const result = await client.query(api.storage.getFileUrl, {
             workspace_id: toWorkspaceId(input.workspaceId),
             hash: input.hash,
@@ -122,15 +143,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
     }
 
     async commit(event: H3Event, input: unknown): Promise<void> {
-        const token = await resolveProviderToken(event, {
-            providerId: CONVEX_PROVIDER_ID,
-            template: CONVEX_JWT_TEMPLATE,
-        });
-        if (!token) {
-            throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-        }
-
-        const client = getConvexGatewayClient(event, token);
+        const client = await getStorageGatewayClient(event);
         const parsed = CommitInputSchema.safeParse(input);
         if (!parsed.success) {
             throw createError({ statusCode: 400, statusMessage: 'Invalid commit payload' });
@@ -153,15 +166,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
     }
 
     async gc(event: H3Event, input: unknown): Promise<unknown> {
-        const token = await resolveProviderToken(event, {
-            providerId: CONVEX_PROVIDER_ID,
-            template: CONVEX_JWT_TEMPLATE,
-        });
-        if (!token) {
-            throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-        }
-
-        const client = getConvexGatewayClient(event, token);
+        const client = await getStorageGatewayClient(event);
         const parsed = GcInputSchema.safeParse(input);
         if (!parsed.success) {
             throw createError({ statusCode: 400, statusMessage: 'Invalid gc payload' });

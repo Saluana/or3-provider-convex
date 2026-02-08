@@ -2,6 +2,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { H3Event } from 'h3';
 import { ConvexSyncGatewayAdapter } from '../../sync/convex-sync-gateway-adapter';
 
+const runtimeConfig = vi.hoisted(() => ({
+    sync: {
+        convexAdminKey: '',
+    },
+}));
+vi.mock('#imports', () => ({
+    useRuntimeConfig: () => runtimeConfig,
+}));
+
 vi.mock('~~/convex/_generated/api', () => ({
     api: {
         sync: {
@@ -18,13 +27,27 @@ const resolveProviderTokenMock = vi.hoisted(() => vi.fn());
 vi.mock('~~/server/auth/token-broker/resolve', () => ({
     resolveProviderToken: (...args: unknown[]) => resolveProviderTokenMock(...args),
 }));
+const resolveSessionContextMock = vi.hoisted(() => vi.fn());
+vi.mock('~~/server/auth/session', () => ({
+    resolveSessionContext: (...args: unknown[]) => resolveSessionContextMock(...args),
+}));
 
 const queryMock = vi.hoisted(() => vi.fn());
 const mutationMock = vi.hoisted(() => vi.fn());
+const getConvexAdminGatewayClientMock = vi.hoisted(() => vi.fn(() => ({
+    query: (...args: unknown[]) => queryMock(...args),
+    mutation: (...args: unknown[]) => mutationMock(...args),
+})));
 vi.mock('../../utils/convex-gateway', () => ({
     getConvexGatewayClient: () => ({
         query: (...args: unknown[]) => queryMock(...args),
         mutation: (...args: unknown[]) => mutationMock(...args),
+    }),
+    getConvexAdminGatewayClient: (...args: unknown[]) =>
+        getConvexAdminGatewayClientMock(...args),
+    buildGatewayAdminIdentity: (provider: string, providerUserId: string) => ({
+        provider,
+        providerUserId,
     }),
 }));
 
@@ -35,6 +58,9 @@ function makeEvent(): H3Event {
 describe('ConvexSyncGatewayAdapter', () => {
     beforeEach(() => {
         resolveProviderTokenMock.mockReset().mockResolvedValue('provider-jwt');
+        resolveSessionContextMock.mockReset();
+        getConvexAdminGatewayClientMock.mockClear();
+        runtimeConfig.sync.convexAdminKey = '';
         queryMock.mockReset();
         mutationMock.mockReset();
     });
@@ -64,6 +90,30 @@ describe('ConvexSyncGatewayAdapter', () => {
         ).rejects.toMatchObject({ statusCode: 401 });
 
         expect(resolveProviderTokenMock).toHaveBeenCalledTimes(5);
+    });
+
+    it('falls back to admin gateway client when provider token is unavailable', async () => {
+        const adapter = new ConvexSyncGatewayAdapter();
+        resolveProviderTokenMock.mockResolvedValue(null);
+        runtimeConfig.sync.convexAdminKey = 'admin-key';
+        resolveSessionContextMock.mockResolvedValue({
+            authenticated: true,
+            provider: 'basic-auth',
+            providerUserId: 'user-1',
+        });
+        queryMock.mockResolvedValue({ changes: [], nextCursor: 0, hasMore: false });
+
+        await adapter.pull(makeEvent(), {
+            scope: { workspaceId: 'ws-1' },
+            cursor: 0,
+            limit: 10,
+        });
+
+        expect(getConvexAdminGatewayClientMock).toHaveBeenCalledWith(
+            expect.any(Object),
+            'admin-key',
+            { provider: 'basic-auth', providerUserId: 'user-1' }
+        );
     });
 
     it('maps pull response and converts op strings to put|delete', async () => {

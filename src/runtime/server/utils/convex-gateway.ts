@@ -91,6 +91,25 @@ function resolveConvexUrl(event: H3Event): string {
     return url;
 }
 
+function resolveAdminIssuer(provider: string): string {
+    if (provider === 'clerk') {
+        return 'https://clerk.or3.ai';
+    }
+    return `https://or3.ai/auth/${provider}`;
+}
+
+export function buildGatewayAdminIdentity(
+    provider: string,
+    providerUserId: string
+): UserIdentityAttributes {
+    const issuer = resolveAdminIssuer(provider);
+    return {
+        subject: providerUserId,
+        issuer,
+        tokenIdentifier: `${issuer}|${providerUserId}`,
+    };
+}
+
 /**
  * Purpose:
  * Create or retrieve a cached Convex client for a user token.

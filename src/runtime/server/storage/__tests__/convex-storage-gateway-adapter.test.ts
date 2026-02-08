@@ -2,6 +2,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { H3Event } from 'h3';
 import { ConvexStorageGatewayAdapter } from '../../storage/convex-storage-gateway-adapter';
 
+const runtimeConfig = vi.hoisted(() => ({
+    sync: {
+        convexAdminKey: '',
+    },
+}));
+vi.mock('#imports', () => ({
+    useRuntimeConfig: () => runtimeConfig,
+}));
+
 vi.mock('~~/convex/_generated/api', () => ({
     api: {
         storage: {
@@ -17,6 +26,10 @@ const resolveProviderTokenMock = vi.hoisted(() => vi.fn());
 vi.mock('~~/server/auth/token-broker/resolve', () => ({
     resolveProviderToken: resolveProviderTokenMock as any,
 }));
+const resolveSessionContextMock = vi.hoisted(() => vi.fn());
+vi.mock('~~/server/auth/session', () => ({
+    resolveSessionContext: resolveSessionContextMock as any,
+}));
 
 const resolvePresignExpiresAtMock = vi.hoisted(() => vi.fn(() => 111_111));
 vi.mock('~~/server/utils/storage/presign-expiry', () => ({
@@ -25,10 +38,20 @@ vi.mock('~~/server/utils/storage/presign-expiry', () => ({
 
 const queryMock = vi.hoisted(() => vi.fn());
 const mutationMock = vi.hoisted(() => vi.fn());
+const getConvexAdminGatewayClientMock = vi.hoisted(() => vi.fn(() => ({
+    query: queryMock as any,
+    mutation: mutationMock as any,
+})));
 vi.mock('../../utils/convex-gateway', () => ({
     getConvexGatewayClient: () => ({
         query: queryMock as any,
         mutation: mutationMock as any,
+    }),
+    getConvexAdminGatewayClient: (...args: unknown[]) =>
+        getConvexAdminGatewayClientMock(...args),
+    buildGatewayAdminIdentity: (provider: string, providerUserId: string) => ({
+        provider,
+        providerUserId,
     }),
 }));
 
@@ -39,6 +62,9 @@ function makeEvent(): H3Event {
 describe('ConvexStorageGatewayAdapter', () => {
     beforeEach(() => {
         resolveProviderTokenMock.mockReset().mockResolvedValue('provider-jwt');
+        resolveSessionContextMock.mockReset();
+        getConvexAdminGatewayClientMock.mockClear();
+        runtimeConfig.sync.convexAdminKey = '';
         resolvePresignExpiresAtMock.mockReset().mockReturnValue(111_111);
         queryMock.mockReset();
         mutationMock.mockReset();
@@ -66,6 +92,31 @@ describe('ConvexStorageGatewayAdapter', () => {
 
         await expect(adapter.commit(makeEvent(), {})).rejects.toMatchObject({ statusCode: 401 });
         await expect(adapter.gc(makeEvent(), {})).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('falls back to admin gateway client when provider token is unavailable', async () => {
+        const adapter = new ConvexStorageGatewayAdapter();
+        resolveProviderTokenMock.mockResolvedValue(null);
+        runtimeConfig.sync.convexAdminKey = 'admin-key';
+        resolveSessionContextMock.mockResolvedValue({
+            authenticated: true,
+            provider: 'basic-auth',
+            providerUserId: 'user-1',
+        });
+        mutationMock.mockResolvedValueOnce({ uploadUrl: 'https://upload.example' });
+
+        await adapter.presignUpload(makeEvent(), {
+            workspaceId: 'ws-1',
+            hash: 'sha256:abc',
+            mimeType: 'image/png',
+            sizeBytes: 100,
+        });
+
+        expect(getConvexAdminGatewayClientMock).toHaveBeenCalledWith(
+            expect.any(Object),
+            'admin-key',
+            { provider: 'basic-auth', providerUserId: 'user-1' }
+        );
     });
 
     it('maps presign upload/download and resolves expiry', async () => {

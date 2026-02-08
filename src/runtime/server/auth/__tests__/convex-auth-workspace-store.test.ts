@@ -53,6 +53,7 @@ async function loadStore() {
 describe('ConvexAuthWorkspaceStore', () => {
     beforeEach(() => {
         vi.resetModules();
+        (globalThis as Record<string, unknown>).__or3_convex_legacy_clerk_only_backend__ = undefined;
         runtimeConfig.sync.convexUrl = 'https://convex.example';
         runtimeConfig.sync.convexAdminKey = 'admin-key';
         queryMock.mockReset();
@@ -111,6 +112,32 @@ describe('ConvexAuthWorkspaceStore', () => {
             provider_user_id: 'u2',
             email: 'a@test.com',
             name: 'A',
+        });
+    });
+
+    it('falls back to clerk provider when backend only supports clerk', async () => {
+        const { ConvexAuthWorkspaceStore } = await loadStore();
+        const store = new ConvexAuthWorkspaceStore();
+
+        queryMock.mockRejectedValueOnce(
+            new Error("Invalid provider: basic-auth. Only 'clerk' is supported.")
+        );
+        queryMock.mockResolvedValueOnce(null);
+        mutationMock.mockResolvedValueOnce({ id: 'ws-created' });
+
+        await expect(
+            store.getOrCreateUser({
+                provider: 'basic-auth',
+                providerUserId: 'u-legacy',
+                email: 'legacy@example.com',
+            })
+        ).resolves.toEqual({ userId: 'u-legacy' });
+
+        expect(mutationMock).toHaveBeenCalledWith('workspaces.ensure', {
+            provider: 'clerk',
+            provider_user_id: 'u-legacy',
+            email: 'legacy@example.com',
+            name: undefined,
         });
     });
 

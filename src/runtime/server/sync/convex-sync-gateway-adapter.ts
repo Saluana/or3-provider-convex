@@ -9,6 +9,7 @@
  */
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
+import { useRuntimeConfig } from '#imports';
 import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 import type {
     PullRequest,
@@ -18,9 +19,15 @@ import type {
 } from '~~/shared/sync/types';
 import type { Id } from '~~/convex/_generated/dataModel';
 import { api } from '~~/convex/_generated/api';
-import { getConvexGatewayClient } from '../utils/convex-gateway';
+import {
+    buildGatewayAdminIdentity,
+    getConvexAdminGatewayClient,
+    getConvexGatewayClient,
+} from '../utils/convex-gateway';
+import { resolveConvexAuthProvider } from '../utils/provider-compat';
 import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 import { resolveProviderToken } from '~~/server/auth/token-broker/resolve';
+import { resolveSessionContext } from '~~/server/auth/session';
 
 type ConvexPullChange = {
     serverVersion: number;
@@ -54,6 +61,36 @@ function toGatewayOperation(op: string): 'put' | 'delete' {
     });
 }
 
+async function getSyncGatewayClient(event: H3Event) {
+    const token = await resolveProviderToken(event, {
+        providerId: CONVEX_PROVIDER_ID,
+        template: CONVEX_JWT_TEMPLATE,
+    });
+    if (token) {
+        return getConvexGatewayClient(event, token);
+    }
+
+    const config = useRuntimeConfig(event);
+    const adminKey = config.sync?.convexAdminKey;
+    if (!adminKey) {
+        throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
+    }
+
+    const session = await resolveSessionContext(event);
+    if (!session.authenticated || !session.provider || !session.providerUserId) {
+        throw createError({ statusCode: 401, statusMessage: 'Unauthorized' });
+    }
+
+    return getConvexAdminGatewayClient(
+        event,
+        adminKey,
+        buildGatewayAdminIdentity(
+            resolveConvexAuthProvider(session.provider),
+            session.providerUserId
+        )
+    );
+}
+
 /**
  * Convex-backed SyncGatewayAdapter implementation.
  *
@@ -66,15 +103,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
     id = 'convex';
 
     async pull(event: H3Event, input: PullRequest): Promise<PullResponse> {
-        const token = await resolveProviderToken(event, {
-            providerId: CONVEX_PROVIDER_ID,
-            template: CONVEX_JWT_TEMPLATE,
-        });
-        if (!token) {
-            throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-        }
-
-        const client = getConvexGatewayClient(event, token);
+        const client = await getSyncGatewayClient(event);
         const result = await client.query(api.sync.pull, {
             workspace_id: toWorkspaceId(input.scope.workspaceId),
             cursor: input.cursor,
@@ -99,15 +128,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
     }
 
     async push(event: H3Event, input: PushBatch): Promise<PushResult> {
-        const token = await resolveProviderToken(event, {
-            providerId: CONVEX_PROVIDER_ID,
-            template: CONVEX_JWT_TEMPLATE,
-        });
-        if (!token) {
-            throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-        }
-
-        const client = getConvexGatewayClient(event, token);
+        const client = await getSyncGatewayClient(event);
         const result = await client.mutation(api.sync.push, {
             workspace_id: toWorkspaceId(input.scope.workspaceId),
             ops: input.ops.map((op) => ({
@@ -129,15 +150,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         event: H3Event,
         input: { scope: { workspaceId: string }; deviceId: string; version: number }
     ): Promise<void> {
-        const token = await resolveProviderToken(event, {
-            providerId: CONVEX_PROVIDER_ID,
-            template: CONVEX_JWT_TEMPLATE,
-        });
-        if (!token) {
-            throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-        }
-
-        const client = getConvexGatewayClient(event, token);
+        const client = await getSyncGatewayClient(event);
         await client.mutation(api.sync.updateDeviceCursor, {
             workspace_id: toWorkspaceId(input.scope.workspaceId),
             device_id: input.deviceId,
@@ -149,15 +162,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         event: H3Event,
         input: { scope: { workspaceId: string }; retentionSeconds: number }
     ): Promise<void> {
-        const token = await resolveProviderToken(event, {
-            providerId: CONVEX_PROVIDER_ID,
-            template: CONVEX_JWT_TEMPLATE,
-        });
-        if (!token) {
-            throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-        }
-
-        const client = getConvexGatewayClient(event, token);
+        const client = await getSyncGatewayClient(event);
         await client.mutation(api.sync.gcTombstones, {
             workspace_id: toWorkspaceId(input.scope.workspaceId),
             retention_seconds: input.retentionSeconds,
@@ -168,15 +173,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         event: H3Event,
         input: { scope: { workspaceId: string }; retentionSeconds: number }
     ): Promise<void> {
-        const token = await resolveProviderToken(event, {
-            providerId: CONVEX_PROVIDER_ID,
-            template: CONVEX_JWT_TEMPLATE,
-        });
-        if (!token) {
-            throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-        }
-
-        const client = getConvexGatewayClient(event, token);
+        const client = await getSyncGatewayClient(event);
         await client.mutation(api.sync.gcChangeLog, {
             workspace_id: toWorkspaceId(input.scope.workspaceId),
             retention_seconds: input.retentionSeconds,
