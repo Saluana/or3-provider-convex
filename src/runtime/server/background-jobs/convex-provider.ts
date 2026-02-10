@@ -35,6 +35,14 @@ function getClient() {
     return getConvexClient();
 }
 
+function isExtraFieldValidationError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    return (
+        error.message.includes('ArgumentValidationError') &&
+        error.message.includes('extra field')
+    );
+}
+
 /**
  * Purpose:
  * Convex provider implementation for background jobs.
@@ -60,12 +68,31 @@ export const convexJobProvider: BackgroundJobProvider = {
             );
         }
 
-        const jobId = await client.mutation(api.backgroundJobs.create, {
+        const legacyCreatePayload = {
             user_id: params.userId,
             thread_id: params.threadId,
             message_id: params.messageId,
             model: params.model,
-        });
+        };
+
+        let jobId: unknown;
+        try {
+            jobId = await client.mutation(api.backgroundJobs.create, {
+                ...legacyCreatePayload,
+                kind: params.kind,
+                tool_calls: params.tool_calls,
+                workflow_state: params.workflow_state,
+            });
+        } catch (error) {
+            // Backward-compat: deployed Convex validators may not include new fields yet.
+            if (!isExtraFieldValidationError(error)) {
+                throw error;
+            }
+            jobId = await client.mutation(
+                api.backgroundJobs.create,
+                legacyCreatePayload
+            );
+        }
 
         return jobId as string;
     },
@@ -85,22 +112,49 @@ export const convexJobProvider: BackgroundJobProvider = {
             threadId: job.threadId,
             messageId: job.messageId,
             model: job.model,
+            kind: job.kind ?? undefined,
             status: job.status,
             content: job.content,
             chunksReceived: job.chunksReceived,
             startedAt: job.startedAt,
             completedAt: job.completedAt ?? undefined,
             error: job.error ?? undefined,
+            tool_calls: job.tool_calls ?? undefined,
+            workflow_state: job.workflow_state ?? undefined,
         };
     },
 
     async updateJob(jobId: string, update: JobUpdate): Promise<void> {
         const client = getClient();
-        await client.mutation(api.backgroundJobs.update, {
+        const legacyUpdatePayload: Record<string, unknown> = {
             job_id: jobId as Id<'background_jobs'>,
-            content_chunk: update.contentChunk,
-            chunks_received: update.chunksReceived,
-        });
+            ...(update.contentChunk !== undefined
+                ? { content_chunk: update.contentChunk }
+                : {}),
+            ...(update.chunksReceived !== undefined
+                ? { chunks_received: update.chunksReceived }
+                : {}),
+        };
+
+        const extendedUpdatePayload: Record<string, unknown> = {
+            ...legacyUpdatePayload,
+            tool_calls: update.tool_calls,
+            workflow_state: update.workflow_state,
+        };
+
+        try {
+            await client.mutation(api.backgroundJobs.update, extendedUpdatePayload);
+        } catch (error) {
+            // Backward-compat: deployed Convex validators may not include new fields yet.
+            if (
+                !isExtraFieldValidationError(error) ||
+                (update.tool_calls === undefined &&
+                    update.workflow_state === undefined)
+            ) {
+                throw error;
+            }
+            await client.mutation(api.backgroundJobs.update, legacyUpdatePayload);
+        }
     },
 
     async completeJob(jobId: string, finalContent: string): Promise<void> {
