@@ -24,6 +24,10 @@ import {
     getConvexAdminGatewayClient,
     getConvexGatewayClient,
 } from '../utils/convex-gateway';
+import {
+    throwAsConvexServiceUnavailable,
+    withConvexTransportRetry,
+} from '../utils/convex-transport';
 import { resolveConvexAuthProvider } from '../utils/provider-compat';
 import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 import { resolveProviderToken } from '~~/server/auth/token-broker/resolve';
@@ -104,46 +108,56 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 
     async pull(event: H3Event, input: PullRequest): Promise<PullResponse> {
         const client = await getSyncGatewayClient(event);
-        const result = await client.query(api.sync.pull, {
-            workspace_id: toWorkspaceId(input.scope.workspaceId),
-            cursor: input.cursor,
-            limit: input.limit,
-            tables: input.tables,
-        });
+        try {
+            const result = await withConvexTransportRetry('sync.pull', () =>
+                client.query(api.sync.pull, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    cursor: input.cursor,
+                    limit: input.limit,
+                    tables: input.tables,
+                })
+            );
 
-        // Map Convex result to PullResponse type
-        // Convex returns op as string, but we need 'put' | 'delete'
-        return {
-            changes: result.changes.map((change: ConvexPullChange) => ({
-                serverVersion: change.serverVersion,
-                tableName: change.tableName,
-                pk: change.pk,
-                op: toGatewayOperation(change.op),
-                payload: change.payload,
-                stamp: change.stamp,
-            })),
-            nextCursor: result.nextCursor,
-            hasMore: result.hasMore,
-        };
+            // Map Convex result to PullResponse type
+            // Convex returns op as string, but we need 'put' | 'delete'
+            return {
+                changes: result.changes.map((change: ConvexPullChange) => ({
+                    serverVersion: change.serverVersion,
+                    tableName: change.tableName,
+                    pk: change.pk,
+                    op: toGatewayOperation(change.op),
+                    payload: change.payload,
+                    stamp: change.stamp,
+                })),
+                nextCursor: result.nextCursor,
+                hasMore: result.hasMore,
+            };
+        } catch (error) {
+            throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
+        }
     }
 
     async push(event: H3Event, input: PushBatch): Promise<PushResult> {
         const client = await getSyncGatewayClient(event);
-        const result = await client.mutation(api.sync.push, {
-            workspace_id: toWorkspaceId(input.scope.workspaceId),
-            ops: input.ops.map((op) => ({
-                op_id: op.stamp.opId,
-                table_name: op.tableName,
-                operation: op.operation,
-                pk: op.pk,
-                payload: op.payload,
-                clock: op.stamp.clock,
-                hlc: op.stamp.hlc,
-                device_id: op.stamp.deviceId,
-            })),
-        });
-
-        return result;
+        try {
+            return await withConvexTransportRetry('sync.push', () =>
+                client.mutation(api.sync.push, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    ops: input.ops.map((op) => ({
+                        op_id: op.stamp.opId,
+                        table_name: op.tableName,
+                        operation: op.operation,
+                        pk: op.pk,
+                        payload: op.payload,
+                        clock: op.stamp.clock,
+                        hlc: op.stamp.hlc,
+                        device_id: op.stamp.deviceId,
+                    })),
+                })
+            );
+        } catch (error) {
+            throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
+        }
     }
 
     async updateCursor(
@@ -151,11 +165,17 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         input: { scope: { workspaceId: string }; deviceId: string; version: number }
     ): Promise<void> {
         const client = await getSyncGatewayClient(event);
-        await client.mutation(api.sync.updateDeviceCursor, {
-            workspace_id: toWorkspaceId(input.scope.workspaceId),
-            device_id: input.deviceId,
-            last_seen_version: input.version,
-        });
+        try {
+            await withConvexTransportRetry('sync.updateDeviceCursor', () =>
+                client.mutation(api.sync.updateDeviceCursor, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    device_id: input.deviceId,
+                    last_seen_version: input.version,
+                })
+            );
+        } catch (error) {
+            throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
+        }
     }
 
     async gcTombstones(
@@ -163,10 +183,16 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         input: { scope: { workspaceId: string }; retentionSeconds: number }
     ): Promise<void> {
         const client = await getSyncGatewayClient(event);
-        await client.mutation(api.sync.gcTombstones, {
-            workspace_id: toWorkspaceId(input.scope.workspaceId),
-            retention_seconds: input.retentionSeconds,
-        });
+        try {
+            await withConvexTransportRetry('sync.gcTombstones', () =>
+                client.mutation(api.sync.gcTombstones, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    retention_seconds: input.retentionSeconds,
+                })
+            );
+        } catch (error) {
+            throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
+        }
     }
 
     async gcChangeLog(
@@ -174,10 +200,16 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         input: { scope: { workspaceId: string }; retentionSeconds: number }
     ): Promise<void> {
         const client = await getSyncGatewayClient(event);
-        await client.mutation(api.sync.gcChangeLog, {
-            workspace_id: toWorkspaceId(input.scope.workspaceId),
-            retention_seconds: input.retentionSeconds,
-        });
+        try {
+            await withConvexTransportRetry('sync.gcChangeLog', () =>
+                client.mutation(api.sync.gcChangeLog, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    retention_seconds: input.retentionSeconds,
+                })
+            );
+        } catch (error) {
+            throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
+        }
     }
 }
 

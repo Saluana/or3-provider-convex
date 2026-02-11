@@ -58,6 +58,22 @@ function makeEvent(): H3Event {
     return { context: {}, node: { req: { headers: {} } } } as unknown as H3Event;
 }
 
+function createTransientTransportError(message: string = 'fetch failed'): Error {
+    const error = new Error(message) as Error & {
+        cause?: {
+            code?: string;
+            name?: string;
+            message?: string;
+        };
+    };
+    error.cause = {
+        code: 'UND_ERR_CONNECT_TIMEOUT',
+        name: 'ConnectTimeoutError',
+        message: 'Connect Timeout Error',
+    };
+    return error;
+}
+
 describe('ConvexSyncGatewayAdapter', () => {
     beforeEach(() => {
         resolveProviderTokenMock.mockReset().mockResolvedValue('provider-jwt');
@@ -243,5 +259,44 @@ describe('ConvexSyncGatewayAdapter', () => {
         for (const call of resolveProviderTokenMock.mock.calls) {
             expect(call[1]).toEqual({ providerId: 'convex', template: 'convex' });
         }
+    });
+
+    it('retries transient transport errors before succeeding', async () => {
+        const adapter = new ConvexSyncGatewayAdapter();
+        queryMock
+            .mockRejectedValueOnce(createTransientTransportError())
+            .mockResolvedValueOnce({ changes: [], nextCursor: 0, hasMore: false });
+
+        await expect(
+            adapter.pull(makeEvent(), {
+                scope: { workspaceId: 'ws-1' },
+                cursor: 0,
+                limit: 10,
+            })
+        ).resolves.toEqual({
+            changes: [],
+            nextCursor: 0,
+            hasMore: false,
+        });
+
+        expect(queryMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('maps exhausted transient transport failures to 503', async () => {
+        const adapter = new ConvexSyncGatewayAdapter();
+        queryMock.mockRejectedValue(createTransientTransportError());
+
+        await expect(
+            adapter.pull(makeEvent(), {
+                scope: { workspaceId: 'ws-1' },
+                cursor: 0,
+                limit: 10,
+            })
+        ).rejects.toMatchObject({
+            statusCode: 503,
+            statusMessage: 'Sync backend unavailable',
+        });
+
+        expect(queryMock).toHaveBeenCalledTimes(3);
     });
 });

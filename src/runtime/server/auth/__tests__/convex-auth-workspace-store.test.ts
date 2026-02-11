@@ -50,6 +50,22 @@ async function loadStore() {
     return import('../../auth/convex-auth-workspace-store');
 }
 
+function createTransientTransportError(message: string = 'fetch failed'): Error {
+    const error = new Error(message) as Error & {
+        cause?: {
+            code?: string;
+            name?: string;
+            message?: string;
+        };
+    };
+    error.cause = {
+        code: 'UND_ERR_CONNECT_TIMEOUT',
+        name: 'ConnectTimeoutError',
+        message: 'Connect Timeout Error',
+    };
+    return error;
+}
+
 describe('ConvexAuthWorkspaceStore', () => {
     beforeEach(() => {
         vi.resetModules();
@@ -222,5 +238,34 @@ describe('ConvexAuthWorkspaceStore', () => {
         await expect(
             store.createWorkspace({ userId: 'u1', name: 'Name' })
         ).rejects.toThrow('backend exploded');
+    });
+
+    it('retries transient transport errors during workspace reads', async () => {
+        const { ConvexAuthWorkspaceStore } = await loadStore();
+        const store = new ConvexAuthWorkspaceStore();
+
+        queryMock
+            .mockRejectedValueOnce(createTransientTransportError())
+            .mockResolvedValueOnce({ id: 'ws-1', role: 'owner' });
+
+        await expect(
+            store.getWorkspaceRole({ userId: 'u1', workspaceId: 'ws-1' })
+        ).resolves.toBe('owner');
+        expect(queryMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('maps exhausted transient transport errors to 503', async () => {
+        const { ConvexAuthWorkspaceStore } = await loadStore();
+        const store = new ConvexAuthWorkspaceStore();
+
+        queryMock.mockRejectedValue(createTransientTransportError());
+
+        await expect(
+            store.getWorkspaceRole({ userId: 'u1', workspaceId: 'ws-1' })
+        ).rejects.toMatchObject({
+            statusCode: 503,
+            statusMessage: 'Auth backend unavailable',
+        });
+        expect(queryMock).toHaveBeenCalledTimes(3);
     });
 });

@@ -18,6 +18,10 @@ import {
     markLegacyClerkOnlyBackend,
     resolveConvexAuthProvider,
 } from '../utils/provider-compat';
+import {
+    throwAsConvexServiceUnavailable,
+    withConvexTransportRetry,
+} from '../utils/convex-transport';
 
 /**
  * Get an admin-authenticated Convex client for server-to-server calls.
@@ -69,6 +73,17 @@ function getAdminConvexClient(provider: string, providerUserId: string): ConvexH
  * - Maps Convex workspace data to AuthWorkspaceStore interface
  */
 export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
+    private async runConvexOperation<T>(
+        operation: string,
+        run: () => Promise<T>
+    ): Promise<T> {
+        try {
+            return await withConvexTransportRetry(operation, run);
+        } catch (error) {
+            throwAsConvexServiceUnavailable(error, 'Auth backend unavailable');
+        }
+    }
+
     private async ensureUserWithProvider(input: {
         provider: string;
         providerUserId: string;
@@ -77,18 +92,22 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
     }): Promise<void> {
         const convex = getAdminConvexClient(input.provider, input.providerUserId);
 
-        const resolved = await convex.query(api.workspaces.resolveSession, {
-            provider: input.provider,
-            provider_user_id: input.providerUserId,
-        });
+        const resolved = await this.runConvexOperation('workspaces.resolveSession', () =>
+            convex.query(api.workspaces.resolveSession, {
+                provider: input.provider,
+                provider_user_id: input.providerUserId,
+            })
+        );
         if (resolved) return;
 
-        await convex.mutation(api.workspaces.ensure, {
-            provider: input.provider,
-            provider_user_id: input.providerUserId,
-            email: input.email,
-            name: input.displayName,
-        });
+        await this.runConvexOperation('workspaces.ensure', () =>
+            convex.mutation(api.workspaces.ensure, {
+                provider: input.provider,
+                provider_user_id: input.providerUserId,
+                email: input.email,
+                name: input.displayName,
+            })
+        );
     }
 
     async getOrCreateUser(input: {
@@ -126,12 +145,14 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         const convex = getAdminConvexClient(provider, userId);
 
         // Get or create workspace via ensure
-        const workspaceInfo = await convex.mutation(api.workspaces.ensure, {
-            provider,
-            provider_user_id: userId,
-            email: undefined,
-            name: undefined,
-        });
+        const workspaceInfo = await this.runConvexOperation('workspaces.ensure', () =>
+            convex.mutation(api.workspaces.ensure, {
+                provider,
+                provider_user_id: userId,
+                email: undefined,
+                name: undefined,
+            })
+        );
 
         return {
             workspaceId: workspaceInfo.id,
@@ -146,10 +167,12 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.userId);
 
-        const resolved = await convex.query(api.workspaces.resolveSession, {
-            provider,
-            provider_user_id: input.userId,
-        });
+        const resolved = await this.runConvexOperation('workspaces.resolveSession', () =>
+            convex.query(api.workspaces.resolveSession, {
+                provider,
+                provider_user_id: input.userId,
+            })
+        );
 
         if (!resolved || resolved.id !== input.workspaceId) {
             return null;
@@ -173,7 +196,9 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, userId);
 
-        const workspaces = await convex.query(api.workspaces.listMyWorkspaces, {});
+        const workspaces = await this.runConvexOperation('workspaces.listMyWorkspaces', () =>
+            convex.query(api.workspaces.listMyWorkspaces, {})
+        );
         const normalized = Array.isArray(workspaces)
             ? workspaces.filter(
                   (workspace): workspace is NonNullable<typeof workspace> =>
@@ -199,10 +224,12 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.userId);
 
-        const workspaceId = await convex.mutation(api.workspaces.create, {
-            name: input.name,
-            description: input.description ?? undefined,
-        });
+        const workspaceId = await this.runConvexOperation('workspaces.create', () =>
+            convex.mutation(api.workspaces.create, {
+                name: input.name,
+                description: input.description ?? undefined,
+            })
+        );
 
         return { workspaceId };
     }
@@ -216,20 +243,24 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.userId);
 
-        await convex.mutation(api.workspaces.update, {
-            workspace_id: input.workspaceId as Id<'workspaces'>,
-            name: input.name,
-            description: input.description ?? undefined,
-        });
+        await this.runConvexOperation('workspaces.update', () =>
+            convex.mutation(api.workspaces.update, {
+                workspace_id: input.workspaceId as Id<'workspaces'>,
+                name: input.name,
+                description: input.description ?? undefined,
+            })
+        );
     }
 
     async removeWorkspace(input: { userId: string; workspaceId: string }): Promise<void> {
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.userId);
 
-        await convex.mutation(api.workspaces.remove, {
-            workspace_id: input.workspaceId as Id<'workspaces'>,
-        });
+        await this.runConvexOperation('workspaces.remove', () =>
+            convex.mutation(api.workspaces.remove, {
+                workspace_id: input.workspaceId as Id<'workspaces'>,
+            })
+        );
     }
 
     async setActiveWorkspace(input: {
@@ -239,9 +270,11 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.userId);
 
-        await convex.mutation(api.workspaces.setActive, {
-            workspace_id: input.workspaceId as Id<'workspaces'>,
-        });
+        await this.runConvexOperation('workspaces.setActive', () =>
+            convex.mutation(api.workspaces.setActive, {
+                workspace_id: input.workspaceId as Id<'workspaces'>,
+            })
+        );
     }
 }
 
