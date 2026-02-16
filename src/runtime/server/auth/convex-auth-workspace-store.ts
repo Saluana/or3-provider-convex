@@ -138,6 +138,30 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         return { userId: input.providerUserId };
     }
 
+    async getUser(input: {
+        provider: string;
+        providerUserId: string;
+    }): Promise<
+        | {
+              userId: string;
+              email?: string;
+              displayName?: string;
+          }
+        | null
+    > {
+        const provider = resolveConvexAuthProvider(input.provider);
+        const convex = getAdminConvexClient(provider, input.providerUserId);
+        const account = await this.runConvexOperation('users.getAuthAccountByProvider', () =>
+            convex.query(api.users.getAuthAccountByProvider, {
+                provider,
+                provider_user_id: input.providerUserId,
+            })
+        );
+
+        if (!account?.user_id) return null;
+        return { userId: String(account.user_id) };
+    }
+
     async getOrCreateDefaultWorkspace(
         userId: string
     ): Promise<{ workspaceId: string; workspaceName: string }> {
@@ -275,6 +299,119 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
                 workspace_id: input.workspaceId as Id<'workspaces'>,
             })
         );
+    }
+
+    async createInvite(input: {
+        workspaceId: string;
+        email: string;
+        role: WorkspaceRole;
+        invitedByUserId: string;
+        expiresAt: number;
+        tokenHash: string;
+    }): Promise<{ inviteId: string }> {
+        const provider = getConfiguredAuthProvider();
+        const convex = getAdminConvexClient(provider, input.invitedByUserId);
+        const result = await this.runConvexOperation('workspaces.createInvite', () =>
+            convex.mutation(api.workspaces.createInvite, {
+                workspace_id: input.workspaceId as Id<'workspaces'>,
+                email: input.email,
+                role: input.role,
+                invited_by_user_id: input.invitedByUserId as Id<'users'>,
+                token_hash: input.tokenHash,
+                expires_at: input.expiresAt,
+            })
+        );
+        return { inviteId: String(result.invite_id) };
+    }
+
+    async listInvites(input: {
+        workspaceId: string;
+        status?: 'pending' | 'accepted' | 'revoked' | 'expired';
+        limit?: number;
+    }) {
+        const provider = getConfiguredAuthProvider();
+        const convex = getAdminConvexClient(provider, input.workspaceId);
+        const rows = await this.runConvexOperation('workspaces.listInvites', () =>
+            convex.query(api.workspaces.listInvites, {
+                workspace_id: input.workspaceId as Id<'workspaces'>,
+                status: input.status,
+                limit: input.limit,
+            })
+        );
+
+        return (rows ?? []).map((row: any) => ({
+            id: String(row.id),
+            workspaceId: String(row.workspace_id),
+            email: row.email,
+            role: row.role,
+            status: row.status,
+            invitedByUserId: String(row.invited_by_user_id),
+            tokenHash: row.token_hash,
+            expiresAt: row.expires_at,
+            acceptedAt: row.accepted_at ?? null,
+            acceptedUserId: row.accepted_user_id ? String(row.accepted_user_id) : null,
+            revokedAt: row.revoked_at ?? null,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+        }));
+    }
+
+    async revokeInvite(input: {
+        workspaceId: string;
+        inviteId: string;
+        revokedByUserId: string;
+    }): Promise<void> {
+        const provider = getConfiguredAuthProvider();
+        const convex = getAdminConvexClient(provider, input.revokedByUserId);
+        await this.runConvexOperation('workspaces.revokeInvite', () =>
+            convex.mutation(api.workspaces.revokeInvite, {
+                workspace_id: input.workspaceId as Id<'workspaces'>,
+                invite_id: input.inviteId as any,
+            })
+        );
+    }
+
+    async consumeInvite(input: {
+        workspaceId: string;
+        email: string;
+        tokenHash: string;
+        acceptedUserId: string;
+    }): Promise<
+        | { ok: true; role: WorkspaceRole }
+        | {
+              ok: false;
+              reason:
+                  | 'not_found'
+                  | 'expired'
+                  | 'revoked'
+                  | 'already_used'
+                  | 'token_mismatch';
+          }
+    > {
+        const provider = getConfiguredAuthProvider();
+        const convex = getAdminConvexClient(provider, input.acceptedUserId);
+        const result = await this.runConvexOperation('workspaces.consumeInvite', () =>
+            convex.mutation(api.workspaces.consumeInvite, {
+                workspace_id: input.workspaceId as Id<'workspaces'>,
+                email: input.email,
+                token_hash: input.tokenHash,
+                accepted_user_id: input.acceptedUserId as Id<'users'>,
+            })
+        );
+
+        if (result?.ok === true) {
+            return { ok: true, role: result.role as WorkspaceRole };
+        }
+
+        return {
+            ok: false,
+            reason: (result?.reason ?? 'not_found') as
+                | 'not_found'
+                | 'expired'
+                | 'revoked'
+                | 'already_used'
+                | 'token_mismatch',
+        };
     }
 }
 
