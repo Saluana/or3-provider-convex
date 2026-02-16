@@ -169,6 +169,36 @@ describe('ConvexAuthWorkspaceStore', () => {
         });
     });
 
+    it('resolves internal user ids to provider user ids for workspace operations', async () => {
+        const { ConvexAuthWorkspaceStore } = await loadStore();
+        const store = new ConvexAuthWorkspaceStore();
+
+        queryMock.mockResolvedValueOnce({
+            user_id: 'internal_user_1',
+            provider: 'clerk',
+            provider_user_id: 'user_clerk_1',
+        });
+        mutationMock.mockResolvedValueOnce({ id: 'ws-1', name: 'Default Workspace' });
+
+        await expect(store.getOrCreateDefaultWorkspace('internal_user_1')).resolves.toEqual({
+            workspaceId: 'ws-1',
+            workspaceName: 'Default Workspace',
+        });
+
+        const client = createdClients[0] as { setAdminAuth: ReturnType<typeof vi.fn> };
+        expect(client.setAdminAuth).toHaveBeenCalledWith('admin-key', {
+            subject: 'internal_user_1',
+            issuer: 'https://clerk.or3.ai',
+            tokenIdentifier: 'https://clerk.or3.ai|internal_user_1',
+        });
+        const mappedClient = createdClients[1] as { setAdminAuth: ReturnType<typeof vi.fn> };
+        expect(mappedClient.setAdminAuth).toHaveBeenCalledWith('admin-key', {
+            subject: 'user_clerk_1',
+            issuer: 'https://clerk.or3.ai',
+            tokenIdentifier: 'https://clerk.or3.ai|user_clerk_1',
+        });
+    });
+
     it('getWorkspaceRole returns null for workspace mismatch', async () => {
         const { ConvexAuthWorkspaceStore } = await loadStore();
         const store = new ConvexAuthWorkspaceStore();
@@ -249,7 +279,7 @@ describe('ConvexAuthWorkspaceStore', () => {
             .mockResolvedValueOnce({ id: 'ws-1', role: 'owner' });
 
         await expect(
-            store.getWorkspaceRole({ userId: 'u1', workspaceId: 'ws-1' })
+            store.getWorkspaceRole({ userId: 'user_test_1', workspaceId: 'ws-1' })
         ).resolves.toBe('owner');
         expect(queryMock).toHaveBeenCalledTimes(2);
     });
@@ -261,7 +291,7 @@ describe('ConvexAuthWorkspaceStore', () => {
         queryMock.mockRejectedValue(createTransientTransportError());
 
         await expect(
-            store.getWorkspaceRole({ userId: 'u1', workspaceId: 'ws-1' })
+            store.getWorkspaceRole({ userId: 'user_test_1', workspaceId: 'ws-1' })
         ).rejects.toMatchObject({
             statusCode: 503,
             statusMessage: 'Auth backend unavailable',

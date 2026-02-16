@@ -68,6 +68,7 @@ export const convexApiContractNames = [
     'sync:updateDeviceCursor',
     'sync:watchChanges',
     'users:getAuthAccountByProvider',
+    'users:getAuthAccountByUserId',
     'workspaces:create',
     'workspaces:createInvite',
     'workspaces:consumeInvite',
