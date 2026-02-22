@@ -27,9 +27,79 @@ import {
 } from '../notifications/emit';
 import { useRuntimeConfig } from '#imports';
 
+const ALLOW_INSECURE_CONVEX_HTTP_ENV = 'OR3_CONVEX_ALLOW_INSECURE_HTTP';
+
+type RuntimeConfigWithConvex = ReturnType<typeof useRuntimeConfig> & {
+    sync?: {
+        enabled?: boolean;
+        provider?: string;
+        convexUrl?: string;
+    };
+    storage?: {
+        enabled?: boolean;
+        provider?: string;
+    };
+    public?: {
+        sync?: {
+            convexUrl?: string;
+        };
+    };
+};
+
+function isConvexSelected(config: RuntimeConfigWithConvex): boolean {
+    const syncSelected =
+        config.sync?.enabled === true &&
+        config.sync?.provider === CONVEX_PROVIDER_ID;
+    const storageSelected =
+        config.storage?.enabled === true &&
+        config.storage?.provider === CONVEX_STORAGE_PROVIDER_ID;
+    return syncSelected || storageSelected;
+}
+
+function validateConvexStartupConfig(config: RuntimeConfigWithConvex): string[] {
+    if (!isConvexSelected(config)) return [];
+
+    const errors: string[] = [];
+    const convexUrl =
+        config.sync?.convexUrl?.trim() ??
+        config.public?.sync?.convexUrl?.trim() ??
+        '';
+
+    if (!convexUrl) {
+        errors.push('Missing Convex URL (runtimeConfig.sync.convexUrl).');
+        return errors;
+    }
+
+    let parsed: URL | null = null;
+    try {
+        parsed = new URL(convexUrl);
+    } catch {
+        errors.push('Convex URL must be a valid URL.');
+        return errors;
+    }
+
+    if (
+        parsed.protocol === 'http:' &&
+        process.env[ALLOW_INSECURE_CONVEX_HTTP_ENV] !== 'true'
+    ) {
+        errors.push(
+            `Convex URL must use HTTPS unless ${ALLOW_INSECURE_CONVEX_HTTP_ENV}=true is explicitly set.`
+        );
+    }
+
+    return errors;
+}
+
 export default defineNitroPlugin(() => {
-    const config = useRuntimeConfig();
+    const config = useRuntimeConfig() as RuntimeConfigWithConvex;
     if (!config.auth.enabled) return;
+
+    const errors = validateConvexStartupConfig(config);
+    if (errors.length > 0) {
+        throw new Error(
+            `[or3-provider-convex] ${errors.join(' ')} Install/configure Convex provider env values and restart.`
+        );
+    }
 
     registerAuthWorkspaceStore({
         id: CONVEX_PROVIDER_ID,
