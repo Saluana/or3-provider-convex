@@ -42,17 +42,28 @@ export async function emitBackgroundJobComplete(
     workspaceId: string,
     userId: string,
     threadId: string,
-    jobId: string
+    jobId: string,
+    messageId?: string
 ): Promise<string> {
     const client = getNotificationsClient();
+    const actions = [
+        {
+            id: crypto.randomUUID(),
+            label: 'Open chat',
+            kind: 'navigate',
+            target: { threadId },
+            data: messageId ? { messageId } : undefined,
+        },
+    ];
 
     const notificationId = await client.mutation(api.notifications.create, {
         workspace_id: workspaceId as Id<'workspaces'>,
         user_id: userId,
         thread_id: threadId,
-        type: 'ai.background.complete',
-        title: 'Background response completed',
-        body: `Your background AI response is ready in thread ${threadId}`,
+        type: 'ai.message.received',
+        title: 'AI response ready',
+        body: 'Your background response is ready.',
+        actions,
     });
 
     return notificationId;

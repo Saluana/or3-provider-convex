@@ -50,7 +50,8 @@ describe('notification emit helpers', () => {
             'ws-1',
             'user-1',
             'thread-1',
-            'job-1'
+            'job-1',
+            'msg-1'
         );
 
         expect(result).toBe('notif-1');
@@ -58,9 +59,18 @@ describe('notification emit helpers', () => {
             workspace_id: 'ws-1',
             user_id: 'user-1',
             thread_id: 'thread-1',
-            type: 'ai.background.complete',
-            title: 'Background response completed',
-            body: 'Your background AI response is ready in thread thread-1',
+            type: 'ai.message.received',
+            title: 'AI response ready',
+            body: 'Your background response is ready.',
+            actions: [
+                {
+                    id: expect.any(String),
+                    label: 'Open chat',
+                    kind: 'navigate',
+                    target: { threadId: 'thread-1' },
+                    data: { messageId: 'msg-1' },
+                },
+            ],
         });
     });
 
