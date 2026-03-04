@@ -234,11 +234,11 @@ async function applyOpToTable(
         clock: number;
         hlc: string;
     }
-): Promise<void> {
+): Promise<{ wasExisting: boolean; applied: boolean }> {
     const tableInfo = TABLE_INDEX_MAP[op.table_name];
     if (!tableInfo) {
         console.warn(`Unknown table: ${op.table_name}`);
-        return;
+        return { wasExisting: false, applied: false };
     }
 
     const { table, indexName } = tableInfo;
@@ -286,6 +286,9 @@ async function applyOpToTable(
         )
         .first();
 
+    const wasExisting = Boolean(existing);
+    let applied = false;
+
     if (op.operation === 'delete') {
         if (existing && !existing.deleted) {
             console.debug('[sync] apply delete', {
@@ -301,6 +304,7 @@ async function applyOpToTable(
                 clock: op.clock,
                 hlc: op.hlc,
             });
+            applied = true;
         }
     } else {
         // Put operation
@@ -326,6 +330,7 @@ async function applyOpToTable(
                     hlc: op.hlc,
                     updated_at: payloadUpdatedAt ?? nowSec(),
                 });
+                applied = true;
             } else {
                 console.debug('[sync] apply put skipped', {
                     table: op.table_name,
@@ -358,8 +363,11 @@ async function applyOpToTable(
                 created_at: payloadCreatedAt ?? nowSec(),
                 updated_at: payloadUpdatedAt ?? payloadCreatedAt ?? nowSec(),
             });
+            applied = true;
         }
     }
+
+    return { wasExisting, applied };
 }
 
 /**
@@ -559,7 +567,7 @@ export const push = mutation({
                     opId: op.op_id,
                     serverVersion,
                 });
-                await applyOpToTable(ctx, args.workspace_id, op);
+                const applyResult = await applyOpToTable(ctx, args.workspace_id, op);
 
                 const opPayload =
                     typeof op.payload === 'object' && op.payload !== null
@@ -591,13 +599,24 @@ export const push = mutation({
                     await upsertTombstone(ctx, args.workspace_id, op, serverVersion, deletedAt);
                 }
 
-                results.push({ opId: op.op_id, serverVersion, success: true });
+                results.push({
+                    opId: op.op_id,
+                    serverVersion,
+                    success: true,
+                    tableName: op.table_name,
+                    operation: op.operation,
+                    payload: opPayload,
+                    wasExisting: applyResult.wasExisting,
+                    applied: applyResult.applied,
+                });
             } catch (error) {
                 results.push({
                     opId: op.op_id,
                     success: false,
                     error: String(error),
                     errorCode: 'SERVER_ERROR',
+                    tableName: op.table_name,
+                    operation: op.operation,
                 });
             }
         }

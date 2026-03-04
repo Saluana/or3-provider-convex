@@ -32,6 +32,11 @@ vi.mock('~~/server/auth/session', () => ({
     resolveSessionContext: (...args: unknown[]) => resolveSessionContextMock(...args),
 }));
 
+const emitWebhookSystemHookMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock('~~/server/utils/webhooks/runtime', () => ({
+    emitWebhookSystemHook: (...args: unknown[]) => emitWebhookSystemHookMock(...args),
+}));
+
 const queryMock = vi.hoisted(() => vi.fn());
 const mutationMock = vi.hoisted(() => vi.fn());
 const getConvexAdminGatewayClientMock = vi.hoisted(() => vi.fn(() => ({
@@ -77,7 +82,8 @@ function createTransientTransportError(message: string = 'fetch failed'): Error 
 describe('ConvexSyncGatewayAdapter', () => {
     beforeEach(() => {
         resolveProviderTokenMock.mockReset().mockResolvedValue('provider-jwt');
-        resolveSessionContextMock.mockReset();
+        resolveSessionContextMock.mockReset().mockResolvedValue({ authenticated: false });
+        emitWebhookSystemHookMock.mockClear();
         getConvexAdminGatewayClientMock.mockClear();
         runtimeConfig.sync.convexAdminKey = '';
         queryMock.mockReset();
@@ -259,6 +265,125 @@ describe('ConvexSyncGatewayAdapter', () => {
         for (const call of resolveProviderTokenMock.mock.calls) {
             expect(call[1]).toEqual({ providerId: 'convex', template: 'convex' });
         }
+    });
+
+    it('emits webhook runtime hooks for successful push operations', async () => {
+        const adapter = new ConvexSyncGatewayAdapter();
+        resolveSessionContextMock.mockResolvedValue({
+            authenticated: true,
+            user: { id: 'user-1' },
+        });
+        mutationMock.mockResolvedValue({
+            results: [
+                {
+                    opId: 'op-1',
+                    success: true,
+                    serverVersion: 7,
+                    tableName: 'threads',
+                    operation: 'put',
+                    payload: {
+                        id: 'thread-1',
+                        title: 'Renamed',
+                    },
+                    wasExisting: true,
+                    applied: true,
+                },
+            ],
+            serverVersion: 7,
+        });
+
+        await adapter.push(makeEvent(), {
+            scope: { workspaceId: 'ws-1' },
+            ops: [
+                {
+                    id: 'pending-1',
+                    tableName: 'threads',
+                    operation: 'put',
+                    pk: 'thread-1',
+                    payload: { id: 'thread-1', title: 'Renamed' },
+                    stamp: {
+                        opId: 'op-1',
+                        deviceId: 'device-1',
+                        hlc: '1:0:device-1',
+                        clock: 2,
+                    },
+                    createdAt: Date.now(),
+                    attempts: 0,
+                    status: 'pending',
+                },
+            ],
+        });
+
+        expect(emitWebhookSystemHookMock).toHaveBeenCalledWith(
+            'db.threads.update:action:after',
+            expect.objectContaining({
+                id: 'thread-1',
+                workspace_id: 'ws-1',
+                user_id: 'user-1',
+            })
+        );
+    });
+
+    it('maps posts table pushes to document webhook hooks', async () => {
+        const adapter = new ConvexSyncGatewayAdapter();
+        resolveSessionContextMock.mockResolvedValue({
+            authenticated: true,
+            user: { id: 'user-1' },
+        });
+        mutationMock.mockResolvedValue({
+            results: [
+                {
+                    opId: 'op-post-1',
+                    success: true,
+                    serverVersion: 9,
+                    tableName: 'posts',
+                    operation: 'put',
+                    payload: {
+                        id: 'doc-1',
+                        title: 'Doc title',
+                        post_type: 'document',
+                    },
+                    wasExisting: false,
+                    applied: true,
+                },
+            ],
+            serverVersion: 9,
+        });
+
+        await adapter.push(makeEvent(), {
+            scope: { workspaceId: 'ws-1' },
+            ops: [
+                {
+                    id: 'pending-post-1',
+                    tableName: 'posts',
+                    operation: 'put',
+                    pk: 'doc-1',
+                    payload: {
+                        id: 'doc-1',
+                        title: 'Doc title',
+                        post_type: 'document',
+                    },
+                    stamp: {
+                        opId: 'op-post-1',
+                        deviceId: 'device-1',
+                        hlc: '1:0:device-1',
+                        clock: 1,
+                    },
+                    createdAt: Date.now(),
+                    attempts: 0,
+                    status: 'pending',
+                },
+            ],
+        });
+
+        expect(emitWebhookSystemHookMock).toHaveBeenCalledWith(
+            'db.documents.create:action:after',
+            expect.objectContaining({
+                id: 'doc-1',
+                workspace_id: 'ws-1',
+                user_id: 'user-1',
+            })
+        );
     });
 
     it('retries transient transport errors before succeeding', async () => {

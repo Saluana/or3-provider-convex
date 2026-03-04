@@ -7,10 +7,12 @@ import { registerAdminStoreProvider } from '~~/server/admin/stores/registry';
 import { registerBackgroundJobProvider } from '~~/server/utils/background-jobs/registry';
 import { registerRateLimitProvider } from '~~/server/utils/rate-limit/registry';
 import { registerNotificationEmitter } from '~~/server/utils/notifications/registry';
+import { registerWebhookStore } from '~~/server/utils/webhooks/store/registry';
 import { registerDeploymentAdminChecker } from '~~/server/auth/deployment-admin';
 import { createConvexAuthWorkspaceStore } from '../auth/convex-auth-workspace-store';
 import { createConvexSyncGatewayAdapter } from '../sync/convex-sync-gateway-adapter';
 import { createConvexStorageGatewayAdapter } from '../storage/convex-storage-gateway-adapter';
+import { createConvexWebhookStore } from '../webhooks/convex-webhook-store';
 import { convexSyncAdminAdapter } from '../admin/adapters/sync-convex';
 import { convexStorageAdminAdapter } from '../admin/adapters/storage-convex';
 import {
@@ -138,6 +140,11 @@ export default defineNitroPlugin(() => {
 
     registerBackgroundJobProvider(CONVEX_PROVIDER_ID, convexJobProvider);
     registerRateLimitProvider(CONVEX_PROVIDER_ID, convexRateLimitProvider);
+    registerWebhookStore({
+        id: CONVEX_PROVIDER_ID,
+        order: 100,
+        create: createConvexWebhookStore,
+    });
 
     registerNotificationEmitter(CONVEX_PROVIDER_ID, {
         emitBackgroundJobComplete,

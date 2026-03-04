@@ -20,12 +20,36 @@
 import { convexApi as api } from '../../utils/convex-api';
 import type { GenericId as Id } from 'convex/values';
 import { getConvexClient } from '../utils/convex-client';
+import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 
 /**
  * Purpose:
  * Resolve the Convex client used for notification writes.
  */
 const getNotificationsClient = () => getConvexClient();
+
+async function emitNotificationWebhookEvent(input: {
+    id: string;
+    workspaceId: string;
+    userId: string;
+    threadId: string;
+    type: string;
+    title: string;
+    body: string;
+}): Promise<void> {
+    const now = Date.now();
+    await emitWebhookSystemHook('notify:action:push', {
+        id: input.id,
+        workspaceId: input.workspaceId,
+        userId: input.userId,
+        threadId: input.threadId,
+        type: input.type,
+        title: input.title,
+        body: input.body,
+        createdAt: now,
+        updatedAt: now,
+    });
+}
 
 /**
  * Purpose:
@@ -46,6 +70,9 @@ export async function emitBackgroundJobComplete(
     messageId?: string
 ): Promise<string> {
     const client = getNotificationsClient();
+    const type = 'ai.message.received';
+    const title = 'AI response ready';
+    const body = 'Your background response is ready.';
     const actions = [
         {
             id: crypto.randomUUID(),
@@ -60,10 +87,20 @@ export async function emitBackgroundJobComplete(
         workspace_id: workspaceId as Id<'workspaces'>,
         user_id: userId,
         thread_id: threadId,
-        type: 'ai.message.received',
-        title: 'AI response ready',
-        body: 'Your background response is ready.',
+        type,
+        title,
+        body,
         actions,
+    });
+
+    await emitNotificationWebhookEvent({
+        id: String(notificationId),
+        workspaceId,
+        userId,
+        threadId,
+        type,
+        title,
+        body,
     });
 
     return notificationId;
@@ -88,14 +125,27 @@ export async function emitBackgroundJobError(
     error: string
 ): Promise<string> {
     const client = getNotificationsClient();
+    const type = 'ai.background.error';
+    const title = 'Background response failed';
+    const body = `Failed: ${error}`;
 
     const notificationId = await client.mutation(api.notifications.create, {
         workspace_id: workspaceId as Id<'workspaces'>,
         user_id: userId,
         thread_id: threadId,
-        type: 'ai.background.error',
-        title: 'Background response failed',
-        body: `Failed: ${error}`,
+        type,
+        title,
+        body,
+    });
+
+    await emitNotificationWebhookEvent({
+        id: String(notificationId),
+        workspaceId,
+        userId,
+        threadId,
+        type,
+        title,
+        body,
     });
 
     return notificationId;

@@ -20,9 +20,15 @@ import {
 
 const mutationMock = vi.hoisted(() => vi.fn().mockResolvedValue('notif-1'));
 const getConvexClientMock = vi.hoisted(() => vi.fn(() => ({ mutation: mutationMock })));
+const emitWebhookSystemHookMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
 vi.mock('../../utils/convex-client', () => ({
     getConvexClient: (...args: unknown[]) => getConvexClientMock(...args as []),
+}));
+
+vi.mock('~~/server/utils/webhooks/runtime', () => ({
+    emitWebhookSystemHook:
+        (...args: unknown[]) => emitWebhookSystemHookMock(...args),
 }));
 
 vi.mock('convex/server', () => ({
@@ -33,6 +39,7 @@ describe('notification emit helpers', () => {
     beforeEach(() => {
         mutationMock.mockClear();
         getConvexClientMock.mockClear().mockReturnValue({ mutation: mutationMock });
+        emitWebhookSystemHookMock.mockClear().mockResolvedValue(undefined);
     });
 
     it('throws when convex client is unavailable', async () => {
@@ -72,6 +79,16 @@ describe('notification emit helpers', () => {
                 },
             ],
         });
+        expect(emitWebhookSystemHookMock).toHaveBeenCalledWith(
+            'notify:action:push',
+            expect.objectContaining({
+                id: 'notif-1',
+                workspaceId: 'ws-1',
+                userId: 'user-1',
+                threadId: 'thread-1',
+                type: 'ai.message.received',
+            })
+        );
     });
 
     it('emits background error notifications', async () => {
@@ -92,5 +109,15 @@ describe('notification emit helpers', () => {
             title: 'Background response failed',
             body: 'Failed: boom',
         });
+        expect(emitWebhookSystemHookMock).toHaveBeenCalledWith(
+            'notify:action:push',
+            expect.objectContaining({
+                id: 'notif-1',
+                workspaceId: 'ws-1',
+                userId: 'user-1',
+                threadId: 'thread-2',
+                type: 'ai.background.error',
+            })
+        );
     });
 });

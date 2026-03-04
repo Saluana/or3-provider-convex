@@ -12,6 +12,7 @@ import { createError } from 'h3';
 import { useRuntimeConfig } from '#imports';
 import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 import type {
+    PendingOp,
     PullRequest,
     PullResponse,
     PushBatch,
@@ -32,6 +33,7 @@ import { resolveConvexAuthProvider } from '../utils/provider-compat';
 import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 import { resolveProviderToken } from '~~/server/auth/token-broker/resolve';
 import { resolveSessionContext } from '~~/server/auth/session';
+import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 
 type ConvexPullChange = {
     serverVersion: number;
@@ -46,6 +48,192 @@ type ConvexPullChange = {
         opId: string;
     };
 };
+
+type HookEmission = {
+    hookName: string;
+    payload: Record<string, unknown>;
+};
+
+function nowEpoch(): number {
+    return Math.floor(Date.now() / 1000);
+}
+
+function toWebhookEntityPayload(input: {
+    op: PendingOp;
+    workspaceId: string;
+    now: number;
+    userId?: string;
+    deleted?: boolean;
+}): Record<string, unknown> {
+    const base =
+        input.op.payload && typeof input.op.payload === 'object'
+            ? { ...(input.op.payload as Record<string, unknown>) }
+            : {};
+
+    if (typeof base.id !== 'string' || base.id.length === 0) {
+        base.id = input.op.pk;
+    }
+    if (
+        typeof base.workspace_id !== 'string' ||
+        base.workspace_id.length === 0
+    ) {
+        base.workspace_id = input.workspaceId;
+    }
+    if (
+        input.userId &&
+        (typeof base.user_id !== 'string' || base.user_id.length === 0)
+    ) {
+        base.user_id = input.userId;
+    }
+    if (input.deleted) {
+        base.deleted = true;
+    }
+    if (typeof base.updated_at !== 'number') {
+        base.updated_at = input.now;
+    }
+
+    return base;
+}
+
+function resolveHookEmission(input: {
+    op: PendingOp;
+    workspaceId: string;
+    now: number;
+    userId?: string;
+    wasExisting: boolean;
+    applied: boolean;
+}): HookEmission | null {
+    if (!input.applied) {
+        return null;
+    }
+
+    const { op } = input;
+    if (op.tableName === 'threads') {
+        if (op.operation === 'delete') {
+            return {
+                hookName: 'db.threads.delete:action:soft:after',
+                payload: toWebhookEntityPayload({
+                    op,
+                    workspaceId: input.workspaceId,
+                    now: input.now,
+                    userId: input.userId,
+                    deleted: true,
+                }),
+            };
+        }
+
+        return {
+            hookName: input.wasExisting
+                ? 'db.threads.update:action:after'
+                : 'db.threads.create:action:after',
+            payload: toWebhookEntityPayload({
+                op,
+                workspaceId: input.workspaceId,
+                now: input.now,
+                userId: input.userId,
+            }),
+        };
+    }
+
+    if (op.tableName === 'messages') {
+        if (op.operation === 'delete') {
+            return {
+                hookName: 'db.messages.delete:action:soft:after',
+                payload: toWebhookEntityPayload({
+                    op,
+                    workspaceId: input.workspaceId,
+                    now: input.now,
+                    userId: input.userId,
+                    deleted: true,
+                }),
+            };
+        }
+
+        return {
+            hookName: input.wasExisting
+                ? 'db.messages.update:action:after'
+                : 'db.messages.create:action:after',
+            payload: toWebhookEntityPayload({
+                op,
+                workspaceId: input.workspaceId,
+                now: input.now,
+                userId: input.userId,
+            }),
+        };
+    }
+
+    if (op.tableName === 'documents' || op.tableName === 'posts') {
+        if (op.operation === 'delete') {
+            return {
+                hookName: 'db.documents.delete:action:soft:after',
+                payload: toWebhookEntityPayload({
+                    op,
+                    workspaceId: input.workspaceId,
+                    now: input.now,
+                    userId: input.userId,
+                    deleted: true,
+                }),
+            };
+        }
+
+        return {
+            hookName: input.wasExisting
+                ? 'db.documents.update:action:after'
+                : 'db.documents.create:action:after',
+            payload: toWebhookEntityPayload({
+                op,
+                workspaceId: input.workspaceId,
+                now: input.now,
+                userId: input.userId,
+            }),
+        };
+    }
+
+    if (op.tableName === 'notifications' && op.operation === 'put') {
+        return {
+            hookName: 'notify:action:push',
+            payload: toWebhookEntityPayload({
+                op,
+                workspaceId: input.workspaceId,
+                now: input.now,
+                userId: input.userId,
+            }),
+        };
+    }
+
+    return null;
+}
+
+function inferWasExistingFallback(op: PendingOp): boolean {
+    if (op.operation === 'delete') {
+        return true;
+    }
+
+    if (op.payload && typeof op.payload === 'object') {
+        const payload = op.payload as Record<string, unknown>;
+        const createdAt =
+            typeof payload.created_at === 'number'
+                ? payload.created_at
+                : typeof payload.createdAt === 'number'
+                  ? payload.createdAt
+                  : undefined;
+        const updatedAt =
+            typeof payload.updated_at === 'number'
+                ? payload.updated_at
+                : typeof payload.updatedAt === 'number'
+                  ? payload.updatedAt
+                  : undefined;
+
+        if (
+            typeof createdAt === 'number' &&
+            typeof updatedAt === 'number'
+        ) {
+            return updatedAt > createdAt;
+        }
+    }
+
+    return op.stamp.clock > 1;
+}
 
 function toWorkspaceId(workspaceId: string): Id<'workspaces'> {
     if (!workspaceId.trim()) {
@@ -140,7 +328,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
     async push(event: H3Event, input: PushBatch): Promise<PushResult> {
         const client = await getSyncGatewayClient(event);
         try {
-            return await withConvexTransportRetry('sync.push', () =>
+            const result = await withConvexTransportRetry('sync.push', () =>
                 client.mutation(api.sync.push, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     ops: input.ops.map((op) => ({
@@ -155,6 +343,63 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                     })),
                 })
             );
+
+            let sessionUserId: string | undefined;
+            try {
+                const session = await resolveSessionContext(event);
+                if (
+                    session.authenticated &&
+                    session.user &&
+                    typeof session.user.id === 'string' &&
+                    session.user.id.trim().length > 0
+                ) {
+                    sessionUserId = session.user.id;
+                }
+            } catch {
+                sessionUserId = undefined;
+            }
+
+            const opByOpId = new Map(input.ops.map((op) => [op.stamp.opId, op]));
+            const now = nowEpoch();
+            const emissions: HookEmission[] = [];
+
+            for (const resultItem of result.results) {
+                if (!resultItem.success) {
+                    continue;
+                }
+
+                const sourceOp = opByOpId.get(resultItem.opId);
+                if (!sourceOp) {
+                    continue;
+                }
+
+                const op: PendingOp = {
+                    ...sourceOp,
+                    tableName: resultItem.tableName ?? sourceOp.tableName,
+                    operation: resultItem.operation ?? sourceOp.operation,
+                    payload: resultItem.payload ?? sourceOp.payload,
+                };
+
+                const emission = resolveHookEmission({
+                    op,
+                    workspaceId: input.scope.workspaceId,
+                    now,
+                    userId: sessionUserId,
+                    wasExisting:
+                        resultItem.wasExisting ?? inferWasExistingFallback(op),
+                    applied: resultItem.applied ?? true,
+                });
+
+                if (emission) {
+                    emissions.push(emission);
+                }
+            }
+
+            for (const emission of emissions) {
+                await emitWebhookSystemHook(emission.hookName, emission.payload);
+            }
+
+            return result;
         } catch (error) {
             throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
         }
