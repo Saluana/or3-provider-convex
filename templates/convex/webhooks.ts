@@ -171,7 +171,7 @@ export const listWebhooksByEvent = query({
             }
 
             if (!args.workspace_id) {
-                return true;
+                return args.scope === 'admin' ? row.workspace_id == null : false;
             }
 
             if (args.scope === 'admin') {
