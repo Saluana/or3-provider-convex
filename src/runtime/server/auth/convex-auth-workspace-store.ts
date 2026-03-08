@@ -202,8 +202,9 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
 
     async getOrCreateDefaultWorkspace(
         userId: string
-    ): Promise<{ workspaceId: string; workspaceName: string }> {
+    ): Promise<{ workspaceId: string; workspaceName: string; created?: boolean }> {
         const provider = getConfiguredAuthProvider();
+        const existingProviderUserId = this.providerUserIdByInternalUserId.get(userId);
         const providerUserId = await this.resolveProviderUserIdForInternalUser({
             provider,
             userId,
@@ -211,6 +212,12 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         const convex = getAdminConvexClient(provider, providerUserId);
 
         // Get or create workspace via ensure
+        const existingWorkspace = await this.runConvexOperation('workspaces.resolveSession', () =>
+            convex.query(api.workspaces.resolveSession, {
+                provider,
+                provider_user_id: providerUserId,
+            })
+        );
         const workspaceInfo = await this.runConvexOperation('workspaces.ensure', () =>
             convex.mutation(api.workspaces.ensure, {
                 provider,
@@ -223,6 +230,7 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         return {
             workspaceId: workspaceInfo.id,
             workspaceName: workspaceInfo.name,
+            created: !existingWorkspace && !existingProviderUserId,
         };
     }
 
