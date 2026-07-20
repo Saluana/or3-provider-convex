@@ -13,7 +13,8 @@
  * - Multi-tenant client pooling.
  *
  * Constraints:
- * - Requires `runtimeConfig.sync.convexUrl` to be configured.
+ * - Requires `runtimeConfig.sync.convexUrl` and `convexAdminKey`.
+ * - The admin credential is required because callers use internal Convex functions.
  * - Server-only usage.
  */
 
@@ -38,12 +39,23 @@ export function getConvexClient() {
 
     const runtimeConfig = useRuntimeConfig();
     const url = runtimeConfig.sync.convexUrl;
+    const adminKey = runtimeConfig.sync.convexAdminKey?.trim();
 
     if (typeof url !== 'string' || url.length === 0) {
         throw new Error('CONVEX_URL is not defined in runtime config');
     }
+    if (!adminKey) {
+        throw new Error('Convex admin key not configured');
+    }
 
     client = new ConvexHttpClient(url);
+    const issuer = 'https://or3.ai/internal';
+    const subject = 'or3-auxiliary-persistence';
+    client.setAdminAuth(adminKey, {
+        subject,
+        issuer,
+        tokenIdentifier: `${issuer}|${subject}`,
+    });
     return client;
 }
 

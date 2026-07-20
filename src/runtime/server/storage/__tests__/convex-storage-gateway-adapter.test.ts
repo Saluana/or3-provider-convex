@@ -106,7 +106,7 @@ describe('ConvexStorageGatewayAdapter', () => {
             provider: 'basic-auth',
             providerUserId: 'user-1',
         });
-        mutationMock.mockResolvedValueOnce({ uploadUrl: 'https://upload.example' });
+        mutationMock.mockResolvedValueOnce({ uploadUrl: 'https://upload.example', intentId: 'intent-1' });
 
         await adapter.presignUpload(makeEvent(), {
             workspaceId: 'ws-1',
@@ -124,7 +124,7 @@ describe('ConvexStorageGatewayAdapter', () => {
 
     it('maps presign upload/download and resolves expiry', async () => {
         const adapter = new ConvexStorageGatewayAdapter();
-        mutationMock.mockResolvedValueOnce({ uploadUrl: 'https://upload.example', expiresAt: '2026-02-06T12:00:00Z' });
+        mutationMock.mockResolvedValueOnce({ uploadUrl: 'https://upload.example', intentId: 'intent-1', expiresAt: '2026-02-06T12:00:00Z' });
         queryMock.mockResolvedValueOnce({ url: 'https://download.example', expiresAt: 123 });
 
         await expect(
@@ -134,7 +134,7 @@ describe('ConvexStorageGatewayAdapter', () => {
                 mimeType: 'image/png',
                 sizeBytes: 100,
             })
-        ).resolves.toEqual({ url: 'https://upload.example', expiresAt: 111_111 });
+        ).resolves.toEqual({ url: 'https://upload.example', expiresAt: 111_111, intentId: 'intent-1' });
 
         await expect(
             adapter.presignDownload(makeEvent(), {
@@ -148,6 +148,7 @@ describe('ConvexStorageGatewayAdapter', () => {
             hash: 'sha256:abc',
             mime_type: 'image/png',
             size_bytes: 100,
+            workspace_quota_bytes: undefined,
         });
 
         expect(queryMock).toHaveBeenCalledWith('storage.getFileUrl', {
@@ -173,6 +174,7 @@ describe('ConvexStorageGatewayAdapter', () => {
 
         await adapter.commit(makeEvent(), {
             workspace_id: 'ws-1',
+            intent_id: 'intent-1',
             hash: 'sha256:abc',
             storage_id: 'st_1',
             storage_provider_id: 'convex',
@@ -187,6 +189,7 @@ describe('ConvexStorageGatewayAdapter', () => {
 
         expect(mutationMock).toHaveBeenCalledWith('storage.commitUpload', {
             workspace_id: 'ws-1',
+            intent_id: 'intent-1',
             hash: 'sha256:abc',
             storage_id: 'st_1',
             storage_provider_id: 'convex',

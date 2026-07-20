@@ -4,7 +4,7 @@
  * Purpose:
  * Implements `SyncProvider` for the Convex backend using direct mode.
  * Authenticates via Clerk JWT template and communicates with Convex
- * functions for push, pull, subscription, and garbage collection.
+ * functions for push, pull, and subscription.
  *
  * Behavior:
  * - `subscribe()`: Uses `client.onUpdate()` for real-time reactivity
@@ -12,7 +12,7 @@
  * - `pull()`: Paginates through `api.sync.pull` query
  * - `push()`: Sends batched ops to `api.sync.push` mutation
  * - `updateCursor()`: Reports device cursor to `api.sync.updateDeviceCursor`
- * - `gcTombstones()` / `gcChangeLog()`: Invoke server-side GC mutations
+ * - Does not expose history GC while snapshot bootstrap is unavailable
  *
  * Constraints:
  * - Convex client must be captured in Vue setup context (uses `useConvexClient()`)
@@ -32,12 +32,19 @@ import type {
     SyncChange,
     PullRequest,
     PullResponse,
+    SnapshotRequest,
+    SnapshotResponse,
     PushBatch,
     PushResult,
     PendingOp,
     SyncSubscribeOptions,
 } from '~~/shared/sync/types';
-import { PullResponseSchema, SyncChangeSchema, PushResultSchema } from '~~/shared/sync/schemas';
+import {
+    PullResponseSchema,
+    SnapshotResponseSchema,
+    SyncChangeSchema,
+    PushResultSchema,
+} from '~~/shared/sync/schemas';
 import { z } from 'zod';
 import type { GenericId as Id } from 'convex/values';
 import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
@@ -70,6 +77,9 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         auth: {
             providerId: CONVEX_PROVIDER_ID,
             template: CONVEX_JWT_TEMPLATE, // Clerk JWT template name
+        },
+        capabilities: {
+            snapshotBootstrap: 'snapshot-v1',
         },
 
         async subscribe(
@@ -163,6 +173,23 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             return parsed.data;
         },
 
+        async snapshot(request: SnapshotRequest): Promise<SnapshotResponse> {
+            const result = await client.mutation(api.sync.snapshot, {
+                workspace_id: request.scope.workspaceId as Id<'workspaces'>,
+                page_size: request.pageSize,
+                page_token: request.pageToken,
+                tables: request.tables,
+            });
+
+            const parsed = SnapshotResponseSchema.safeParse(result);
+            if (!parsed.success) {
+                console.error('[convex-sync] Invalid snapshot response:', parsed.error);
+                throw new Error(`Invalid snapshot response: ${parsed.error.message}`);
+            }
+
+            return parsed.data;
+        },
+
         async push(batch: PushBatch): Promise<PushResult> {
             const result = await client.mutation(api.sync.push, {
                 workspace_id: batch.scope.workspaceId as Id<'workspaces'>,
@@ -197,20 +224,6 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
                 workspace_id: scope.workspaceId as Id<'workspaces'>,
                 device_id: deviceId,
                 last_seen_version: version,
-            });
-        },
-
-        async gcTombstones(scope: SyncScope, retentionSeconds: number): Promise<void> {
-            await client.mutation(api.sync.gcTombstones, {
-                workspace_id: scope.workspaceId as Id<'workspaces'>,
-                retention_seconds: retentionSeconds,
-            });
-        },
-
-        async gcChangeLog(scope: SyncScope, retentionSeconds: number): Promise<void> {
-            await client.mutation(api.sync.gcChangeLog, {
-                workspace_id: scope.workspaceId as Id<'workspaces'>,
-                retention_seconds: retentionSeconds,
             });
         },
 

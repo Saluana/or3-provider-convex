@@ -6,6 +6,7 @@ vi.mock('convex/server', () => ({
         sync: {
             watchChanges: 'sync.watchChanges',
             pull: 'sync.pull',
+            snapshot: 'sync.snapshot',
             push: 'sync.push',
             updateDeviceCursor: 'sync.updateDeviceCursor',
             gcTombstones: 'sync.gcTombstones',
@@ -139,7 +140,44 @@ describe('createConvexSyncProvider', () => {
         ).rejects.toThrow('Invalid push response');
     });
 
-    it('maps pull/push/updateCursor/gc calls to Convex APIs', async () => {
+    it('maps and validates materialized snapshot pages', async () => {
+        const provider = createConvexSyncProvider(client as any);
+        mutationMock.mockResolvedValue({
+            workspaceId: 'ws-1',
+            snapshotId: 'snapshot-1',
+            highWatermark: 12,
+            items: [
+                {
+                    kind: 'row',
+                    tableName: 'messages',
+                    pk: 'message-1',
+                    payload: { id: 'message-1', data: { text: 'hello' } },
+                    revision: { clock: 2, hlc: '12:0:dev', opId: 'op-12' },
+                },
+            ],
+            nextPageToken: 'opaque-next',
+        });
+
+        await expect(provider.snapshot?.({
+            scope: { workspaceId: 'ws-1' },
+            pageSize: 25,
+            pageToken: 'opaque-current',
+            tables: ['messages'],
+        })).resolves.toMatchObject({
+            snapshotId: 'snapshot-1',
+            highWatermark: 12,
+            nextPageToken: 'opaque-next',
+        });
+
+        expect(mutationMock).toHaveBeenCalledWith('sync.snapshot', {
+            workspace_id: 'ws-1',
+            page_size: 25,
+            page_token: 'opaque-current',
+            tables: ['messages'],
+        });
+    });
+
+    it('maps pull/push/updateCursor calls and does not expose history GC', async () => {
         const provider = createConvexSyncProvider(client as any);
         queryMock.mockResolvedValue({
             changes: [],
@@ -196,17 +234,16 @@ describe('createConvexSyncProvider', () => {
             last_seen_version: 123,
         });
 
-        await provider.gcTombstones?.({ workspaceId: 'ws-1' }, 3600);
-        expect(mutationMock).toHaveBeenCalledWith('sync.gcTombstones', {
-            workspace_id: 'ws-1',
-            retention_seconds: 3600,
-        });
-
-        await provider.gcChangeLog?.({ workspaceId: 'ws-1' }, 3600);
-        expect(mutationMock).toHaveBeenCalledWith('sync.gcChangeLog', {
-            workspace_id: 'ws-1',
-            retention_seconds: 3600,
-        });
+        expect(provider.gcTombstones).toBeUndefined();
+        expect(provider.gcChangeLog).toBeUndefined();
+        expect(mutationMock).not.toHaveBeenCalledWith(
+            'sync.gcTombstones',
+            expect.anything()
+        );
+        expect(mutationMock).not.toHaveBeenCalledWith(
+            'sync.gcChangeLog',
+            expect.anything()
+        );
     });
 
     it('dispose unsubscribes all tracked subscriptions', async () => {

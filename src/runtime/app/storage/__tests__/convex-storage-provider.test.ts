@@ -17,7 +17,7 @@ describe('createConvexStorageProvider', () => {
     it('maps upload/download/commit payloads to endpoints', async () => {
         const fetchMock = vi
             .fn()
-            .mockResolvedValueOnce(okJson({ url: 'u1', expiresAt: 1 }))
+            .mockResolvedValueOnce(okJson({ url: 'u1', expiresAt: 1, intentId: 'intent-1' }))
             .mockResolvedValueOnce(okJson({ url: 'u2', expiresAt: 2 }))
             .mockResolvedValueOnce(okJson({ ok: true }));
         vi.stubGlobal('fetch', fetchMock);
@@ -33,7 +33,7 @@ describe('createConvexStorageProvider', () => {
                 expiresInMs: 500,
                 disposition: 'inline',
             })
-        ).resolves.toEqual({ url: 'u1', expiresAt: 1 });
+        ).resolves.toEqual({ url: 'u1', expiresAt: 1, intentId: 'intent-1' });
 
         await expect(
             provider.getPresignedDownloadUrl({
@@ -49,6 +49,7 @@ describe('createConvexStorageProvider', () => {
             workspaceId: 'ws-1',
             hash: 'sha256:abc',
             storageId: 's1',
+            intentId: 'intent-1',
             meta: {
                 name: 'a.png',
                 mimeType: 'image/png',
@@ -75,6 +76,7 @@ describe('createConvexStorageProvider', () => {
 
         const commitBody = JSON.parse((fetchMock.mock.calls[2]?.[1] as RequestInit).body as string);
         expect(commitBody.storage_provider_id).toBe('convex');
+        expect(commitBody.intent_id).toBe('intent-1');
     });
 
     it('throws when endpoint returns non-OK status', async () => {

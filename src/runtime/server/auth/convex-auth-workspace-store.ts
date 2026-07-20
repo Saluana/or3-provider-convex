@@ -7,11 +7,18 @@
  * DO NOT import this file directly in core. Use getAuthWorkspaceStore('convex')
  * after the Convex provider package registers the store.
  */
-import type { AuthWorkspaceStore } from '~~/server/auth/store/types';
+import type {
+    AuthWorkspaceStore,
+    InviteProvisionResult,
+    InviteValidationResult,
+} from '~~/server/auth/store/types';
 import type { WorkspaceRole } from '~~/app/core/hooks/hook-types';
 import type { GenericId as Id } from 'convex/values';
 import { ConvexHttpClient } from 'convex/browser';
-import { convexApi as api } from '../../utils/convex-api';
+import {
+    convexApi as api,
+    convexInternalApi as internalApi,
+} from '../../utils/convex-api';
 import { useRuntimeConfig } from '#imports';
 import {
     isLegacyClerkOnlyError,
@@ -39,7 +46,11 @@ function buildProviderIssuer(provider: string): string {
     return `https://or3.ai/auth/${provider}`;
 }
 
-function getAdminConvexClient(provider: string, providerUserId: string): ConvexHttpClient {
+export function getAdminConvexClient(
+    provider: string,
+    providerUserId: string,
+    identity?: { email?: string }
+): ConvexHttpClient {
     const config = useRuntimeConfig();
     const { convexUrl: url, convexAdminKey: adminKey } = config.sync;
 
@@ -59,6 +70,8 @@ function getAdminConvexClient(provider: string, providerUserId: string): ConvexH
         subject: providerUserId,
         issuer,
         tokenIdentifier: `${issuer}|${providerUserId}`,
+        or3_server: true,
+        ...(identity?.email ? { email: identity.email } : {}),
     });
 
     return client;
@@ -73,38 +86,58 @@ function getAdminConvexClient(provider: string, providerUserId: string): ConvexH
  * - Maps Convex workspace data to AuthWorkspaceStore interface
  */
 export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
-    private readonly providerUserIdByInternalUserId = new Map<string, string>();
+    private readonly providerIdentityByInternalUserId = new Map<
+        string,
+        { provider: string; providerUserId: string }
+    >();
 
-    private async resolveProviderUserIdForInternalUser(input: {
+    private rememberProviderIdentity(input: {
+        userId: string;
+        provider: string;
+        providerUserId: string;
+    }): void {
+        this.providerIdentityByInternalUserId.set(input.userId, {
+            provider: input.provider,
+            providerUserId: input.providerUserId,
+        });
+    }
+
+    private async resolveProviderIdentityForInternalUser(input: {
         provider: string;
         userId: string;
-    }): Promise<string> {
-        const cached = this.providerUserIdByInternalUserId.get(input.userId);
+    }): Promise<{ provider: string; providerUserId: string }> {
+        const cached = this.providerIdentityByInternalUserId.get(input.userId);
         if (cached) return cached;
 
-        // Legacy shape where user.id already equals provider_user_id.
-        if (input.userId.startsWith('user_')) {
-            this.providerUserIdByInternalUserId.set(input.userId, input.userId);
-            return input.userId;
-        }
-
-        const convex = getAdminConvexClient(input.provider, input.userId);
+        // Resolve a declared internal ID under a neutral trusted-server identity.
+        // The internal query normalizes this string before any document lookup, so
+        // provider subjects (including Basic Auth UUIDs) are never cast to Convex IDs.
+        const convex = getAdminConvexClient(input.provider, 'or3-server');
         const account = await this.runConvexOperation('users.getAuthAccountByUserId', () =>
-            convex.query(api.users.getAuthAccountByUserId, {
+            convex.query(internalApi.users.getAuthAccountByUserId, {
                 provider: input.provider,
-                user_id: input.userId as Id<'users'>,
+                user_id: input.userId,
             })
         );
 
-        if (account?.provider_user_id) {
-            const providerUserId = String(account.provider_user_id);
-            this.providerUserIdByInternalUserId.set(input.userId, providerUserId);
-            return providerUserId;
+        if (
+            account?.user_id &&
+            String(account.user_id) === input.userId &&
+            account.provider &&
+            account.provider_user_id
+        ) {
+            const identity = {
+                provider: String(account.provider),
+                providerUserId: String(account.provider_user_id),
+            };
+            this.rememberProviderIdentity({
+                userId: String(account.user_id),
+                ...identity,
+            });
+            return identity;
         }
 
-        // Fallback keeps compatibility with historical datasets where IDs match.
-        this.providerUserIdByInternalUserId.set(input.userId, input.userId);
-        return input.userId;
+        throw new Error(`Unable to resolve provider identity for internal user "${input.userId}"`);
     }
 
     private async runConvexOperation<T>(
@@ -123,18 +156,30 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         providerUserId: string;
         email?: string;
         displayName?: string;
-    }): Promise<void> {
+    }): Promise<string> {
         const convex = getAdminConvexClient(input.provider, input.providerUserId);
 
         const resolved = await this.runConvexOperation('workspaces.resolveSession', () =>
-            convex.query(api.workspaces.resolveSession, {
+            convex.query(internalApi.workspaces.resolveSession, {
                 provider: input.provider,
                 provider_user_id: input.providerUserId,
             })
         );
-        if (resolved) return;
+        if (resolved?.user_id) return String(resolved.user_id);
 
-        await this.runConvexOperation('workspaces.ensure', () =>
+        if (resolved) {
+            const existingAccount = await this.runConvexOperation(
+                'users.getAuthAccountByProvider',
+                () =>
+                    convex.query(internalApi.users.getAuthAccountByProvider, {
+                        provider: input.provider,
+                        provider_user_id: input.providerUserId,
+                    })
+            );
+            if (existingAccount?.user_id) return String(existingAccount.user_id);
+        }
+
+        const ensured = await this.runConvexOperation('workspaces.ensure', () =>
             convex.mutation(api.workspaces.ensure, {
                 provider: input.provider,
                 provider_user_id: input.providerUserId,
@@ -142,6 +187,21 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
                 name: input.displayName,
             })
         );
+        if (ensured?.user_id) return String(ensured.user_id);
+
+        // Compatibility with older deployed templates whose ensure result did
+        // not yet include user_id.
+        const createdAccount = await this.runConvexOperation(
+            'users.getAuthAccountByProvider',
+            () =>
+                convex.query(internalApi.users.getAuthAccountByProvider, {
+                    provider: input.provider,
+                    provider_user_id: input.providerUserId,
+                })
+        );
+        if (createdAccount?.user_id) return String(createdAccount.user_id);
+
+        throw new Error('Convex user provisioning completed without an internal user ID');
     }
 
     async getOrCreateUser(input: {
@@ -151,25 +211,33 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         displayName?: string;
     }): Promise<{ userId: string }> {
         const configuredProvider = resolveConvexAuthProvider(input.provider);
+        let resolvedProvider = configuredProvider;
+        let userId: string;
 
         try {
-            await this.ensureUserWithProvider({
+            userId = await this.ensureUserWithProvider({
                 ...input,
                 provider: configuredProvider,
             });
         } catch (error) {
             if (configuredProvider !== 'clerk' && isLegacyClerkOnlyError(error)) {
                 markLegacyClerkOnlyBackend();
-                await this.ensureUserWithProvider({
+                resolvedProvider = 'clerk';
+                userId = await this.ensureUserWithProvider({
                     ...input,
-                    provider: 'clerk',
+                    provider: resolvedProvider,
                 });
             } else {
                 throw error;
             }
         }
 
-        return { userId: input.providerUserId };
+        this.rememberProviderIdentity({
+            userId,
+            provider: resolvedProvider,
+            providerUserId: input.providerUserId,
+        });
+        return { userId };
     }
 
     async getUser(input: {
@@ -186,34 +254,36 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         const provider = resolveConvexAuthProvider(input.provider);
         const convex = getAdminConvexClient(provider, input.providerUserId);
         const account = await this.runConvexOperation('users.getAuthAccountByProvider', () =>
-            convex.query(api.users.getAuthAccountByProvider, {
+            convex.query(internalApi.users.getAuthAccountByProvider, {
                 provider,
                 provider_user_id: input.providerUserId,
             })
         );
 
         if (!account?.user_id) return null;
-        this.providerUserIdByInternalUserId.set(
-            String(account.user_id),
-            input.providerUserId
-        );
-        return { userId: String(account.user_id) };
+        const userId = String(account.user_id);
+        this.rememberProviderIdentity({
+            userId,
+            provider: String(account.provider ?? provider),
+            providerUserId: String(account.provider_user_id ?? input.providerUserId),
+        });
+        return { userId };
     }
 
     async getOrCreateDefaultWorkspace(
         userId: string
     ): Promise<{ workspaceId: string; workspaceName: string; created?: boolean }> {
-        const provider = getConfiguredAuthProvider();
-        const existingProviderUserId = this.providerUserIdByInternalUserId.get(userId);
-        const providerUserId = await this.resolveProviderUserIdForInternalUser({
-            provider,
+        const configuredProvider = getConfiguredAuthProvider();
+        const hadProviderIdentity = this.providerIdentityByInternalUserId.has(userId);
+        const { provider, providerUserId } = await this.resolveProviderIdentityForInternalUser({
+            provider: configuredProvider,
             userId,
         });
         const convex = getAdminConvexClient(provider, providerUserId);
 
         // Get or create workspace via ensure
         const existingWorkspace = await this.runConvexOperation('workspaces.resolveSession', () =>
-            convex.query(api.workspaces.resolveSession, {
+            convex.query(internalApi.workspaces.resolveSession, {
                 provider,
                 provider_user_id: providerUserId,
             })
@@ -230,7 +300,7 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         return {
             workspaceId: workspaceInfo.id,
             workspaceName: workspaceInfo.name,
-            created: !existingWorkspace && !existingProviderUserId,
+            created: !existingWorkspace && !hadProviderIdentity,
         };
     }
 
@@ -238,15 +308,15 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         userId: string;
         workspaceId: string;
     }): Promise<WorkspaceRole | null> {
-        const provider = getConfiguredAuthProvider();
-        const providerUserId = await this.resolveProviderUserIdForInternalUser({
-            provider,
+        const configuredProvider = getConfiguredAuthProvider();
+        const { provider, providerUserId } = await this.resolveProviderIdentityForInternalUser({
+            provider: configuredProvider,
             userId: input.userId,
         });
         const convex = getAdminConvexClient(provider, providerUserId);
 
         const resolved = await this.runConvexOperation('workspaces.resolveSession', () =>
-            convex.query(api.workspaces.resolveSession, {
+            convex.query(internalApi.workspaces.resolveSession, {
                 provider,
                 provider_user_id: providerUserId,
             })
@@ -271,9 +341,9 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
             isActive?: boolean;
         }>
     > {
-        const provider = getConfiguredAuthProvider();
-        const providerUserId = await this.resolveProviderUserIdForInternalUser({
-            provider,
+        const configuredProvider = getConfiguredAuthProvider();
+        const { provider, providerUserId } = await this.resolveProviderIdentityForInternalUser({
+            provider: configuredProvider,
             userId,
         });
         const convex = getAdminConvexClient(provider, providerUserId);
@@ -303,9 +373,9 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         name: string;
         description?: string | null;
     }): Promise<{ workspaceId: string }> {
-        const provider = getConfiguredAuthProvider();
-        const providerUserId = await this.resolveProviderUserIdForInternalUser({
-            provider,
+        const configuredProvider = getConfiguredAuthProvider();
+        const { provider, providerUserId } = await this.resolveProviderIdentityForInternalUser({
+            provider: configuredProvider,
             userId: input.userId,
         });
         const convex = getAdminConvexClient(provider, providerUserId);
@@ -326,9 +396,9 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         name: string;
         description?: string | null;
     }): Promise<void> {
-        const provider = getConfiguredAuthProvider();
-        const providerUserId = await this.resolveProviderUserIdForInternalUser({
-            provider,
+        const configuredProvider = getConfiguredAuthProvider();
+        const { provider, providerUserId } = await this.resolveProviderIdentityForInternalUser({
+            provider: configuredProvider,
             userId: input.userId,
         });
         const convex = getAdminConvexClient(provider, providerUserId);
@@ -343,9 +413,9 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
     }
 
     async removeWorkspace(input: { userId: string; workspaceId: string }): Promise<void> {
-        const provider = getConfiguredAuthProvider();
-        const providerUserId = await this.resolveProviderUserIdForInternalUser({
-            provider,
+        const configuredProvider = getConfiguredAuthProvider();
+        const { provider, providerUserId } = await this.resolveProviderIdentityForInternalUser({
+            provider: configuredProvider,
             userId: input.userId,
         });
         const convex = getAdminConvexClient(provider, providerUserId);
@@ -361,9 +431,9 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         userId: string;
         workspaceId: string;
     }): Promise<void> {
-        const provider = getConfiguredAuthProvider();
-        const providerUserId = await this.resolveProviderUserIdForInternalUser({
-            provider,
+        const configuredProvider = getConfiguredAuthProvider();
+        const { provider, providerUserId } = await this.resolveProviderIdentityForInternalUser({
+            provider: configuredProvider,
             userId: input.userId,
         });
         const convex = getAdminConvexClient(provider, providerUserId);
@@ -383,9 +453,9 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         expiresAt: number;
         tokenHash: string;
     }): Promise<{ inviteId: string }> {
-        const provider = getConfiguredAuthProvider();
-        const providerUserId = await this.resolveProviderUserIdForInternalUser({
-            provider,
+        const configuredProvider = getConfiguredAuthProvider();
+        const { provider, providerUserId } = await this.resolveProviderIdentityForInternalUser({
+            provider: configuredProvider,
             userId: input.invitedByUserId,
         });
         const convex = getAdminConvexClient(provider, providerUserId);
@@ -394,7 +464,6 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
                 workspace_id: input.workspaceId as Id<'workspaces'>,
                 email: input.email,
                 role: input.role,
-                invited_by_user_id: input.invitedByUserId as Id<'users'>,
                 token_hash: input.tokenHash,
                 expires_at: input.expiresAt,
             })
@@ -409,8 +478,8 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
     }) {
         const provider = getConfiguredAuthProvider();
         const convex = getAdminConvexClient(provider, input.workspaceId);
-        const rows = await this.runConvexOperation('workspaces.listInvites', () =>
-            convex.query(api.workspaces.listInvites, {
+        const rows = await this.runConvexOperation('workspaces.listInvitesInternal', () =>
+            convex.query(internalApi.workspaces.listInvitesInternal, {
                 workspace_id: input.workspaceId as Id<'workspaces'>,
                 status: input.status,
                 limit: input.limit,
@@ -439,9 +508,9 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         inviteId: string;
         revokedByUserId: string;
     }): Promise<void> {
-        const provider = getConfiguredAuthProvider();
-        const providerUserId = await this.resolveProviderUserIdForInternalUser({
-            provider,
+        const configuredProvider = getConfiguredAuthProvider();
+        const { provider, providerUserId } = await this.resolveProviderIdentityForInternalUser({
+            provider: configuredProvider,
             userId: input.revokedByUserId,
         });
         const convex = getAdminConvexClient(provider, providerUserId);
@@ -451,6 +520,64 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
                 invite_id: input.inviteId as any,
             })
         );
+    }
+
+    async validateInvite(input: {
+        workspaceId: string;
+        email: string;
+        tokenHash: string;
+    }): Promise<InviteValidationResult> {
+        const provider = getConfiguredAuthProvider();
+        const convex = getAdminConvexClient(provider, input.workspaceId);
+        return await this.runConvexOperation('workspaces.validateInviteInternal', () =>
+            convex.query(internalApi.workspaces.validateInviteInternal, {
+                workspace_id: input.workspaceId as Id<'workspaces'>,
+                email: input.email,
+                token_hash: input.tokenHash,
+            })
+        ) as InviteValidationResult;
+    }
+
+    async acceptInviteAndProvisionUser(input: {
+        provider: string;
+        providerUserId: string;
+        email: string;
+        displayName?: string;
+        workspaceId: string;
+        tokenHash: string;
+    }): Promise<InviteProvisionResult> {
+        const provider = resolveConvexAuthProvider(input.provider);
+        const convex = getAdminConvexClient(provider, input.providerUserId, {
+            email: input.email,
+        });
+        const result = await this.runConvexOperation(
+            'workspaces.acceptInviteAndProvisionUser',
+            () => convex.mutation(internalApi.workspaces.acceptInviteAndProvisionUser, {
+                provider,
+                provider_user_id: input.providerUserId,
+                email: input.email,
+                name: input.displayName,
+                workspace_id: input.workspaceId as Id<'workspaces'>,
+                token_hash: input.tokenHash,
+            })
+        ) as InviteProvisionResult & { user_id?: string };
+
+        if (!result.ok) return result;
+        const userId = result.user_id ?? result.userId;
+        if (!userId) {
+            throw new Error('Convex atomic invite provisioning returned no internal user id');
+        }
+        this.rememberProviderIdentity({
+            userId,
+            provider,
+            providerUserId: input.providerUserId,
+        });
+        return {
+            ok: true,
+            userId,
+            role: result.role,
+            createdUser: result.createdUser,
+        };
     }
 
     async consumeInvite(input: {
@@ -470,18 +597,19 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
                   | 'token_mismatch';
           }
     > {
-        const provider = getConfiguredAuthProvider();
-        const providerUserId = await this.resolveProviderUserIdForInternalUser({
-            provider,
+        const configuredProvider = getConfiguredAuthProvider();
+        const { provider, providerUserId } = await this.resolveProviderIdentityForInternalUser({
+            provider: configuredProvider,
             userId: input.acceptedUserId,
         });
-        const convex = getAdminConvexClient(provider, providerUserId);
+        const convex = getAdminConvexClient(provider, providerUserId, {
+            email: input.email,
+        });
         const result = await this.runConvexOperation('workspaces.consumeInvite', () =>
             convex.mutation(api.workspaces.consumeInvite, {
                 workspace_id: input.workspaceId as Id<'workspaces'>,
                 email: input.email,
                 token_hash: input.tokenHash,
-                accepted_user_id: input.acceptedUserId as Id<'users'>,
             })
         );
 

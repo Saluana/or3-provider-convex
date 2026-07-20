@@ -2,29 +2,17 @@
  * @module server/admin/providers/adapters/sync-convex.ts
  *
  * Purpose:
- * Admin adapter for the Convex sync provider. Provides maintenance tools for
- * the sync change log and tombstone tracking.
- *
- * Key Operations:
- * - **Change Log GC**: Purges historical sync entries that have been fully
- *   propagated to all devices beyond the retention window.
- * - **Tombstone GC**: Permanently deletes metadata records of deleted entities.
+ * Admin status adapter for the Convex sync provider.
  *
  * Constraints:
- * - Requires a valid Clerk gateway token for authentication.
- * - Actions are workspace-scoped.
+ * - History GC is unavailable until snapshot bootstrap is verified.
  */
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
-import { convexApi as api } from '../../../utils/convex-api';
-import type { GenericId as Id } from 'convex/values';
-import { getConvexGatewayClient } from '../../utils/convex-gateway';
 import {
     CLERK_PROVIDER_ID,
-    CONVEX_JWT_TEMPLATE,
     CONVEX_PROVIDER_ID,
 } from '~~/shared/cloud/provider-ids';
-import { resolveProviderToken } from '~~/server/auth/token-broker/resolve';
 import { listProviderTokenBrokerIds } from '~~/server/auth/token-broker/registry';
 import type {
     ProviderAdminAdapter,
@@ -33,22 +21,7 @@ import type {
     ProviderActionContext,
 } from '~~/server/admin/providers/types';
 import { useRuntimeConfig } from '#imports';
-
-/** Default retention window for sync metadata (30 days). */
-const DEFAULT_RETENTION_SECONDS = 30 * 24 * 3600;
-
-/**
- * Purpose:
- * Normalizes user-provided GC limits into seconds.
- */
-function resolveRetentionSeconds(payload?: Record<string, unknown>): number {
-    const days = typeof payload?.retentionDays === 'number' ? payload.retentionDays : null;
-    const seconds =
-        typeof payload?.retentionSeconds === 'number' ? payload.retentionSeconds : null;
-    if (seconds && Number.isFinite(seconds) && seconds > 0) return seconds;
-    if (days && Number.isFinite(days) && days > 0) return Math.floor(days * 24 * 3600);
-    return DEFAULT_RETENTION_SECONDS;
-}
+import { SYNC_HISTORY_GC_POLICY } from '../../../utils/sync-history-gc-policy';
 
 /**
  * Singleton implementation of the Convex Sync admin adapter.
@@ -88,43 +61,28 @@ export const convexSyncAdminAdapter: ProviderAdminAdapter = {
                 });
             }
         }
+        warnings.push({
+            level: 'warning',
+            message: SYNC_HISTORY_GC_POLICY.reason,
+        });
 
         return {
             details: {
                 convexUrl: config.sync.convexUrl,
             },
             warnings,
-            actions: [
-                {
-                    id: 'sync.gc-change-log',
-                    label: 'Run Sync Change Log GC',
-                    description: 'Purge old change_log entries from the database after the retention window.',
-                    danger: true,
-                },
-                {
-                    id: 'sync.gc-tombstones',
-                    label: 'Run Sync Tombstone GC',
-                    description: 'Purge metadata tombstones after the retention window.',
-                    danger: true,
-                },
-            ],
+            actions: [],
         };
     },
 
     /**
      * Purpose:
-     * Executes sync maintenance tasks.
-     *
-     * Behavior:
-     * - `sync.gc-change-log`: Calls the purge mutation for historical change logs.
-     * - `sync.gc-tombstones`: Calls the purge mutation for entity tombstones.
-     *
-     * @throws 401 Unauthorized if a valid Clerk token cannot be resolved.
+     * Rejects stale history-GC action IDs while snapshot bootstrap is absent.
      */
     async runAction(
-        event: H3Event,
+        _event: H3Event,
         actionId: string,
-        payload: Record<string, unknown> | undefined,
+        _payload: Record<string, unknown> | undefined,
         ctx: ProviderActionContext
     ): Promise<unknown> {
         if (!ctx.session.workspace?.id) {
@@ -134,29 +92,13 @@ export const convexSyncAdminAdapter: ProviderAdminAdapter = {
             });
         }
 
-        const token = await resolveProviderToken(event, {
-            providerId: CONVEX_PROVIDER_ID,
-            template: CONVEX_JWT_TEMPLATE,
-        });
-        if (!token) {
-            throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-        }
-
-        const client = getConvexGatewayClient(event, token);
-        const workspaceId = ctx.session.workspace.id as Id<'workspaces'>;
-        const retentionSeconds = resolveRetentionSeconds(payload);
-
-        if (actionId === 'sync.gc-change-log') {
-            return await client.mutation(api.sync.gcChangeLog, {
-                workspace_id: workspaceId,
-                retention_seconds: retentionSeconds,
-            });
-        }
-
-        if (actionId === 'sync.gc-tombstones') {
-            return await client.mutation(api.sync.gcTombstones, {
-                workspace_id: workspaceId,
-                retention_seconds: retentionSeconds,
+        if (
+            actionId === 'sync.gc-change-log' ||
+            actionId === 'sync.gc-tombstones'
+        ) {
+            throw createError({
+                statusCode: 503,
+                statusMessage: SYNC_HISTORY_GC_POLICY.reason,
             });
         }
 

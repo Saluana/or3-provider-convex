@@ -17,7 +17,7 @@
  * - Server-only usage.
  */
 
-import { convexApi as api } from '../../utils/convex-api';
+import { convexInternalApi as internalApi } from '../../utils/convex-api';
 import type { GenericId as Id } from 'convex/values';
 import { getConvexClient } from '../utils/convex-client';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
@@ -83,7 +83,7 @@ export async function emitBackgroundJobComplete(
         },
     ];
 
-    const notificationId = await client.mutation(api.notifications.create, {
+    const notificationId = await client.mutation(internalApi.notifications.create, {
         workspace_id: workspaceId as Id<'workspaces'>,
         user_id: userId,
         thread_id: threadId,
@@ -129,7 +129,7 @@ export async function emitBackgroundJobError(
     const title = 'Background response failed';
     const body = `Failed: ${error}`;
 
-    const notificationId = await client.mutation(api.notifications.create, {
+    const notificationId = await client.mutation(internalApi.notifications.create, {
         workspace_id: workspaceId as Id<'workspaces'>,
         user_id: userId,
         thread_id: threadId,

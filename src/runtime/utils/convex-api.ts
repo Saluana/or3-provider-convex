@@ -18,10 +18,16 @@ function createNamespaceProxy(namespace: string): NamespaceApi {
 
 export const convexApi = {
     admin: createNamespaceProxy('admin'),
+    storage: createNamespaceProxy('storage'),
+    sync: createNamespaceProxy('sync'),
+    users: createNamespaceProxy('users'),
+    workspaces: createNamespaceProxy('workspaces'),
+} as const;
+
+export const convexInternalApi = {
     backgroundJobs: createNamespaceProxy('backgroundJobs'),
     notifications: createNamespaceProxy('notifications'),
     rateLimits: createNamespaceProxy('rateLimits'),
-    storage: createNamespaceProxy('storage'),
     sync: createNamespaceProxy('sync'),
     users: createNamespaceProxy('users'),
     webhooks: createNamespaceProxy('webhooks'),
@@ -46,6 +52,29 @@ export const convexApiContractNames = [
     'admin:setWorkspaceSetting',
     'admin:softDeleteWorkspace',
     'admin:upsertWorkspaceMember',
+    'storage:commitUpload',
+    'storage:gcDeletedFiles',
+    'storage:generateUploadUrl',
+    'storage:getFileUrl',
+    'sync:pull',
+    'sync:queryCanonicalStorage',
+    'sync:snapshot',
+    'sync:push',
+    'sync:updateDeviceCursor',
+    'sync:watchChanges',
+    'workspaces:create',
+    'workspaces:createInvite',
+    'workspaces:consumeInvite',
+    'workspaces:ensure',
+    'workspaces:listInvites',
+    'workspaces:listMyWorkspaces',
+    'workspaces:remove',
+    'workspaces:revokeInvite',
+    'workspaces:setActive',
+    'workspaces:update',
+] as const;
+
+export const convexInternalApiContractNames = [
     'backgroundJobs:abort',
     'backgroundJobs:checkAborted',
     'backgroundJobs:cleanup',
@@ -56,18 +85,15 @@ export const convexApiContractNames = [
     'backgroundJobs:getActiveCount',
     'backgroundJobs:update',
     'notifications:create',
+    'notifications:getByUser',
+    'notifications:markRead',
     'rateLimits:checkAndRecord',
+    'rateLimits:cleanup',
     'rateLimits:getStats',
-    'storage:commitUpload',
-    'storage:gcDeletedFiles',
-    'storage:generateUploadUrl',
-    'storage:getFileUrl',
     'sync:gcChangeLog',
     'sync:gcTombstones',
-    'sync:pull',
-    'sync:push',
-    'sync:updateDeviceCursor',
-    'sync:watchChanges',
+    'sync:runScheduledGc',
+    'sync:runWorkspaceGc',
     'users:getAuthAccountByProvider',
     'users:getAuthAccountByUserId',
     'webhooks:cancelDeliveriesByWebhook',
@@ -90,20 +116,16 @@ export const convexApiContractNames = [
     'webhooks:updateDeliveryLog',
     'webhooks:updateWebhook',
     'webhooks:updateWebhookHealth',
-    'workspaces:create',
-    'workspaces:createInvite',
-    'workspaces:consumeInvite',
-    'workspaces:ensure',
-    'workspaces:listInvites',
-    'workspaces:listMyWorkspaces',
-    'workspaces:remove',
-    'workspaces:revokeInvite',
+    'workspaces:acceptInviteAndProvisionUser',
+    'workspaces:listInvitesInternal',
     'workspaces:resolveSession',
-    'workspaces:setActive',
-    'workspaces:update',
+    'workspaces:validateInviteInternal',
 ] as const;
 
 export function getConvexApiReference(functionName: string): any {
+    if ((convexInternalApiContractNames as readonly string[]).includes(functionName)) {
+        throw new Error(`Internal Convex function is not public: ${functionName}`);
+    }
     const [namespace, handler] = functionName.split(':');
     if (!namespace || !handler) {
         throw new Error(`Invalid Convex function name: ${functionName}`);
@@ -112,6 +134,19 @@ export function getConvexApiReference(functionName: string): any {
     const reference = namespaceApi?.[handler];
     if (!reference) {
         throw new Error(`Missing Convex function reference: ${functionName}`);
+    }
+    return reference;
+}
+
+export function getConvexInternalApiReference(functionName: string): any {
+    const [namespace, handler] = functionName.split(':');
+    if (!namespace || !handler) {
+        throw new Error(`Invalid Convex internal function name: ${functionName}`);
+    }
+    const namespaceApi = (anyApi as AnyApiShape)[namespace];
+    const reference = namespaceApi?.[handler];
+    if (!reference) {
+        throw new Error(`Missing Convex internal function reference: ${functionName}`);
     }
     return reference;
 }

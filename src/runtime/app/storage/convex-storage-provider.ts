@@ -32,6 +32,7 @@ const PresignedUrlResponseSchema = z
         expiresAt: z.number(),
         headers: z.record(z.string(), z.string()).optional(),
         storageId: z.string().optional(),
+        intentId: z.string().optional(),
         method: z.string().optional(),
     })
     .passthrough();
@@ -113,6 +114,7 @@ export function createConvexStorageProvider(): ObjectStorageProvider {
                     workspace_id: input.workspaceId,
                     hash: input.hash,
                     storage_id: input.storageId,
+                    intent_id: input.intentId,
                     storage_provider_id: input.storageProviderId ?? CONVEX_STORAGE_PROVIDER_ID,
                     name: input.meta.name,
                     mime_type: input.meta.mimeType,

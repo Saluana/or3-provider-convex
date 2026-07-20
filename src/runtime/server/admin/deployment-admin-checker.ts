@@ -5,8 +5,11 @@
  * Convex-backed deployment admin checker.
  */
 import type { DeploymentAdminChecker } from '~~/server/auth/deployment-admin';
-import { convexApi as api } from '../../utils/convex-api';
-import { getConvexClient } from '../utils/convex-client';
+import {
+    convexApi as api,
+    convexInternalApi as internalApi,
+} from '../../utils/convex-api';
+import { getAdminConvexClient } from '../auth/convex-auth-workspace-store';
 
 export class ConvexDeploymentAdminChecker implements DeploymentAdminChecker {
     async checkDeploymentAdmin(
@@ -14,10 +17,10 @@ export class ConvexDeploymentAdminChecker implements DeploymentAdminChecker {
         provider: string
     ): Promise<boolean> {
         try {
-            const convex = getConvexClient();
+            const convex = getAdminConvexClient(provider, providerUserId);
 
             const authAccount = await convex.query(
-                api.users.getAuthAccountByProvider,
+                internalApi.users.getAuthAccountByProvider,
                 {
                     provider,
                     provider_user_id: providerUserId,

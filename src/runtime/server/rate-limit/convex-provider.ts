@@ -14,7 +14,7 @@
  */
 
 import { ConvexHttpClient } from 'convex/browser';
-import { convexApi as api } from '../../utils/convex-api';
+import { convexInternalApi as internalApi } from '../../utils/convex-api';
 import type {
     RateLimitProvider,
     RateLimitConfig,
@@ -48,12 +48,22 @@ export class ConvexRateLimitProvider implements RateLimitProvider {
         const convexUrl =
             (config.sync as { convexUrl?: string } | undefined)?.convexUrl ??
             config.public.sync.convexUrl;
+        const adminKey = (
+            config.sync as { convexAdminKey?: string } | undefined
+        )?.convexAdminKey?.trim();
 
-        if (!convexUrl) {
+        if (!convexUrl || !adminKey) {
             return null;
         }
 
         this.client = new ConvexHttpClient(convexUrl);
+        const issuer = 'https://or3.ai/internal';
+        const subject = 'or3-rate-limit-store';
+        this.client.setAdminAuth(adminKey, {
+            subject,
+            issuer,
+            tokenIdentifier: `${issuer}|${subject}`,
+        });
         return this.client;
     }
 
@@ -66,7 +76,7 @@ export class ConvexRateLimitProvider implements RateLimitProvider {
 
         try {
             // Atomic check and record
-            const result = await client.mutation(api.rateLimits.checkAndRecord, {
+            const result = await client.mutation(internalApi.rateLimits.checkAndRecord, {
                 key,
                 windowMs: config.windowMs,
                 maxRequests: config.maxRequests,
@@ -90,7 +100,7 @@ export class ConvexRateLimitProvider implements RateLimitProvider {
         }
 
         try {
-            return await client.query(api.rateLimits.getStats, {
+            return await client.query(internalApi.rateLimits.getStats, {
                 key,
                 windowMs: config.windowMs,
                 maxRequests: config.maxRequests,

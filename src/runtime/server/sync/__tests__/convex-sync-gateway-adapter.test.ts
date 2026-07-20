@@ -15,6 +15,8 @@ vi.mock('convex/server', () => ({
     anyApi: {
         sync: {
             pull: 'sync.pull',
+            queryCanonicalStorage: 'sync.queryCanonicalStorage',
+            snapshot: 'sync.snapshot',
             push: 'sync.push',
             updateDeviceCursor: 'sync.updateDeviceCursor',
             gcTombstones: 'sync.gcTombstones',
@@ -90,7 +92,7 @@ describe('ConvexSyncGatewayAdapter', () => {
         mutationMock.mockReset();
     });
 
-    it('requires token for all methods and returns 401 when missing', async () => {
+    it('requires token for operational methods and returns 401 when missing', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
         resolveProviderTokenMock.mockResolvedValue(null);
 
@@ -106,15 +108,7 @@ describe('ConvexSyncGatewayAdapter', () => {
             adapter.updateCursor(makeEvent(), { scope: { workspaceId: 'ws-1' }, deviceId: 'd1', version: 1 })
         ).rejects.toMatchObject({ statusCode: 401 });
 
-        await expect(
-            adapter.gcTombstones(makeEvent(), { scope: { workspaceId: 'ws-1' }, retentionSeconds: 10 })
-        ).rejects.toMatchObject({ statusCode: 401 });
-
-        await expect(
-            adapter.gcChangeLog(makeEvent(), { scope: { workspaceId: 'ws-1' }, retentionSeconds: 10 })
-        ).rejects.toMatchObject({ statusCode: 401 });
-
-        expect(resolveProviderTokenMock).toHaveBeenCalledTimes(5);
+        expect(resolveProviderTokenMock).toHaveBeenCalledTimes(3);
     });
 
     it('falls back to admin gateway client when provider token is unavailable', async () => {
@@ -189,7 +183,70 @@ describe('ConvexSyncGatewayAdapter', () => {
         });
     });
 
-    it('maps push/updateCursor/gc methods to Convex API', async () => {
+    it('maps bounded snapshot pages through the Convex mutation', async () => {
+        const adapter = new ConvexSyncGatewayAdapter();
+        mutationMock.mockResolvedValue({
+            workspaceId: 'ws-1',
+            snapshotId: 'snapshot-1',
+            highWatermark: 7,
+            items: [
+                {
+                    kind: 'tombstone',
+                    tableName: 'projects',
+                    pk: 'project-1',
+                    revision: { clock: 3, hlc: '7:0:dev', opId: 'op-7' },
+                    serverDeletedAt: 1007,
+                },
+            ],
+            nextPageToken: null,
+        });
+
+        await expect(adapter.snapshot(makeEvent(), {
+            scope: { workspaceId: 'ws-1' },
+            pageSize: 50,
+            tables: ['projects'],
+        })).resolves.toMatchObject({
+            snapshotId: 'snapshot-1',
+            highWatermark: 7,
+            nextPageToken: null,
+        });
+
+        expect(mutationMock).toHaveBeenCalledWith('sync.snapshot', {
+            workspace_id: 'ws-1',
+            page_size: 50,
+            page_token: undefined,
+            tables: ['projects'],
+        });
+    });
+
+    it('maps bounded canonical storage pages through the Convex query', async () => {
+        queryMock.mockResolvedValue({
+            items: [{ kind: 'metadata', hash: 'abc', sizeBytes: 12, updatedAt: 1 }],
+            hasMore: false,
+        });
+        const adapter = new ConvexSyncGatewayAdapter();
+
+        await expect(adapter.queryCanonicalStorage(makeEvent(), {
+            scope: { workspaceId: 'ws-1' },
+            kind: 'live_metadata',
+            limit: 25,
+            hash: 'sha256:abc',
+            now: 123,
+        })).resolves.toEqual({
+            items: [{ kind: 'metadata', hash: 'abc', sizeBytes: 12, updatedAt: 1 }],
+            hasMore: false,
+        });
+        expect(queryMock).toHaveBeenCalledWith('sync.queryCanonicalStorage', {
+            workspace_id: 'ws-1',
+            kind: 'live_metadata',
+            page_size: 25,
+            cursor: undefined,
+            hash: 'sha256:abc',
+            now: 123,
+        });
+    });
+
+    it('maps push/updateCursor and verified retention methods to Convex API', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
         mutationMock.mockResolvedValue({ results: [], serverVersion: 5 });
 
@@ -232,7 +289,19 @@ describe('ConvexSyncGatewayAdapter', () => {
             last_seen_version: 123,
         });
 
+        runtimeConfig.sync.convexAdminKey = 'admin-key';
+        resolveSessionContextMock.mockResolvedValue({
+            authenticated: true,
+            provider: 'clerk',
+            providerUserId: 'subject-1',
+        });
+
         await adapter.gcTombstones(makeEvent(), {
+            scope: { workspaceId: 'ws-1' },
+            retentionSeconds: 3600,
+        });
+
+        await adapter.gcChangeLog(makeEvent(), {
             scope: { workspaceId: 'ws-1' },
             retentionSeconds: 3600,
         });
@@ -240,15 +309,11 @@ describe('ConvexSyncGatewayAdapter', () => {
             workspace_id: 'ws-1',
             retention_seconds: 3600,
         });
-
-        await adapter.gcChangeLog(makeEvent(), {
-            scope: { workspaceId: 'ws-1' },
-            retentionSeconds: 3600,
-        });
         expect(mutationMock).toHaveBeenCalledWith('sync.gcChangeLog', {
             workspace_id: 'ws-1',
             retention_seconds: 3600,
         });
+        expect(resolveProviderTokenMock).toHaveBeenCalledTimes(2);
     });
 
     it('calls resolveProviderToken for each method with provider/template', async () => {
@@ -259,12 +324,11 @@ describe('ConvexSyncGatewayAdapter', () => {
         await adapter.pull(makeEvent(), { scope: { workspaceId: 'ws-1' }, cursor: 0, limit: 10 });
         await adapter.push(makeEvent(), { scope: { workspaceId: 'ws-1' }, ops: [] });
         await adapter.updateCursor(makeEvent(), { scope: { workspaceId: 'ws-1' }, deviceId: 'd1', version: 1 });
-        await adapter.gcTombstones(makeEvent(), { scope: { workspaceId: 'ws-1' }, retentionSeconds: 1 });
-        await adapter.gcChangeLog(makeEvent(), { scope: { workspaceId: 'ws-1' }, retentionSeconds: 1 });
 
         for (const call of resolveProviderTokenMock.mock.calls) {
             expect(call[1]).toEqual({ providerId: 'convex', template: 'convex' });
         }
+        expect(resolveProviderTokenMock).toHaveBeenCalledTimes(3);
     });
 
     it('emits webhook runtime hooks for successful push operations', async () => {

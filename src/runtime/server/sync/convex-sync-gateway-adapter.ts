@@ -10,16 +10,22 @@
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
 import { useRuntimeConfig } from '#imports';
-import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
+import type {
+    CanonicalStorageQueryRequest,
+    CanonicalStorageQueryResponse,
+    SyncGatewayAdapter,
+} from '~~/server/sync/gateway/types';
 import type {
     PendingOp,
     PullRequest,
     PullResponse,
+    SnapshotRequest,
+    SnapshotResponse,
     PushBatch,
     PushResult,
 } from '~~/shared/sync/types';
 import type { GenericId as Id } from 'convex/values';
-import { convexApi as api } from '../../utils/convex-api';
+import { convexApi as api, convexInternalApi as internalApi } from '../../utils/convex-api';
 import {
     buildGatewayAdminIdentity,
     getConvexAdminGatewayClient,
@@ -34,6 +40,7 @@ import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provide
 import { resolveProviderToken } from '~~/server/auth/token-broker/resolve';
 import { resolveSessionContext } from '~~/server/auth/session';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
+import { canRunSyncHistoryGc } from '../../utils/sync-history-gc-policy';
 
 type ConvexPullChange = {
     serverVersion: number;
@@ -283,6 +290,23 @@ async function getSyncGatewayClient(event: H3Event) {
     );
 }
 
+async function getSyncGcAdminClient(event: H3Event) {
+    const config = useRuntimeConfig(event);
+    const adminKey = config.sync?.convexAdminKey;
+    if (!adminKey) {
+        throw createError({ statusCode: 503, statusMessage: 'Convex admin key required for history retention' });
+    }
+    const session = await resolveSessionContext(event);
+    if (!session.authenticated || !session.provider || !session.providerUserId) {
+        throw createError({ statusCode: 401, statusMessage: 'Unauthorized' });
+    }
+    return getConvexAdminGatewayClient(
+        event,
+        adminKey,
+        buildGatewayAdminIdentity(resolveConvexAuthProvider(session.provider), session.providerUserId)
+    );
+}
+
 /**
  * Convex-backed SyncGatewayAdapter implementation.
  *
@@ -293,6 +317,10 @@ async function getSyncGatewayClient(event: H3Event) {
  */
 export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
     id = 'convex';
+    readonly capabilities = {
+        snapshotBootstrap: 'snapshot-v1',
+        historyRetention: 'snapshot-v1',
+    } as const;
 
     async pull(event: H3Event, input: PullRequest): Promise<PullResponse> {
         const client = await getSyncGatewayClient(event);
@@ -320,6 +348,43 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                 nextCursor: result.nextCursor,
                 hasMore: result.hasMore,
             };
+        } catch (error) {
+            throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
+        }
+    }
+
+    async snapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
+        const client = await getSyncGatewayClient(event);
+        try {
+            return await withConvexTransportRetry('sync.snapshot', () =>
+                client.mutation(api.sync.snapshot, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    page_size: input.pageSize,
+                    page_token: input.pageToken,
+                    tables: input.tables,
+                })
+            );
+        } catch (error) {
+            throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
+        }
+    }
+
+    async queryCanonicalStorage(
+        event: H3Event,
+        input: CanonicalStorageQueryRequest
+    ): Promise<CanonicalStorageQueryResponse> {
+        const client = await getSyncGatewayClient(event);
+        try {
+            return await withConvexTransportRetry('sync.queryCanonicalStorage', () =>
+                client.query(api.sync.queryCanonicalStorage, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    kind: input.kind,
+                    page_size: input.limit ?? 100,
+                    cursor: input.cursor,
+                    hash: input.hash,
+                    now: input.now,
+                })
+            );
         } catch (error) {
             throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
         }
@@ -427,34 +492,28 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         event: H3Event,
         input: { scope: { workspaceId: string }; retentionSeconds: number }
     ): Promise<void> {
-        const client = await getSyncGatewayClient(event);
-        try {
-            await withConvexTransportRetry('sync.gcTombstones', () =>
-                client.mutation(api.sync.gcTombstones, {
-                    workspace_id: toWorkspaceId(input.scope.workspaceId),
-                    retention_seconds: input.retentionSeconds,
-                })
-            );
-        } catch (error) {
-            throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
-        }
+        if (!canRunSyncHistoryGc()) return;
+        const client = await getSyncGcAdminClient(event);
+        await withConvexTransportRetry('sync.gcTombstones', () =>
+            client.mutation(internalApi.sync.gcTombstones, {
+                workspace_id: toWorkspaceId(input.scope.workspaceId),
+                retention_seconds: input.retentionSeconds,
+            })
+        );
     }
 
     async gcChangeLog(
         event: H3Event,
         input: { scope: { workspaceId: string }; retentionSeconds: number }
     ): Promise<void> {
-        const client = await getSyncGatewayClient(event);
-        try {
-            await withConvexTransportRetry('sync.gcChangeLog', () =>
-                client.mutation(api.sync.gcChangeLog, {
-                    workspace_id: toWorkspaceId(input.scope.workspaceId),
-                    retention_seconds: input.retentionSeconds,
-                })
-            );
-        } catch (error) {
-            throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
-        }
+        if (!canRunSyncHistoryGc()) return;
+        const client = await getSyncGcAdminClient(event);
+        await withConvexTransportRetry('sync.gcChangeLog', () =>
+            client.mutation(internalApi.sync.gcChangeLog, {
+                workspace_id: toWorkspaceId(input.scope.workspaceId),
+                retention_seconds: input.retentionSeconds,
+            })
+        );
     }
 }
 

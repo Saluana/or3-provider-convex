@@ -1,6 +1,6 @@
 import {
-    mutationGeneric as mutation,
-    queryGeneric as query,
+    internalMutationGeneric as internalMutation,
+    internalQueryGeneric as internalQuery,
 } from 'convex/server';
 import { v } from 'convex/values';
 
@@ -18,7 +18,7 @@ const deliveryStatus = v.union(
     v.literal('cancelled')
 );
 
-export const createWebhook = mutation({
+export const createWebhook = internalMutation({
     args: {
         id: v.string(),
         scope: v.union(v.literal('user'), v.literal('admin')),
@@ -44,7 +44,7 @@ export const createWebhook = mutation({
     },
 });
 
-export const updateWebhook = mutation({
+export const updateWebhook = internalMutation({
     args: {
         webhook_id: v.string(),
         url: v.string(),
@@ -89,7 +89,7 @@ export const updateWebhook = mutation({
     },
 });
 
-export const deleteWebhook = mutation({
+export const deleteWebhook = internalMutation({
     args: { webhook_id: v.string() },
     handler: async (ctx, args) => {
         const row = await ctx.db
@@ -110,7 +110,7 @@ export const deleteWebhook = mutation({
     },
 });
 
-export const getWebhook = query({
+export const getWebhook = internalQuery({
     args: { webhook_id: v.string() },
     handler: async (ctx, args) => {
         return ctx.db
@@ -120,7 +120,7 @@ export const getWebhook = query({
     },
 });
 
-export const listWebhooks = query({
+export const listWebhooks = internalQuery({
     args: {
         user_id: v.string(),
         workspace_id: v.string(),
@@ -140,7 +140,7 @@ export const listWebhooks = query({
     },
 });
 
-export const listAdminWebhooks = query({
+export const listAdminWebhooks = internalQuery({
     args: {},
     handler: async (ctx) => {
         return ctx.db
@@ -151,7 +151,7 @@ export const listAdminWebhooks = query({
     },
 });
 
-export const listWebhooksByEvent = query({
+export const listWebhooksByEvent = internalQuery({
     args: {
         event_type: v.string(),
         scope: v.union(v.literal('user'), v.literal('admin')),
@@ -183,7 +183,7 @@ export const listWebhooksByEvent = query({
     },
 });
 
-export const listWebhooksByCustomHook = query({
+export const listWebhooksByCustomHook = internalQuery({
     args: {
         hook_name: v.string(),
     },
@@ -201,7 +201,7 @@ export const listWebhooksByCustomHook = query({
     },
 });
 
-export const listActiveCustomHookNames = query({
+export const listActiveCustomHookNames = internalQuery({
     args: {},
     handler: async (ctx) => {
         const rows = await ctx.db
@@ -222,7 +222,7 @@ export const listActiveCustomHookNames = query({
     },
 });
 
-export const updateWebhookHealth = mutation({
+export const updateWebhookHealth = internalMutation({
     args: {
         webhook_id: v.string(),
         health: webhookHealth,
@@ -244,7 +244,7 @@ export const updateWebhookHealth = mutation({
     },
 });
 
-export const disableAllWebhooks = mutation({
+export const disableAllWebhooks = internalMutation({
     args: {
         user_id: v.string(),
         workspace_id: v.string(),
@@ -275,7 +275,7 @@ export const disableAllWebhooks = mutation({
     },
 });
 
-export const createDeliveryLog = mutation({
+export const createDeliveryLog = internalMutation({
     args: {
         id: v.string(),
         webhook_id: v.string(),
@@ -311,7 +311,7 @@ export const createDeliveryLog = mutation({
     },
 });
 
-export const updateDeliveryLog = mutation({
+export const updateDeliveryLog = internalMutation({
     args: {
         log_id: v.string(),
         status: v.optional(deliveryStatus),
@@ -364,7 +364,7 @@ export const updateDeliveryLog = mutation({
     },
 });
 
-export const getDeliveryLogs = query({
+export const getDeliveryLogs = internalQuery({
     args: {
         webhook_id: v.string(),
         since: v.number(),
@@ -380,7 +380,7 @@ export const getDeliveryLogs = query({
     },
 });
 
-export const getRecentTerminalDeliveries = query({
+export const getRecentTerminalDeliveries = internalQuery({
     args: {
         webhook_id: v.string(),
         limit: v.number(),
@@ -414,7 +414,7 @@ export const getRecentTerminalDeliveries = query({
     },
 });
 
-export const claimPendingDeliveries = mutation({
+export const claimPendingDeliveries = internalMutation({
     args: {
         worker_id: v.string(),
         limit: v.number(),
@@ -454,7 +454,7 @@ export const claimPendingDeliveries = mutation({
     },
 });
 
-export const resetStaleInFlightDeliveries = mutation({
+export const resetStaleInFlightDeliveries = internalMutation({
     args: {
         cutoff: v.number(),
     },
@@ -481,7 +481,7 @@ export const resetStaleInFlightDeliveries = mutation({
     },
 });
 
-export const cancelDeliveriesByWebhook = mutation({
+export const cancelDeliveriesByWebhook = internalMutation({
     args: {
         webhook_id: v.string(),
     },
@@ -512,7 +512,7 @@ export const cancelDeliveriesByWebhook = mutation({
     },
 });
 
-export const deleteDeliveryLogsByWebhook = mutation({
+export const deleteDeliveryLogsByWebhook = internalMutation({
     args: {
         webhook_id: v.string(),
     },
@@ -527,7 +527,7 @@ export const deleteDeliveryLogsByWebhook = mutation({
     },
 });
 
-export const purgeExpiredLogs = mutation({
+export const purgeExpiredLogs = internalMutation({
     args: {
         before_timestamp: v.number(),
     },

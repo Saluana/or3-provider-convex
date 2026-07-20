@@ -12,8 +12,8 @@
  * - Cleanup removes stale or timed-out jobs in batches
  *
  * Constraints:
- * - This module does not authenticate callers. Caller must enforce access
- *   control for job creation and reads.
+ * - Every function is internal and may only be called by trusted server code.
+ * - User-scoped reads and aborts still require an exact stored-owner match.
  * - Status transitions are not strictly enforced beyond simple guards.
  *
  * Non-Goals:
@@ -22,7 +22,7 @@
  */
 
 import { v } from 'convex/values';
-import { mutation, query } from './_generated/server';
+import { internalMutation, internalQuery } from './_generated/server';
 
 // ============================================================
 // CONSTANTS
@@ -36,7 +36,7 @@ const CLEANUP_BATCH_SIZE = 100;
 // ============================================================
 
 /**
- * `backgroundJobs.create` (mutation)
+ * `backgroundJobs.create` (internal mutation)
  *
  * Purpose:
  * Creates a new streaming job record for a user and thread.
@@ -45,7 +45,7 @@ const CLEANUP_BATCH_SIZE = 100;
  * - Initializes `status` to `streaming`
  * - Initializes content and chunk counters
  */
-export const create = mutation({
+export const create = internalMutation({
     args: {
         user_id: v.string(),
         thread_id: v.string(),
@@ -79,16 +79,15 @@ export const create = mutation({
 });
 
 /**
- * `backgroundJobs.get` (query)
+ * `backgroundJobs.get` (internal query)
  *
  * Purpose:
- * Retrieves a job by ID with a simple user ownership check.
+ * Retrieves a job by ID with an exact user ownership check.
  *
  * Authorization:
- * - If `user_id` is `'*'`, the ownership check is skipped.
- * - Otherwise the job must belong to the provided `user_id`.
+ * - The job must belong to the server-resolved `user_id`.
  */
-export const get = query({
+export const get = internalQuery({
     args: {
         job_id: v.id('background_jobs'),
         user_id: v.string(),
@@ -97,8 +96,7 @@ export const get = query({
         const job = await ctx.db.get(args.job_id);
         if (!job) return null;
 
-        // Authorization check (skip if user_id is '*')
-        if (args.user_id !== '*' && job.user_id !== args.user_id) {
+        if (job.user_id !== args.user_id) {
             return null;
         }
 
@@ -122,7 +120,7 @@ export const get = query({
 });
 
 /**
- * `backgroundJobs.update` (mutation)
+ * `backgroundJobs.update` (internal mutation)
  *
  * Purpose:
  * Appends streamed content and updates progress counters.
@@ -130,7 +128,7 @@ export const get = query({
  * Constraints:
  * - No-op if the job is not in `streaming` state.
  */
-export const update = mutation({
+export const update = internalMutation({
     args: {
         job_id: v.id('background_jobs'),
         content_chunk: v.optional(v.string()),
@@ -164,12 +162,12 @@ export const update = mutation({
 });
 
 /**
- * `backgroundJobs.complete` (mutation)
+ * `backgroundJobs.complete` (internal mutation)
  *
  * Purpose:
  * Marks a job as completed and stores final content.
  */
-export const complete = mutation({
+export const complete = internalMutation({
     args: {
         job_id: v.id('background_jobs'),
         content: v.string(),
@@ -196,12 +194,12 @@ export const complete = mutation({
 });
 
 /**
- * `backgroundJobs.fail` (mutation)
+ * `backgroundJobs.fail` (internal mutation)
  *
  * Purpose:
  * Marks a job as failed and stores an error string.
  */
-export const fail = mutation({
+export const fail = internalMutation({
     args: {
         job_id: v.id('background_jobs'),
         error: v.string(),
@@ -219,7 +217,7 @@ export const fail = mutation({
 });
 
 /**
- * `backgroundJobs.abort` (mutation)
+ * `backgroundJobs.abort` (internal mutation)
  *
  * Purpose:
  * Requests cancellation of an active streaming job.
@@ -227,7 +225,7 @@ export const fail = mutation({
  * Behavior:
  * - Returns `false` when the job is missing, not owned, or not streaming.
  */
-export const abort = mutation({
+export const abort = internalMutation({
     args: {
         job_id: v.id('background_jobs'),
         user_id: v.string(),
@@ -236,8 +234,7 @@ export const abort = mutation({
         const job = await ctx.db.get(args.job_id);
         if (!job) return false;
 
-        // Authorization check
-        if (args.user_id !== '*' && job.user_id !== args.user_id) {
+        if (job.user_id !== args.user_id) {
             return false;
         }
 
@@ -256,7 +253,7 @@ export const abort = mutation({
 });
 
 /**
- * `backgroundJobs.checkAborted` (query)
+ * `backgroundJobs.checkAborted` (internal query)
  *
  * Purpose:
  * Lightweight polling endpoint to determine whether a job has been aborted.
@@ -264,7 +261,7 @@ export const abort = mutation({
  * Behavior:
  * - Returns `true` when the job does not exist to allow callers to stop work.
  */
-export const checkAborted = query({
+export const checkAborted = internalQuery({
     args: {
         job_id: v.id('background_jobs'),
     },
@@ -277,7 +274,7 @@ export const checkAborted = query({
 });
 
 /**
- * `backgroundJobs.cleanup` (mutation)
+ * `backgroundJobs.cleanup` (internal mutation)
  *
  * Purpose:
  * Cleans up timed-out streaming jobs and removes stale completed jobs.
@@ -286,7 +283,7 @@ export const checkAborted = query({
  * - Times out streaming jobs older than `timeout_ms`
  * - Deletes completed, errored, or aborted jobs older than `retention_ms`
  */
-export const cleanup = mutation({
+export const cleanup = internalMutation({
     args: {
         timeout_ms: v.optional(v.number()),
         retention_ms: v.optional(v.number()),
@@ -336,12 +333,12 @@ export const cleanup = mutation({
 });
 
 /**
- * `backgroundJobs.getActiveCount` (query)
+ * `backgroundJobs.getActiveCount` (internal query)
  *
  * Purpose:
  * Returns the number of currently streaming jobs.
  */
-export const getActiveCount = query({
+export const getActiveCount = internalQuery({
     args: {},
     handler: async (ctx) => {
         const jobs = await ctx.db

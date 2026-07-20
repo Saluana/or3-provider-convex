@@ -12,10 +12,8 @@
  * - `markRead` sets `read_at` for a notification in a workspace
  *
  * Authorization:
- * This module currently does not call `ctx.auth.getUserIdentity()`.
- * Callers are responsible for enforcing access control.
- * In OR3 Cloud gateway mode, SSR endpoints should enforce authorization via
- * `can()` and only then call these functions.
+ * Every function is internal. Resolved SSR subjects and trusted notification
+ * authors are the only callers allowed to choose a target user or workspace.
  *
  * Constraints:
  * - Timestamps are stored in seconds since epoch (integer).
@@ -27,7 +25,11 @@
  */
 
 import { v } from 'convex/values';
-import { mutation, query, type MutationCtx } from './_generated/server';
+import {
+    internalMutation,
+    internalQuery,
+    type MutationCtx,
+} from './_generated/server';
 import type { Id } from './_generated/dataModel';
 
 const nowSec = (): number => Math.floor(Date.now() / 1000);
@@ -55,7 +57,7 @@ async function allocateServerVersion(
 }
 
 /**
- * `notifications.create` (mutation)
+ * `notifications.create` (internal mutation)
  *
  * Purpose:
  * Creates a single notification entry for a user in a workspace.
@@ -69,7 +71,7 @@ async function allocateServerVersion(
  * - This mutation does not validate that `user_id` belongs to the workspace.
  *   Callers must enforce access control.
  */
-export const create = mutation({
+export const create = internalMutation({
     args: {
         workspace_id: v.id('workspaces'),
         user_id: v.string(),
@@ -138,7 +140,7 @@ export const create = mutation({
 });
 
 /**
- * `notifications.getByUser` (query)
+ * `notifications.getByUser` (internal query)
  *
  * Purpose:
  * Lists recent notifications for a workspace user.
@@ -151,7 +153,7 @@ export const create = mutation({
  * Constraints:
  * - `limit` is caller-controlled. Callers should pass a reasonable cap.
  */
-export const getByUser = query({
+export const getByUser = internalQuery({
     args: {
         workspace_id: v.id('workspaces'),
         user_id: v.string(),
@@ -171,7 +173,7 @@ export const getByUser = query({
 });
 
 /**
- * `notifications.markRead` (mutation)
+ * `notifications.markRead` (internal mutation)
  *
  * Purpose:
  * Marks a specific notification as read for a workspace.
@@ -181,7 +183,7 @@ export const getByUser = query({
  * - Returns `false` if the notification does not exist
  * - Sets `read_at` and bumps `updated_at`
  */
-export const markRead = mutation({
+export const markRead = internalMutation({
     args: {
         workspace_id: v.id('workspaces'),
         notification_id: v.string(),

@@ -22,7 +22,7 @@
  */
 
 import { v } from 'convex/values';
-import { mutation, query, internalMutation } from './_generated/server';
+import { internalMutation, internalQuery } from './_generated/server';
 
 // ============================================================
 // CONSTANTS
@@ -42,7 +42,7 @@ const MAX_CLEANUP_BATCHES = 5;
 // ============================================================
 
 /**
- * `rateLimits.checkAndRecord` (mutation)
+ * `rateLimits.checkAndRecord` (internal mutation)
  *
  * Purpose:
  * Atomically records a rate-limit hit for `key` and returns whether the request
@@ -55,10 +55,9 @@ const MAX_CLEANUP_BATCHES = 5;
  * - Returns `retryAfterMs` when blocked
  *
  * Constraints:
- * - This mutation does not authenticate the caller.
- *   Callers must ensure untrusted clients cannot choose arbitrary keys.
+ * - Only trusted server code may call this function and construct subject keys.
  */
-export const checkAndRecord = mutation({
+export const checkAndRecord = internalMutation({
     args: {
         key: v.string(),
         windowMs: v.number(),
@@ -126,7 +125,7 @@ export const checkAndRecord = mutation({
 });
 
 /**
- * `rateLimits.getStats` (query)
+ * `rateLimits.getStats` (internal query)
  *
  * Purpose:
  * Returns current window state for a key without incrementing counters.
@@ -134,7 +133,7 @@ export const checkAndRecord = mutation({
  * Behavior:
  * - Returns a full allowance when no record exists or the window has expired
  */
-export const getStats = query({
+export const getStats = internalQuery({
     args: {
         key: v.string(),
         windowMs: v.number(),

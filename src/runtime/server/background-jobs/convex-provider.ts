@@ -22,7 +22,7 @@ import type {
     JobUpdate,
 } from '~~/server/utils/background-jobs/types';
 import { getJobConfig } from '~~/server/utils/background-jobs/store';
-import { convexApi as api } from '../../utils/convex-api';
+import { convexInternalApi as internalApi } from '../../utils/convex-api';
 import type { GenericId as Id } from 'convex/values';
 import { getConvexClient } from '../utils/convex-client';
 import { CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
@@ -59,7 +59,7 @@ export const convexJobProvider: BackgroundJobProvider = {
 
         // Check active count first
         const activeCount = await client.query(
-            api.backgroundJobs.getActiveCount,
+            internalApi.backgroundJobs.getActiveCount,
             {}
         );
         if (activeCount >= config.maxConcurrentJobs) {
@@ -77,7 +77,7 @@ export const convexJobProvider: BackgroundJobProvider = {
 
         let jobId: unknown;
         try {
-            jobId = await client.mutation(api.backgroundJobs.create, {
+            jobId = await client.mutation(internalApi.backgroundJobs.create, {
                 ...legacyCreatePayload,
                 kind: params.kind,
                 tool_calls: params.tool_calls,
@@ -89,7 +89,7 @@ export const convexJobProvider: BackgroundJobProvider = {
                 throw error;
             }
             jobId = await client.mutation(
-                api.backgroundJobs.create,
+                internalApi.backgroundJobs.create,
                 legacyCreatePayload
             );
         }
@@ -99,7 +99,7 @@ export const convexJobProvider: BackgroundJobProvider = {
 
     async getJob(jobId: string, userId: string): Promise<BackgroundJob | null> {
         const client = getClient();
-        const job = await client.query(api.backgroundJobs.get, {
+        const job = await client.query(internalApi.backgroundJobs.get, {
             job_id: jobId as Id<'background_jobs'>,
             user_id: userId,
         });
@@ -143,7 +143,7 @@ export const convexJobProvider: BackgroundJobProvider = {
         };
 
         try {
-            await client.mutation(api.backgroundJobs.update, extendedUpdatePayload);
+            await client.mutation(internalApi.backgroundJobs.update, extendedUpdatePayload);
         } catch (error) {
             // Backward-compat: deployed Convex validators may not include new fields yet.
             if (
@@ -153,13 +153,13 @@ export const convexJobProvider: BackgroundJobProvider = {
             ) {
                 throw error;
             }
-            await client.mutation(api.backgroundJobs.update, legacyUpdatePayload);
+            await client.mutation(internalApi.backgroundJobs.update, legacyUpdatePayload);
         }
     },
 
     async completeJob(jobId: string, finalContent: string): Promise<void> {
         const client = getClient();
-        await client.mutation(api.backgroundJobs.complete, {
+        await client.mutation(internalApi.backgroundJobs.complete, {
             job_id: jobId as Id<'background_jobs'>,
             content: finalContent,
         });
@@ -167,7 +167,7 @@ export const convexJobProvider: BackgroundJobProvider = {
 
     async failJob(jobId: string, error: string): Promise<void> {
         const client = getClient();
-        await client.mutation(api.backgroundJobs.fail, {
+        await client.mutation(internalApi.backgroundJobs.fail, {
             job_id: jobId as Id<'background_jobs'>,
             error,
         });
@@ -175,7 +175,7 @@ export const convexJobProvider: BackgroundJobProvider = {
 
     async abortJob(jobId: string, userId: string): Promise<boolean> {
         const client = getClient();
-        return await client.mutation(api.backgroundJobs.abort, {
+        return await client.mutation(internalApi.backgroundJobs.abort, {
             job_id: jobId as Id<'background_jobs'>,
             user_id: userId,
         });
@@ -188,7 +188,7 @@ export const convexJobProvider: BackgroundJobProvider = {
 
     async checkJobAborted(jobId: string): Promise<boolean> {
         const client = getClient();
-        return await client.query(api.backgroundJobs.checkAborted, {
+        return await client.query(internalApi.backgroundJobs.checkAborted, {
             job_id: jobId as Id<'background_jobs'>,
         });
     },
@@ -196,7 +196,7 @@ export const convexJobProvider: BackgroundJobProvider = {
     async cleanupExpired(): Promise<number> {
         const client = getClient();
         const config = getJobConfig();
-        return await client.mutation(api.backgroundJobs.cleanup, {
+        return await client.mutation(internalApi.backgroundJobs.cleanup, {
             timeout_ms: config.jobTimeoutMs,
             retention_ms: config.completedJobRetentionMs,
         });
@@ -204,6 +204,6 @@ export const convexJobProvider: BackgroundJobProvider = {
 
     async getActiveJobCount(): Promise<number> {
         const client = getClient();
-        return await client.query(api.backgroundJobs.getActiveCount, {});
+        return await client.query(internalApi.backgroundJobs.getActiveCount, {});
     },
 };

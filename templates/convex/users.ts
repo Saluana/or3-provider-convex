@@ -2,8 +2,8 @@
  * @module convex/users
  *
  * Purpose:
- * Small identity and account lookup utilities used by the client and test
- * harness to validate auth integration.
+ * Small identity and account lookup utilities used by the server auth bridge
+ * and client identity UI.
  *
  * Behavior:
  * - `me` returns the caller's auth identity (or `null`)
@@ -17,30 +17,40 @@
  * - Full user profile APIs.
  * - Workspace authorization checks (handled in workspace/sync modules).
  */
-import { query } from './_generated/server';
+import { internalQuery, query } from './_generated/server';
 import { v } from 'convex/values';
 import type { Id } from './_generated/dataModel';
+import { requireCallerSubject, requireCallerUserId } from './authz';
 
 /**
- * `users.getAuthAccountByProvider` (query)
+ * `users.getAuthAccountByProvider` (internal query)
  *
  * Purpose:
  * Looks up an auth account mapping by `(provider, provider_user_id)`.
  *
  * Authorization:
- * This query does not validate the caller's identity and should be treated as
- * an internal/testing surface. Do not expose it to untrusted clients.
+ * Internal-only. Trusted SSR provider calls use Convex admin auth and bind the
+ * lookup to the impersonated provider subject.
  *
  * Behavior:
  * - Returns `null` when no mapping exists
  * - Returns the internal `user_id` (Convex Id<'users'>) when found
  */
-export const getAuthAccountByProvider = query({
+export const getAuthAccountByProvider = internalQuery({
     args: {
         provider: v.string(),
         provider_user_id: v.string(),
     },
     handler: async (ctx, args) => {
+        await requireCallerSubject(
+            ctx,
+            {
+                provider: args.provider,
+                providerUserId: args.provider_user_id,
+            },
+            { allowTrustedServer: true }
+        );
+
         const authAccount = await ctx.db
             .query('auth_accounts')
             .withIndex('by_provider', (q) =>
@@ -61,24 +71,29 @@ export const getAuthAccountByProvider = query({
 });
 
 /**
- * `users.getAuthAccountByUserId` (query)
+ * `users.getAuthAccountByUserId` (internal query)
  *
  * Purpose:
  * Looks up the provider mapping for an internal user id.
  *
  * Authorization:
- * Internal/testing surface. Do not expose to untrusted clients.
+ * Internal-only. Trusted SSR provider calls use Convex admin auth and may only
+ * resolve the internal user represented by the authenticated server context.
  */
-export const getAuthAccountByUserId = query({
+export const getAuthAccountByUserId = internalQuery({
     args: {
         provider: v.string(),
-        user_id: v.id('users'),
+        user_id: v.string(),
     },
     handler: async (ctx, args) => {
+        const userId = ctx.db.normalizeId('users', args.user_id);
+        if (!userId) return null;
+        await requireCallerUserId(ctx, userId, { allowTrustedServer: true });
+
         const authAccount = await ctx.db
             .query('auth_accounts')
             .withIndex('by_user_provider', (q) =>
-                q.eq('user_id', args.user_id).eq('provider', args.provider)
+                q.eq('user_id', userId).eq('provider', args.provider)
             )
             .first();
 

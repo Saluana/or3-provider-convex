@@ -33,6 +33,7 @@ import { resolveSessionContext } from '~~/server/auth/session';
 
 const CommitInputSchema = z.object({
     workspace_id: z.string().min(1),
+    intent_id: z.string().min(1),
     hash: z.string().min(1),
     storage_id: z.string().min(1),
     storage_provider_id: z.string().min(1),
@@ -113,13 +114,19 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
             hash: input.hash,
             mime_type: input.mimeType,
             size_bytes: input.sizeBytes,
+            workspace_quota_bytes: input.workspaceQuotaBytes,
         });
+
+        if (typeof result.intentId !== 'string' || !result.intentId) {
+            throw createError({ statusCode: 502, statusMessage: 'Convex did not persist an upload intent' });
+        }
 
         const expiresAt = resolvePresignExpiresAt(result, undefined);
 
         return {
             url: result.uploadUrl,
             expiresAt,
+            intentId: result.intentId,
         };
     }
 
@@ -152,6 +159,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
 
         await client.mutation(api.storage.commitUpload, {
             workspace_id: toWorkspaceId(commitInput.workspace_id),
+            intent_id: commitInput.intent_id as Id<'upload_intents'>,
             hash: commitInput.hash,
             storage_id: toStorageId(commitInput.storage_id),
             storage_provider_id: commitInput.storage_provider_id,

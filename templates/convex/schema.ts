@@ -169,6 +169,7 @@ export default defineSchema({
     device_cursors: defineTable({
         workspace_id: v.id('workspaces'),
         device_id: v.string(),
+        owner_user_id: v.optional(v.id('users')),
         last_seen_version: v.number(),
         updated_at: v.number(),
     })
@@ -183,12 +184,49 @@ export default defineSchema({
         table_name: v.string(),
         pk: v.string(),
         deleted_at: v.number(),
+        server_deleted_at: v.optional(v.number()),
         clock: v.number(),
+        hlc: v.optional(v.string()),
+        op_id: v.optional(v.string()),
         server_version: v.number(),
         created_at: v.number(),
     })
         .index('by_workspace_version', ['workspace_id', 'server_version'])
         .index('by_workspace_table_pk', ['workspace_id', 'table_name', 'pk']),
+
+    /** Frozen high-watermarks and table filters for paginated snapshots. */
+    sync_snapshot_sessions: defineTable({
+        workspace_id: v.id('workspaces'),
+        user_id: v.string(),
+        high_watermark: v.number(),
+        tables: v.array(v.string()),
+        created_at: v.number(),
+        expires_at: v.number(),
+    })
+        .index('by_workspace', ['workspace_id'])
+        .index('by_expires_at', ['expires_at']),
+
+    /**
+     * Applied materialized pre-images used only when a later write occurs
+     * after a snapshot's frozen high-watermark.
+     */
+    sync_record_versions: defineTable({
+        workspace_id: v.id('workspaces'),
+        table_name: v.string(),
+        pk: v.string(),
+        server_version: v.number(),
+        kind: v.union(v.literal('row'), v.literal('tombstone')),
+        payload: v.optional(v.any()),
+        clock: v.number(),
+        hlc: v.string(),
+        op_id: v.string(),
+        server_deleted_at: v.optional(v.number()),
+    }).index('by_workspace_table_pk_version', [
+        'workspace_id',
+        'table_name',
+        'pk',
+        'server_version',
+    ]),
 
     // ============================================================
     // SYNCED DATA TABLES
@@ -217,6 +255,8 @@ export default defineSchema({
         branch_mode: v.optional(v.nullable(v.union(v.literal('reference'), v.literal('copy')))),
         forked: v.boolean(),
         hlc: v.optional(v.string()),
+        op_id: v.optional(v.string()),
+        server_version: v.optional(v.number()),
     })
         .index('by_workspace', ['workspace_id', 'updated_at'])
         .index('by_workspace_id', ['workspace_id', 'id']),
@@ -243,6 +283,8 @@ export default defineSchema({
         clock: v.number(),
         stream_id: v.optional(v.nullable(v.string())),
         hlc: v.optional(v.string()),
+        op_id: v.optional(v.string()),
+        server_version: v.optional(v.number()),
     })
         .index('by_thread', ['workspace_id', 'thread_id', 'index', 'order_key'])
         .index('by_workspace_id', ['workspace_id', 'id']),
@@ -262,6 +304,8 @@ export default defineSchema({
         updated_at: v.number(),
         clock: v.number(),
         hlc: v.optional(v.string()),
+        op_id: v.optional(v.string()),
+        server_version: v.optional(v.number()),
     })
         .index('by_workspace', ['workspace_id', 'updated_at'])
         .index('by_workspace_id', ['workspace_id', 'id']),
@@ -283,6 +327,8 @@ export default defineSchema({
         updated_at: v.number(),
         clock: v.number(),
         hlc: v.optional(v.string()),
+        op_id: v.optional(v.string()),
+        server_version: v.optional(v.number()),
     })
         .index('by_workspace', ['workspace_id', 'updated_at'])
         .index('by_workspace_id', ['workspace_id', 'id']),
@@ -300,7 +346,7 @@ export default defineSchema({
         width: v.optional(v.number()),
         height: v.optional(v.number()),
         page_count: v.optional(v.number()),
-        ref_count: v.number(), // Derived locally, synced as hint
+        ref_count: v.number(), // Compatibility cache only; never imported as authority
         storage_id: v.optional(v.id('_storage')), // Convex storage reference
         storage_provider_id: v.optional(v.string()),
         deleted: v.boolean(),
@@ -309,9 +355,34 @@ export default defineSchema({
         updated_at: v.number(),
         clock: v.number(),
         hlc: v.optional(v.string()),
+        op_id: v.optional(v.string()),
+        server_version: v.optional(v.number()),
     })
         .index('by_workspace_hash', ['workspace_id', 'hash'])
         .index('by_workspace_deleted', ['workspace_id', 'deleted']),
+
+    /** Persisted, expiring, one-time upload intents and quota reservations. */
+    upload_intents: defineTable({
+        workspace_id: v.id('workspaces'),
+        user_id: v.id('users'),
+        hash: v.string(),
+        mime_type: v.string(),
+        size_bytes: v.number(),
+        reserved_bytes: v.number(),
+        expires_at: v.number(),
+        status: v.union(
+            v.literal('active'),
+            v.literal('consumed'),
+            v.literal('cancelled')
+        ),
+        storage_id: v.optional(v.id('_storage')),
+        created_at: v.number(),
+        consumed_at: v.optional(v.number()),
+        cancelled_at: v.optional(v.number()),
+    })
+        .index('by_workspace_status', ['workspace_id', 'status'])
+        .index('by_workspace_hash_status', ['workspace_id', 'hash', 'status'])
+        .index('by_expiry', ['expires_at']),
 
     /**
      * KV store - key-value pairs for user preferences
@@ -327,6 +398,8 @@ export default defineSchema({
         updated_at: v.number(),
         clock: v.number(),
         hlc: v.optional(v.string()),
+        op_id: v.optional(v.string()),
+        server_version: v.optional(v.number()),
     })
         .index('by_workspace_name', ['workspace_id', 'name'])
         .index('by_workspace_id', ['workspace_id', 'id']),
@@ -351,6 +424,8 @@ export default defineSchema({
         updated_at: v.number(),
         clock: v.number(),
         hlc: v.optional(v.string()),
+        op_id: v.optional(v.string()),
+        server_version: v.optional(v.number()),
     })
         .index('by_workspace', ['workspace_id', 'updated_at'])
         .index('by_workspace_id', ['workspace_id', 'id'])

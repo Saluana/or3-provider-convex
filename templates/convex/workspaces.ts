@@ -9,7 +9,7 @@
  * Behavior:
  * - Authenticated users can create and list their workspaces
  * - Membership is required for updates, activation, and removal
- * - `ensure` and `resolveSession` support session bootstrapping
+ * - `ensure` and internal `resolveSession` support session bootstrapping
  *
  * Constraints:
  * - Provider identity is inferred from the JWT issuer
@@ -19,9 +19,21 @@
  * - Admin-grade management of all workspaces (see convex/admin.ts)
  * - Fine-grained role permissions beyond owner checks
  */
-import { mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
+import {
+    internalMutation,
+    internalQuery,
+    mutation,
+    query,
+    type MutationCtx,
+    type QueryCtx,
+} from './_generated/server';
 import { v } from 'convex/values';
 import type { Id, TableNames } from './_generated/dataModel';
+import {
+    requireCallerSubject,
+    requireInviteAcceptance,
+    requireWorkspaceRole,
+} from './authz';
 
 // ============================================================
 // CONSTANTS
@@ -55,7 +67,7 @@ function normalizeEmail(email: string): string {
     return email.trim().toLowerCase();
 }
 
-async function markExpiredInvites(ctx: MutationCtx | QueryCtx, workspaceId: Id<'workspaces'>, now: number) {
+async function markExpiredInvites(ctx: MutationCtx, workspaceId: Id<'workspaces'>, now: number) {
     const pending = await ctx.db
         .query('auth_invites')
         .withIndex('by_workspace_status', (q) =>
@@ -73,6 +85,84 @@ async function markExpiredInvites(ctx: MutationCtx | QueryCtx, workspaceId: Id<'
                 })
             )
     );
+}
+
+type InviteStatus = 'pending' | 'accepted' | 'revoked' | 'expired';
+
+async function listWorkspaceInvites(
+    ctx: MutationCtx | QueryCtx,
+    args: {
+        workspace_id: Id<'workspaces'>;
+        status?: InviteStatus;
+        limit?: number;
+    }
+) {
+    const now = Date.now();
+    const limit = Math.max(1, Math.min(args.limit ?? 100, 500));
+    const rows = await ctx.db
+        .query('auth_invites')
+        .withIndex('by_workspace_status', (q) => q.eq('workspace_id', args.workspace_id))
+        .collect();
+
+    return rows
+        .map((row) => ({
+            row,
+            status: row.status === 'pending' && row.expires_at <= now
+                ? 'expired' as const
+                : row.status,
+        }))
+        .filter(({ status }) => !args.status || status === args.status)
+        .sort((a, b) => b.row.created_at - a.row.created_at)
+        .slice(0, limit)
+        .map(({ row, status }) => ({
+            id: row._id,
+            workspace_id: row.workspace_id,
+            email: row.email,
+            role: row.role,
+            status,
+            invited_by_user_id: row.invited_by_user_id,
+            token_hash: row.token_hash,
+            expires_at: row.expires_at,
+            accepted_at: row.accepted_at ?? null,
+            accepted_user_id: row.accepted_user_id ?? null,
+            revoked_at: row.revoked_at ?? null,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }));
+}
+
+async function findInviteByTokenHash(
+    ctx: MutationCtx | QueryCtx,
+    workspaceId: Id<'workspaces'>,
+    tokenHash: string
+) {
+    return await ctx.db
+        .query('auth_invites')
+        .withIndex('by_workspace_token_hash', (q) =>
+            q.eq('workspace_id', workspaceId).eq('token_hash', tokenHash)
+        )
+        .first();
+}
+
+function validateInviteRecord(
+    invite: Awaited<ReturnType<typeof findInviteByTokenHash>>,
+    email: string,
+    now: number
+) {
+    if (!invite) return { ok: false as const, reason: 'not_found' as const };
+    if (invite.email !== normalizeEmail(email)) {
+        return { ok: false as const, reason: 'email_mismatch' as const };
+    }
+    if (invite.status === 'accepted') {
+        return { ok: false as const, reason: 'already_used' as const };
+    }
+    if (invite.status === 'revoked') {
+        return { ok: false as const, reason: 'revoked' as const };
+    }
+    if (invite.status === 'expired' || invite.expires_at <= now) {
+        return { ok: false as const, reason: 'expired' as const };
+    }
+    return { ok: true as const, role: invite.role, invite };
 }
 
 /**
@@ -556,6 +646,7 @@ export const ensure = mutation({
         }
 
         return {
+            user_id: userId,
             id: workspaceId,
             name: workspace?.name ?? 'Personal Workspace',
             description: workspace?.description ?? null,
@@ -565,21 +656,31 @@ export const ensure = mutation({
 });
 
 /**
- * `workspaces.resolveSession` (query)
+ * `workspaces.resolveSession` (internal query)
  *
  * Purpose:
  * Resolves a user and workspace session without mutating state.
+ * This is not registered in the public Convex API.
  *
  * Behavior:
  * - Returns `null` when the mapping or workspace cannot be found
  * - Falls back to the oldest membership when no active workspace is set
  */
-export const resolveSession = query({
+export const resolveSession = internalQuery({
     args: {
         provider: v.string(),
         provider_user_id: v.string(),
     },
     handler: async (ctx, args) => {
+        await requireCallerSubject(
+            ctx,
+            {
+                provider: args.provider,
+                providerUserId: args.provider_user_id,
+            },
+            { allowTrustedServer: true }
+        );
+
         const authAccount = await ctx.db
             .query('auth_accounts')
             .withIndex('by_provider', (q) =>
@@ -631,6 +732,7 @@ export const resolveSession = query({
         if (!membership) return null;
 
         return {
+            user_id: userId,
             id: workspaceId,
             name: workspace.name,
             description: workspace.description ?? null,
@@ -644,18 +746,20 @@ export const createInvite = mutation({
         workspace_id: v.id('workspaces'),
         email: v.string(),
         role: v.union(v.literal('owner'), v.literal('editor'), v.literal('viewer')),
-        invited_by_user_id: v.id('users'),
         token_hash: v.string(),
         expires_at: v.number(),
     },
     handler: async (ctx, args) => {
+        const { userId } = await requireWorkspaceRole(ctx, args.workspace_id, new Set(['owner']));
+        if (!userId) throw new Error('Forbidden');
+
         const now = Date.now();
         const inviteId = await ctx.db.insert('auth_invites', {
             workspace_id: args.workspace_id,
             email: normalizeEmail(args.email),
             role: args.role,
             status: 'pending',
-            invited_by_user_id: args.invited_by_user_id,
+            invited_by_user_id: userId,
             token_hash: args.token_hash,
             expires_at: args.expires_at,
             created_at: now,
@@ -674,37 +778,132 @@ export const listInvites = query({
         limit: v.optional(v.number()),
     },
     handler: async (ctx, args) => {
-        const now = Date.now();
-        await markExpiredInvites(ctx, args.workspace_id, now);
+        await requireWorkspaceRole(ctx, args.workspace_id, new Set(['owner']));
+        return listWorkspaceInvites(ctx, args);
+    },
+});
 
-        const limit = Math.max(1, Math.min(args.limit ?? 100, 500));
-        let rows = await ctx.db
-            .query('auth_invites')
-            .withIndex('by_workspace_status', (q) => q.eq('workspace_id', args.workspace_id))
-            .collect();
+export const listInvitesInternal = internalQuery({
+    args: {
+        workspace_id: v.id('workspaces'),
+        status: v.optional(
+            v.union(v.literal('pending'), v.literal('accepted'), v.literal('revoked'), v.literal('expired'))
+        ),
+        limit: v.optional(v.number()),
+    },
+    handler: async (ctx, args) => listWorkspaceInvites(ctx, args),
+});
 
-        if (args.status) {
-            rows = rows.filter((row) => row.status === args.status);
+export const validateInviteInternal = internalQuery({
+    args: {
+        workspace_id: v.id('workspaces'),
+        email: v.string(),
+        token_hash: v.string(),
+    },
+    handler: async (ctx, args) => {
+        const invite = await findInviteByTokenHash(
+            ctx,
+            args.workspace_id,
+            args.token_hash
+        );
+        const result = validateInviteRecord(invite, args.email, Date.now());
+        if (!result.ok) return result;
+        return { ok: true as const, role: result.role };
+    },
+});
+
+export const acceptInviteAndProvisionUser = internalMutation({
+    args: {
+        provider: v.string(),
+        provider_user_id: v.string(),
+        email: v.string(),
+        name: v.optional(v.string()),
+        workspace_id: v.id('workspaces'),
+        token_hash: v.string(),
+    },
+    handler: async (ctx, args) => {
+        const identity = await requireCallerSubject(
+            ctx,
+            {
+                provider: args.provider,
+                providerUserId: args.provider_user_id,
+            },
+            { allowTrustedServer: true }
+        );
+        const identityEmail = typeof identity.email === 'string'
+            ? normalizeEmail(identity.email)
+            : '';
+        const email = normalizeEmail(args.email);
+        if (!identityEmail || identityEmail !== email) {
+            throw new Error('Forbidden');
         }
 
-        return rows
-            .sort((a, b) => b.created_at - a.created_at)
-            .slice(0, limit)
-            .map((row) => ({
-                id: row._id,
-                workspace_id: row.workspace_id,
-                email: row.email,
-                role: row.role,
-                status: row.status,
-                invited_by_user_id: row.invited_by_user_id,
-                token_hash: row.token_hash,
-                expires_at: row.expires_at,
-                accepted_at: row.accepted_at ?? null,
-                accepted_user_id: row.accepted_user_id ?? null,
-                revoked_at: row.revoked_at ?? null,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-            }));
+        const now = Date.now();
+        const invite = await findInviteByTokenHash(
+            ctx,
+            args.workspace_id,
+            args.token_hash
+        );
+        const validation = validateInviteRecord(invite, email, now);
+        if (!validation.ok) return validation;
+
+        const authAccount = await ctx.db
+            .query('auth_accounts')
+            .withIndex('by_provider', (q) =>
+                q.eq('provider', args.provider).eq('provider_user_id', args.provider_user_id)
+            )
+            .first();
+        let userId: Id<'users'>;
+        let createdUser = false;
+        if (authAccount) {
+            userId = authAccount.user_id;
+        } else {
+            userId = await ctx.db.insert('users', {
+                email,
+                display_name: args.name,
+                active_workspace_id: args.workspace_id,
+                created_at: now,
+            });
+            await ctx.db.insert('auth_accounts', {
+                user_id: userId,
+                provider: args.provider,
+                provider_user_id: args.provider_user_id,
+                created_at: now,
+            });
+            createdUser = true;
+        }
+
+        const existingMembership = await ctx.db
+            .query('workspace_members')
+            .withIndex('by_workspace_user', (q) =>
+                q.eq('workspace_id', args.workspace_id).eq('user_id', userId)
+            )
+            .first();
+        if (existingMembership) {
+            await ctx.db.patch(existingMembership._id, { role: validation.role });
+        } else {
+            await ctx.db.insert('workspace_members', {
+                workspace_id: args.workspace_id,
+                user_id: userId,
+                role: validation.role,
+                created_at: now,
+            });
+        }
+
+        await ctx.db.patch(userId, { active_workspace_id: args.workspace_id });
+        await ctx.db.patch(validation.invite._id, {
+            status: 'accepted',
+            accepted_at: now,
+            accepted_user_id: userId,
+            updated_at: now,
+        });
+
+        return {
+            ok: true as const,
+            user_id: userId,
+            role: validation.role,
+            createdUser,
+        };
     },
 });
 
@@ -714,6 +913,8 @@ export const revokeInvite = mutation({
         invite_id: v.id('auth_invites'),
     },
     handler: async (ctx, args) => {
+        await requireWorkspaceRole(ctx, args.workspace_id, new Set(['owner']));
+
         const now = Date.now();
         const invite = await ctx.db.get(args.invite_id);
         if (!invite || invite.workspace_id !== args.workspace_id) {
@@ -736,12 +937,12 @@ export const consumeInvite = mutation({
         workspace_id: v.id('workspaces'),
         email: v.string(),
         token_hash: v.string(),
-        accepted_user_id: v.id('users'),
     },
     handler: async (ctx, args) => {
         const now = Date.now();
         await markExpiredInvites(ctx, args.workspace_id, now);
         const email = normalizeEmail(args.email);
+        const acceptedUserId = await requireInviteAcceptance(ctx, email);
 
         const candidates = await ctx.db
             .query('auth_invites')
@@ -768,14 +969,14 @@ export const consumeInvite = mutation({
         await ctx.db.patch(invite._id, {
             status: 'accepted',
             accepted_at: now,
-            accepted_user_id: args.accepted_user_id,
+            accepted_user_id: acceptedUserId,
             updated_at: now,
         });
 
         const existingMembership = await ctx.db
             .query('workspace_members')
             .withIndex('by_workspace_user', (q) =>
-                q.eq('workspace_id', args.workspace_id).eq('user_id', args.accepted_user_id)
+                q.eq('workspace_id', args.workspace_id).eq('user_id', acceptedUserId)
             )
             .first();
 
@@ -784,13 +985,13 @@ export const consumeInvite = mutation({
         } else {
             await ctx.db.insert('workspace_members', {
                 workspace_id: args.workspace_id,
-                user_id: args.accepted_user_id,
+                user_id: acceptedUserId,
                 role: invite.role,
                 created_at: now,
             });
         }
 
-        await ctx.db.patch(args.accepted_user_id, {
+        await ctx.db.patch(acceptedUserId, {
             active_workspace_id: args.workspace_id,
         });
 

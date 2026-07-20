@@ -47,7 +47,7 @@ This generates `convex/_generated/` in your host repo. The `_generated/` directo
 | Variable | Description |
 |---|---|
 | `VITE_CONVEX_URL` | Convex deployment URL |
-| `CONVEX_SELF_HOSTED_ADMIN_KEY` | Admin key for self-hosted Convex (optional for cloud) |
+| `CONVEX_SELF_HOSTED_ADMIN_KEY` | Server-only admin credential required for internal auth/session, background-job, notification, webhook, and rate-limit functions |
 | `SSR_AUTH_ENABLED` | Set to `true` to enable SSR auth |
 | `OR3_SYNC_PROVIDER` | Set to `convex` (default when sync enabled) |
 | `NUXT_PUBLIC_STORAGE_PROVIDER` | Set to `convex` (default when storage enabled) |
@@ -63,6 +63,35 @@ The provider registers itself via the OR3 hook/registry system at startup:
 - **Background jobs**: Convex-backed job queue for background AI streaming
 - **Notifications**: Convex-backed notification emitter
 - **Admin stores**: Convex workspace access store for admin panel
+
+`ConvexAuthWorkspaceStore` keeps provider subjects and internal user IDs as
+separate identifiers. Provisioning and existing-user lookup both return the
+canonical Convex `users` document ID; provider subjects (including Basic Auth
+UUIDs) are used only to authenticate and resolve the corresponding account.
+
+Auxiliary persistence is not part of the public Convex API. Background-job,
+notification, webhook, and rate-limit functions are registered as internal and
+are called only by admin-authenticated server adapters. Background-job owner
+checks require an exact user ID and do not support wildcard access.
+
+Sync `change_log` and tombstone retention is available through internal,
+admin-authenticated mutations. Collection is bounded, requires the explicit
+`snapshot-v1` capability, and deletes only old revisions acknowledged by every
+registered device; fresh devices bootstrap from canonical snapshots.
+
+The provider exposes the shared materialized snapshot contract in both direct
+and gateway modes. The first page records one Convex server-version
+high-watermark and an expiring session. Every continuation page is bound to
+that workspace and normalized table filter, examines at most the requested
+page size, and orders canonical rows/tombstones by `(tableName, pk, kind)`.
+Applied pre-images keep later pages stable when writes occur after page one;
+incremental replay then starts strictly after the returned watermark.
+
+Gateway storage lifecycle also uses bounded canonical pages over materialized
+`file_meta` and live message/post file-reference edges. Quota and filesystem GC
+never reconstruct state from retained sync logs. Cursor filters are immutable
+across pages and each request is capped at 500 records. Active reservations are
+an explicit empty view until upload-intent persistence is installed.
 
 ## Runtime entrypoints
 

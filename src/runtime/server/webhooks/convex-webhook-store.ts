@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { ConvexHttpClient } from 'convex/browser';
 import { useRuntimeConfig } from '#imports';
-import { convexApi as api } from '../../utils/convex-api';
+import { convexInternalApi as internalApi } from '../../utils/convex-api';
 import {
     throwAsConvexServiceUnavailable,
     withConvexTransportRetry,
@@ -69,15 +69,16 @@ function getConvexWebhookClient(): ConvexHttpClient {
 
     const client = new ConvexHttpClient(convexUrl);
     const adminKey = config.sync?.convexAdminKey?.trim();
-    if (adminKey) {
-        const issuer = 'https://or3.ai/internal';
-        const subject = 'or3-webhooks-store';
-        client.setAdminAuth(adminKey, {
-            subject,
-            issuer,
-            tokenIdentifier: `${issuer}|${subject}`,
-        });
+    if (!adminKey) {
+        throw new Error('Convex admin key not configured');
     }
+    const issuer = 'https://or3.ai/internal';
+    const subject = 'or3-webhooks-store';
+    client.setAdminAuth(adminKey, {
+        subject,
+        issuer,
+        tokenIdentifier: `${issuer}|${subject}`,
+    });
 
     adminClient = client;
     return client;
@@ -150,7 +151,7 @@ class ConvexWebhookStore implements WebhookStore {
 
         const client = getConvexWebhookClient();
         const created = await runConvexOperation('webhooks.createWebhook', () =>
-            client.mutation(api.webhooks.createWebhook, {
+            client.mutation(internalApi.webhooks.createWebhook, {
                 id: row.id,
                 scope: row.scope,
                 user_id: row.user_id,
@@ -198,7 +199,7 @@ class ConvexWebhookStore implements WebhookStore {
 
         const client = getConvexWebhookClient();
         const updated = await runConvexOperation('webhooks.updateWebhook', () =>
-            client.mutation(api.webhooks.updateWebhook, {
+            client.mutation(internalApi.webhooks.updateWebhook, {
                 webhook_id: webhookId,
                 url: next.url,
                 label: next.label,
@@ -221,7 +222,7 @@ class ConvexWebhookStore implements WebhookStore {
     async deleteWebhook(webhookId: string): Promise<void> {
         const client = getConvexWebhookClient();
         await runConvexOperation('webhooks.deleteWebhook', () =>
-            client.mutation(api.webhooks.deleteWebhook, {
+            client.mutation(internalApi.webhooks.deleteWebhook, {
                 webhook_id: webhookId,
             })
         );
@@ -230,7 +231,7 @@ class ConvexWebhookStore implements WebhookStore {
     async getWebhook(webhookId: string): Promise<WebhookRegistration | null> {
         const client = getConvexWebhookClient();
         const row = await runConvexOperation('webhooks.getWebhook', () =>
-            client.query(api.webhooks.getWebhook, {
+            client.query(internalApi.webhooks.getWebhook, {
                 webhook_id: webhookId,
             })
         );
@@ -244,7 +245,7 @@ class ConvexWebhookStore implements WebhookStore {
     ): Promise<WebhookRegistration[]> {
         const client = getConvexWebhookClient();
         const rows = await runConvexOperation('webhooks.listWebhooks', () =>
-            client.query(api.webhooks.listWebhooks, {
+            client.query(internalApi.webhooks.listWebhooks, {
                 user_id: userId,
                 workspace_id: workspaceId,
             })
@@ -256,7 +257,7 @@ class ConvexWebhookStore implements WebhookStore {
     async listAdminWebhooks(): Promise<WebhookRegistration[]> {
         const client = getConvexWebhookClient();
         const rows = await runConvexOperation('webhooks.listAdminWebhooks', () =>
-            client.query(api.webhooks.listAdminWebhooks, {})
+            client.query(internalApi.webhooks.listAdminWebhooks, {})
         );
 
         return (rows as ConvexWebhookRow[]).map(toWebhookRegistration);
@@ -269,7 +270,7 @@ class ConvexWebhookStore implements WebhookStore {
     ): Promise<WebhookRegistration[]> {
         const client = getConvexWebhookClient();
         const rows = await runConvexOperation('webhooks.listWebhooksByEvent', () =>
-            client.query(api.webhooks.listWebhooksByEvent, {
+            client.query(internalApi.webhooks.listWebhooksByEvent, {
                 event_type: eventType,
                 scope,
                 workspace_id: workspaceId,
@@ -282,7 +283,7 @@ class ConvexWebhookStore implements WebhookStore {
     async listWebhooksByCustomHook(hookName: string): Promise<WebhookRegistration[]> {
         const client = getConvexWebhookClient();
         const rows = await runConvexOperation('webhooks.listWebhooksByCustomHook', () =>
-            client.query(api.webhooks.listWebhooksByCustomHook, {
+            client.query(internalApi.webhooks.listWebhooksByCustomHook, {
                 hook_name: hookName,
             })
         );
@@ -293,7 +294,7 @@ class ConvexWebhookStore implements WebhookStore {
     async listActiveCustomHookNames(): Promise<string[]> {
         const client = getConvexWebhookClient();
         const rows = await runConvexOperation('webhooks.listActiveCustomHookNames', () =>
-            client.query(api.webhooks.listActiveCustomHookNames, {})
+            client.query(internalApi.webhooks.listActiveCustomHookNames, {})
         );
 
         return rows as string[];
@@ -305,7 +306,7 @@ class ConvexWebhookStore implements WebhookStore {
     ): Promise<void> {
         const client = getConvexWebhookClient();
         await runConvexOperation('webhooks.updateWebhookHealth', () =>
-            client.mutation(api.webhooks.updateWebhookHealth, {
+            client.mutation(internalApi.webhooks.updateWebhookHealth, {
                 webhook_id: webhookId,
                 health,
                 updated_at: Date.now(),
@@ -316,7 +317,7 @@ class ConvexWebhookStore implements WebhookStore {
     async disableAllWebhooks(userId: string, workspaceId: string): Promise<number> {
         const client = getConvexWebhookClient();
         const count = await runConvexOperation('webhooks.disableAllWebhooks', () =>
-            client.mutation(api.webhooks.disableAllWebhooks, {
+            client.mutation(internalApi.webhooks.disableAllWebhooks, {
                 user_id: userId,
                 workspace_id: workspaceId,
                 updated_at: Date.now(),
@@ -336,7 +337,7 @@ class ConvexWebhookStore implements WebhookStore {
 
         const client = getConvexWebhookClient();
         const created = await runConvexOperation('webhooks.createDeliveryLog', () =>
-            client.mutation(api.webhooks.createDeliveryLog, {
+            client.mutation(internalApi.webhooks.createDeliveryLog, {
                 id: row.id,
                 webhook_id: row.webhook_id,
                 event_id: row.event_id,
@@ -375,7 +376,7 @@ class ConvexWebhookStore implements WebhookStore {
     ): Promise<void> {
         const client = getConvexWebhookClient();
         await runConvexOperation('webhooks.updateDeliveryLog', () =>
-            client.mutation(api.webhooks.updateDeliveryLog, {
+            client.mutation(internalApi.webhooks.updateDeliveryLog, {
                 log_id: logId,
                 status: patch.status,
                 http_status: patch.http_status,
@@ -394,7 +395,7 @@ class ConvexWebhookStore implements WebhookStore {
     ): Promise<WebhookDeliveryLog[]> {
         const client = getConvexWebhookClient();
         const rows = await runConvexOperation('webhooks.getDeliveryLogs', () =>
-            client.query(api.webhooks.getDeliveryLogs, {
+            client.query(internalApi.webhooks.getDeliveryLogs, {
                 webhook_id: webhookId,
                 since,
             })
@@ -411,7 +412,7 @@ class ConvexWebhookStore implements WebhookStore {
         const rows = await runConvexOperation(
             'webhooks.getRecentTerminalDeliveries',
             () =>
-                client.query(api.webhooks.getRecentTerminalDeliveries, {
+                client.query(internalApi.webhooks.getRecentTerminalDeliveries, {
                     webhook_id: webhookId,
                     limit,
                 })
@@ -431,7 +432,7 @@ class ConvexWebhookStore implements WebhookStore {
 
         const client = getConvexWebhookClient();
         const rows = await runConvexOperation('webhooks.claimPendingDeliveries', () =>
-            client.mutation(api.webhooks.claimPendingDeliveries, {
+            client.mutation(internalApi.webhooks.claimPendingDeliveries, {
                 worker_id: workerId,
                 limit: safeLimit,
                 now: Date.now(),
@@ -445,7 +446,7 @@ class ConvexWebhookStore implements WebhookStore {
         const cutoff = Date.now() - Math.max(0, Math.floor(olderThanMs));
         const client = getConvexWebhookClient();
         const count = await runConvexOperation('webhooks.resetStaleInFlightDeliveries', () =>
-            client.mutation(api.webhooks.resetStaleInFlightDeliveries, {
+            client.mutation(internalApi.webhooks.resetStaleInFlightDeliveries, {
                 cutoff,
             })
         );
@@ -456,7 +457,7 @@ class ConvexWebhookStore implements WebhookStore {
     async cancelDeliveriesByWebhook(webhookId: string): Promise<number> {
         const client = getConvexWebhookClient();
         const count = await runConvexOperation('webhooks.cancelDeliveriesByWebhook', () =>
-            client.mutation(api.webhooks.cancelDeliveriesByWebhook, {
+            client.mutation(internalApi.webhooks.cancelDeliveriesByWebhook, {
                 webhook_id: webhookId,
             })
         );
@@ -467,7 +468,7 @@ class ConvexWebhookStore implements WebhookStore {
     async deleteDeliveryLogsByWebhook(webhookId: string): Promise<number> {
         const client = getConvexWebhookClient();
         const count = await runConvexOperation('webhooks.deleteDeliveryLogsByWebhook', () =>
-            client.mutation(api.webhooks.deleteDeliveryLogsByWebhook, {
+            client.mutation(internalApi.webhooks.deleteDeliveryLogsByWebhook, {
                 webhook_id: webhookId,
             })
         );
@@ -478,7 +479,7 @@ class ConvexWebhookStore implements WebhookStore {
     async purgeExpiredLogs(beforeTimestamp: number): Promise<number> {
         const client = getConvexWebhookClient();
         const count = await runConvexOperation('webhooks.purgeExpiredLogs', () =>
-            client.mutation(api.webhooks.purgeExpiredLogs, {
+            client.mutation(internalApi.webhooks.purgeExpiredLogs, {
                 before_timestamp: beforeTimestamp,
             })
         );
