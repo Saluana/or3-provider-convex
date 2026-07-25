@@ -823,6 +823,36 @@ export const upsertWorkspaceMember = mutation({
             .first();
 
         if (existing) {
+            if (existing.role === 'owner' && args.role !== 'owner') {
+                const owners = (
+                    await ctx.db
+                        .query('workspace_members')
+                        .withIndex('by_workspace', (q) =>
+                            q.eq('workspace_id', args.workspace_id)
+                        )
+                        .collect()
+                ).filter((candidate) => candidate.role === 'owner');
+                if (owners.length <= 1) {
+                    throw new Error(
+                        'Cannot demote the last workspace owner. Transfer ownership first.'
+                    );
+                }
+
+                const workspace = await ctx.db.get(args.workspace_id);
+                if (workspace?.owner_user_id === existing.user_id) {
+                    const replacement = owners.find(
+                        (owner) => owner.user_id !== existing.user_id
+                    );
+                    if (!replacement) {
+                        throw new Error(
+                            'Cannot demote the last workspace owner. Transfer ownership first.'
+                        );
+                    }
+                    await ctx.db.patch(args.workspace_id, {
+                        owner_user_id: replacement.user_id,
+                    });
+                }
+            }
             await ctx.db.patch(existing._id, { role: args.role });
         } else {
             await ctx.db.insert('workspace_members', {
@@ -862,6 +892,37 @@ export const setWorkspaceMemberRole = mutation({
             throw new Error('Member not found');
         }
 
+        if (member.role === 'owner' && args.role !== 'owner') {
+            const owners = (
+                await ctx.db
+                    .query('workspace_members')
+                    .withIndex('by_workspace', (q) =>
+                        q.eq('workspace_id', args.workspace_id)
+                    )
+                    .collect()
+            ).filter((candidate) => candidate.role === 'owner');
+            if (owners.length <= 1) {
+                throw new Error(
+                    'Cannot demote the last workspace owner. Transfer ownership first.'
+                );
+            }
+
+            const workspace = await ctx.db.get(args.workspace_id);
+            if (workspace?.owner_user_id === member.user_id) {
+                const replacement = owners.find(
+                    (owner) => owner.user_id !== member.user_id
+                );
+                if (!replacement) {
+                    throw new Error(
+                        'Cannot demote the last workspace owner. Transfer ownership first.'
+                    );
+                }
+                await ctx.db.patch(args.workspace_id, {
+                    owner_user_id: replacement.user_id,
+                });
+            }
+        }
+
         await ctx.db.patch(member._id, { role: args.role });
     },
 });
@@ -890,6 +951,37 @@ export const removeWorkspaceMember = mutation({
 
         if (!member) {
             throw new Error('Member not found');
+        }
+
+        if (member.role === 'owner') {
+            const owners = (
+                await ctx.db
+                    .query('workspace_members')
+                    .withIndex('by_workspace', (q) =>
+                        q.eq('workspace_id', args.workspace_id)
+                    )
+                    .collect()
+            ).filter((candidate) => candidate.role === 'owner');
+            if (owners.length <= 1) {
+                throw new Error(
+                    'Cannot remove the last workspace owner. Transfer ownership first.'
+                );
+            }
+
+            const workspace = await ctx.db.get(args.workspace_id);
+            if (workspace?.owner_user_id === member.user_id) {
+                const replacement = owners.find(
+                    (owner) => owner.user_id !== member.user_id
+                );
+                if (!replacement) {
+                    throw new Error(
+                        'Cannot remove the last workspace owner. Transfer ownership first.'
+                    );
+                }
+                await ctx.db.patch(args.workspace_id, {
+                    owner_user_id: replacement.user_id,
+                });
+            }
         }
 
         await ctx.db.delete(member._id);
