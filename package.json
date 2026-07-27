@@ -1,6 +1,6 @@
 {
     "name": "or3-provider-convex",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "description": "Convex sync, storage, and backend provider for OR3 Chat — real-time sync, cloud file storage, rate limiting, background jobs, and workspace management.",
     "license": "MIT",
     "type": "module",

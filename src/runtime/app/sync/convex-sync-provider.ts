@@ -42,10 +42,9 @@ import type {
 import {
     PullResponseSchema,
     SnapshotResponseSchema,
-    SyncChangeSchema,
+    SyncChangesSchema,
     PushResultSchema,
 } from '~~/shared/sync/schemas';
-import { z } from 'zod';
 import type { GenericId as Id } from 'convex/values';
 import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 
@@ -104,7 +103,9 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
                     if (disposed) return;
 
                     try {
-                        const safeChanges = z.array(SyncChangeSchema).safeParse(result.changes);
+                        const safeChanges = SyncChangesSchema.safeParse(
+                            result.changes
+                        );
                         if (!safeChanges.success) {
                             console.error('[convex-sync] Invalid watch changes:', safeChanges.error);
                             return;
