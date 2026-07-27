@@ -17,6 +17,7 @@ vi.mock('convex/server', () => ({
             generateUploadUrl: 'storage.generateUploadUrl',
             getFileUrl: 'storage.getFileUrl',
             commitUpload: 'storage.commitUpload',
+            deleteObject: 'storage.deleteObject',
             gcDeletedFiles: 'storage.gcDeletedFiles',
         },
     },
@@ -94,6 +95,10 @@ describe('ConvexStorageGatewayAdapter', () => {
         ).rejects.toMatchObject({ statusCode: 401 });
 
         await expect(adapter.commit(makeEvent(), {})).rejects.toMatchObject({ statusCode: 401 });
+        await expect(adapter.deleteObject(makeEvent(), {
+            workspaceId: 'ws-1',
+            hash: 'sha256:abc',
+        })).rejects.toMatchObject({ statusCode: 401 });
         await expect(adapter.gc(makeEvent(), {})).rejects.toMatchObject({ statusCode: 401 });
     });
 
@@ -200,6 +205,31 @@ describe('ConvexStorageGatewayAdapter', () => {
             width: 10,
             height: 20,
             page_count: 1,
+        });
+    });
+
+    it('maps workspace-scoped deletion and permits an omitted storage id', async () => {
+        const adapter = new ConvexStorageGatewayAdapter();
+
+        await adapter.deleteObject(makeEvent(), {
+            workspaceId: 'ws-1',
+            hash: 'sha256:abc',
+            storageId: 'st_1',
+        });
+        await adapter.deleteObject(makeEvent(), {
+            workspaceId: 'ws-1',
+            hash: 'sha256:missing',
+        });
+
+        expect(mutationMock).toHaveBeenNthCalledWith(1, 'storage.deleteObject', {
+            workspace_id: 'ws-1',
+            hash: 'sha256:abc',
+            storage_id: 'st_1',
+        });
+        expect(mutationMock).toHaveBeenNthCalledWith(2, 'storage.deleteObject', {
+            workspace_id: 'ws-1',
+            hash: 'sha256:missing',
+            storage_id: undefined,
         });
     });
 

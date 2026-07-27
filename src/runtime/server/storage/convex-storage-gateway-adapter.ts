@@ -17,6 +17,7 @@ import type {
     PresignUploadResponse,
     PresignDownloadRequest,
     PresignDownloadResponse,
+    DeleteObjectRequest,
 } from '~~/server/storage/gateway/types';
 import type { GenericId as Id } from 'convex/values';
 import { convexApi as api } from '../../utils/convex-api';
@@ -170,6 +171,17 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
             width: commitInput.width,
             height: commitInput.height,
             page_count: commitInput.page_count,
+        });
+    }
+
+    async deleteObject(event: H3Event, input: DeleteObjectRequest): Promise<void> {
+        const client = await getStorageGatewayClient(event);
+        await client.mutation(api.storage.deleteObject, {
+            workspace_id: toWorkspaceId(input.workspaceId),
+            hash: input.hash,
+            storage_id: input.storageId
+                ? toStorageId(input.storageId)
+                : undefined,
         });
     }
 

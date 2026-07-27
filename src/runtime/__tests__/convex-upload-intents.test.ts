@@ -96,6 +96,49 @@ describe('Convex persisted upload intents', () => {
     });
   });
 
+  it('deletes an unreferenced object idempotently and removes its metadata', async () => {
+    const f = fixture();
+    f.tables.file_meta.push({
+      _id: 'file-delete', workspace_id: 'ws-1', hash: HASH,
+      deleted: true, deleted_at: Math.floor(Date.now() / 1000) - 10_000,
+      storage_id: 'blob-delete',
+    });
+    const remove = handler(storageFunctions.deleteObject);
+
+    await expect(remove(f.ctx, {
+      workspace_id: 'ws-1', hash: HASH, storage_id: 'blob-delete',
+    })).resolves.toEqual({ deleted: true });
+    await expect(remove(f.ctx, {
+      workspace_id: 'ws-1', hash: HASH, storage_id: 'blob-delete',
+    })).resolves.toEqual({ deleted: false });
+
+    expect(f.deletedObjects).toEqual(['blob-delete']);
+    expect(f.tables.file_meta).toEqual([]);
+  });
+
+  it('rejects mismatched storage ids and canonical live references', async () => {
+    const f = fixture();
+    f.tables.file_meta.push({
+      _id: 'file-live', workspace_id: 'ws-1', hash: HASH,
+      storage_id: 'blob-live',
+    });
+    const remove = handler(storageFunctions.deleteObject);
+
+    await expect(remove(f.ctx, {
+      workspace_id: 'ws-1', hash: HASH, storage_id: 'other-blob',
+    })).rejects.toThrow('storage_id does not match');
+
+    f.tables.messages.push({
+      _id: 'message-live', workspace_id: 'ws-1', deleted: false,
+      file_hashes: JSON.stringify([`sha256:${HASH}`]),
+    });
+    await expect(remove(f.ctx, {
+      workspace_id: 'ws-1', hash: HASH, storage_id: 'blob-live',
+    })).rejects.toThrow('referenced file');
+    expect(f.deletedObjects).toEqual([]);
+    expect(f.tables.file_meta).toHaveLength(1);
+  });
+
   it('atomically reserves quota and ignores expired reservations', async () => {
     const f = fixture();
     const generate = handler(storageFunctions.generateUploadUrl);

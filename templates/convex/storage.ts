@@ -397,6 +397,47 @@ export const getFileUrl = query({
 });
 
 /**
+ * Deletes one unreferenced workspace file. Missing metadata is a successful
+ * no-op, making retries safe. A caller-supplied storage id is accepted only
+ * when it matches the canonical workspace/hash metadata record.
+ */
+export const deleteObject = mutation({
+    args: {
+        workspace_id: v.id('workspaces'),
+        hash: v.string(),
+        storage_id: v.optional(v.id('_storage')),
+    },
+    handler: async (ctx, args) => {
+        await verifyWorkspaceMembership(ctx, args.workspace_id);
+        const file = await ctx.db
+            .query('file_meta')
+            .withIndex('by_workspace_hash', (q: any) =>
+                q.eq('workspace_id', args.workspace_id).eq('hash', args.hash)
+            )
+            .first();
+
+        if (!file) return { deleted: false };
+        if (args.storage_id !== undefined && file.storage_id !== args.storage_id) {
+            throw new Error('storage_id does not match workspace file metadata');
+        }
+
+        const referencedHashes = await loadCanonicalReferencedHashes(ctx, args.workspace_id);
+        if (referencedHashes === null) {
+            throw new Error('Unable to prove file is unreferenced');
+        }
+        if (referencedHashes.has(normalizeHash(file.hash))) {
+            throw new Error('Cannot delete a referenced file');
+        }
+
+        if (file.storage_id) {
+            await ctx.storage.delete(file.storage_id);
+        }
+        await ctx.db.delete(file._id);
+        return { deleted: true };
+    },
+});
+
+/**
  * `storage.gcDeletedFiles` (mutation)
  *
  * Purpose:
