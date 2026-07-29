@@ -26,6 +26,7 @@ export const convexApi = {
 
 export const convexInternalApi = {
     backgroundJobs: createNamespaceProxy('backgroundJobs'),
+    connect: createNamespaceProxy('connect'),
     notifications: createNamespaceProxy('notifications'),
     rateLimits: createNamespaceProxy('rateLimits'),
     sync: createNamespaceProxy('sync'),
@@ -85,6 +86,14 @@ export const convexInternalApiContractNames = [
     'backgroundJobs:get',
     'backgroundJobs:getActiveCount',
     'backgroundJobs:update',
+    'connect:approveDeviceAuthorization',
+    'connect:createDeviceAuthorization',
+    'connect:denyDeviceAuthorization',
+    'connect:getDeviceAuthorizationByUserHash',
+    'connect:getEnvironmentByControlTokenHash',
+    'connect:listEnvironmentsForUser',
+    'connect:pollDeviceAuthorization',
+    'connect:revokeEnvironment',
     'notifications:create',
     'notifications:getByUser',
     'notifications:markRead',

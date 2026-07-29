@@ -26,6 +26,21 @@ export const createDeviceAuthorization = internalMutation({
         now: v.number(),
     },
     handler: async (ctx, args) => {
+        const liveCodeCollision = (
+            await ctx.db
+                .query('connect_device_authorizations')
+                .withIndex('by_user_code_hash', (q) =>
+                    q.eq('user_code_hash', args.user_code_hash)
+                )
+                .collect()
+        ).some(
+            (record) =>
+                record.status === 'pending' &&
+                record.expires_at > args.now
+        );
+        if (liveCodeCollision) {
+            throw new Error('OR3_CONNECT_CODE_CONFLICT');
+        }
         return await ctx.db.insert('connect_device_authorizations', {
             device_code_hash: args.device_code_hash,
             user_code_hash: args.user_code_hash,
@@ -49,12 +64,20 @@ export const pollDeviceAuthorization = internalMutation({
             )
             .unique();
         if (!record) return null;
-        if (record.expires_at <= args.now && record.status === 'pending') {
+        if (
+            record.expires_at <= args.now &&
+            (record.status === 'pending' || record.status === 'approved')
+        ) {
             await ctx.db.patch(record._id, {
                 status: 'expired',
+                credential_ciphertext: undefined,
                 updated_at: args.now,
             });
-            return { ...record, status: 'expired' as const };
+            return {
+                ...record,
+                status: 'expired' as const,
+                credential_ciphertext: undefined,
+            };
         }
         if (record.status === 'approved') {
             await ctx.db.patch(record._id, {
@@ -70,12 +93,19 @@ export const pollDeviceAuthorization = internalMutation({
 export const getDeviceAuthorizationByUserHash = internalQuery({
     args: { user_code_hash: v.string(), now: v.number() },
     handler: async (ctx, args) => {
-        const record = await ctx.db
+        const records = await ctx.db
             .query('connect_device_authorizations')
             .withIndex('by_user_code_hash', (q) =>
                 q.eq('user_code_hash', args.user_code_hash)
             )
-            .unique();
+            .collect();
+        const record = records
+            .filter(
+                (candidate) =>
+                    candidate.expires_at > args.now &&
+                    candidate.status === 'pending'
+            )
+            .sort((left, right) => right.created_at - left.created_at)[0];
         if (!record || record.expires_at <= args.now) return null;
         return record;
     },
