@@ -541,4 +541,70 @@ export default defineSchema({
         .index('by_user', ['user_id'])
         .index('by_status', ['status'])
         .index('by_message', ['message_id']),
+
+    // ============================================================
+    // OR3 CONNECT
+    // ============================================================
+
+    connect_device_authorizations: defineTable({
+        device_code_hash: v.string(),
+        user_code_hash: v.string(),
+        user_code_display: v.string(),
+        status: v.union(
+            v.literal('pending'),
+            v.literal('approved'),
+            v.literal('denied'),
+            v.literal('consumed'),
+            v.literal('expired')
+        ),
+        host: v.object({
+            name: v.string(),
+            platform: v.string(),
+            architecture: v.string(),
+            intern_version: v.string(),
+            host_id: v.optional(v.string()),
+            signing_public_key: v.optional(v.string()),
+            noise_public_key: v.optional(v.string()),
+        }),
+        approved_user_id: v.optional(v.id('users')),
+        approved_workspace_id: v.optional(v.id('workspaces')),
+        environment_id: v.optional(v.string()),
+        credential_ciphertext: v.optional(v.string()),
+        expires_at: v.number(),
+        created_at: v.number(),
+        updated_at: v.number(),
+    })
+        .index('by_device_code_hash', ['device_code_hash'])
+        .index('by_user_code_hash', ['user_code_hash'])
+        .index('by_status_expires', ['status', 'expires_at']),
+
+    connect_environments: defineTable({
+        id: v.string(),
+        user_id: v.id('users'),
+        workspace_id: v.id('workspaces'),
+        name: v.string(),
+        platform: v.string(),
+        architecture: v.string(),
+        host_id: v.optional(v.string()),
+        signing_public_key: v.optional(v.string()),
+        noise_public_key: v.optional(v.string()),
+        hostname: v.string(),
+        tunnel_id: v.string(),
+        dns_record_id: v.string(),
+        control_token_hash: v.string(),
+        access_credential_ciphertext: v.string(),
+        status: v.union(
+            v.literal('active'),
+            v.literal('revoked'),
+            v.literal('error')
+        ),
+        last_seen_at: v.optional(v.number()),
+        created_at: v.number(),
+        updated_at: v.number(),
+        revoked_at: v.optional(v.number()),
+    })
+        .index('by_environment_id', ['id'])
+        .index('by_user_status', ['user_id', 'status'])
+        .index('by_workspace_status', ['workspace_id', 'status'])
+        .index('by_control_token_hash', ['control_token_hash']),
 });
