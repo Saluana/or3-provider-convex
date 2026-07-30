@@ -549,10 +549,14 @@ export default defineSchema({
     connect_device_authorizations: defineTable({
         device_code_hash: v.string(),
         user_code_hash: v.string(),
-        user_code_display: v.string(),
+        // Upgrade-only compatibility. New writes omit this field and the
+        // provider purges legacy values before serving Connect requests.
+        user_code_display: v.optional(v.string()),
         status: v.union(
             v.literal('pending'),
+            v.literal('provisioning'),
             v.literal('approved'),
+            v.literal('delivering'),
             v.literal('denied'),
             v.literal('consumed'),
             v.literal('expired')
@@ -570,13 +574,17 @@ export default defineSchema({
         approved_workspace_id: v.optional(v.id('workspaces')),
         environment_id: v.optional(v.string()),
         credential_ciphertext: v.optional(v.string()),
+        credential_delivery_started_at: v.optional(v.number()),
+        credential_redeliver_until: v.optional(v.number()),
         expires_at: v.number(),
         created_at: v.number(),
         updated_at: v.number(),
     })
         .index('by_device_code_hash', ['device_code_hash'])
         .index('by_user_code_hash', ['user_code_hash'])
-        .index('by_status_expires', ['status', 'expires_at']),
+        .index('by_environment_id', ['environment_id'])
+        .index('by_status_expires', ['status', 'expires_at'])
+        .index('by_status_updated', ['status', 'updated_at']),
 
     connect_environments: defineTable({
         id: v.string(),
@@ -588,16 +596,29 @@ export default defineSchema({
         host_id: v.optional(v.string()),
         signing_public_key: v.optional(v.string()),
         noise_public_key: v.optional(v.string()),
+        authorization_id: v.optional(v.id('connect_device_authorizations')),
         hostname: v.string(),
         tunnel_id: v.string(),
         dns_record_id: v.string(),
+        relay_authenticator: v.optional(v.string()),
         control_token_hash: v.string(),
         access_credential_ciphertext: v.string(),
+        tunnel_secret_ciphertext: v.optional(v.string()),
         status: v.union(
+            v.literal('provisioning'),
             v.literal('active'),
+            v.literal('revoking'),
             v.literal('revoked'),
             v.literal('error')
         ),
+        lifecycle_attempts: v.optional(v.number()),
+        lifecycle_next_attempt_at: v.optional(v.number()),
+        lifecycle_claim_token: v.optional(v.string()),
+        lifecycle_claimed_until: v.optional(v.number()),
+        provisioning_deadline_at: v.optional(v.number()),
+        activation_deadline_at: v.optional(v.number()),
+        activation_claimed_at: v.optional(v.number()),
+        lifecycle_error: v.optional(v.string()),
         last_seen_at: v.optional(v.number()),
         created_at: v.number(),
         updated_at: v.number(),
@@ -605,6 +626,31 @@ export default defineSchema({
     })
         .index('by_environment_id', ['id'])
         .index('by_user_status', ['user_id', 'status'])
+        .index('by_user_workspace_status', [
+            'user_id',
+            'workspace_id',
+            'status',
+        ])
+        .index('by_user_workspace_control_token_hash', [
+            'user_id',
+            'workspace_id',
+            'control_token_hash',
+        ])
+        .index('by_user_workspace_environment_id', [
+            'user_id',
+            'workspace_id',
+            'id',
+        ])
         .index('by_workspace_status', ['workspace_id', 'status'])
+        .index('by_status_lifecycle_due', [
+            'status',
+            'lifecycle_next_attempt_at',
+        ])
+        .index('by_status_updated', ['status', 'updated_at'])
+        .index('by_status_activation_due', [
+            'status',
+            'activation_claimed_at',
+            'activation_deadline_at',
+        ])
         .index('by_control_token_hash', ['control_token_hash']),
 });
