@@ -12,6 +12,10 @@ const registerDeploymentAdminCheckerMock = vi.hoisted(() => vi.fn());
 const registerConnectStoreMock = vi.hoisted(() => vi.fn());
 const useRuntimeConfigMock = vi.hoisted(() => vi.fn());
 
+vi.mock('nitropack/runtime/plugin', () => ({
+    defineNitroPlugin: (plugin: () => unknown) => plugin(),
+}));
+
 vi.mock('~~/server/auth/store/registry', () => ({
     registerAuthWorkspaceStore: registerAuthWorkspaceStoreMock as unknown,
 }));
@@ -64,9 +68,6 @@ describe('convex register plugin', () => {
         process.env.NODE_ENV = 'test';
         delete process.env.OR3_CONVEX_ALLOW_INSECURE_HTTP;
 
-        (globalThis as typeof globalThis & { defineNitroPlugin?: unknown }).defineNitroPlugin = (
-            plugin: () => unknown
-        ) => plugin();
         useRuntimeConfigMock.mockReturnValue({
             auth: { enabled: true, provider: 'clerk' },
             sync: { enabled: true, provider: 'convex', convexUrl: 'https://example.convex.cloud' },
