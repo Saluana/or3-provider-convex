@@ -1,6 +1,10 @@
 {
     "name": "or3-provider-convex",
-    "version": "0.0.2",
+    "version": "0.0.3",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Saluana/or3-provider-convex.git"
+    },
     "description": "Convex sync, storage, and backend provider for OR3 Chat — real-time sync, cloud file storage, rate limiting, background jobs, and workspace management.",
     "license": "MIT",
     "type": "module",
@@ -41,7 +45,8 @@
         "test": "vitest run"
     },
     "publishConfig": {
-        "access": "public"
+        "access": "public",
+        "provenance": true
     },
     "dependencies": {
         "convex": "^1.31.3",
