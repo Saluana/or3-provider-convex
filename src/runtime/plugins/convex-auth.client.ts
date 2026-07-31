@@ -1,3 +1,4 @@
+import { defineNuxtPlugin, useRuntimeConfig } from '#imports';
 import { watch } from 'vue';
 import { useConvexClient } from 'convex-vue';
 import {

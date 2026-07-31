@@ -1,3 +1,4 @@
+import { defineNuxtPlugin, useRuntimeConfig } from '#imports';
 import { useConvexClient } from 'convex-vue';
 import {
     CONVEX_JWT_TEMPLATE,
