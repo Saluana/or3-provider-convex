@@ -22,7 +22,13 @@ const hostValidator = v.object({
     name: v.string(),
     platform: v.string(),
     architecture: v.string(),
-    intern_version: v.string(),
+    intern_version: v.optional(v.string()),
+    runtime: v.optional(
+        v.union(v.literal('intern'), v.literal('openclaw'), v.literal('hermes'))
+    ),
+    runtime_version: v.optional(v.string()),
+    driver: v.optional(v.union(v.literal('intern'), v.literal('runs'))),
+    base_path: v.optional(v.union(v.literal('/'), v.literal('/or3/'))),
     host_id: v.optional(v.string()),
     signing_public_key: v.optional(v.string()),
     noise_public_key: v.optional(v.string()),
@@ -206,6 +212,11 @@ export const approveDeviceAuthorization = internalMutation({
             name: v.string(),
             platform: v.string(),
             architecture: v.string(),
+            runtime: v.optional(
+                v.union(v.literal('intern'), v.literal('openclaw'), v.literal('hermes'))
+            ),
+            driver: v.optional(v.union(v.literal('intern'), v.literal('runs'))),
+            base_path: v.optional(v.union(v.literal('/'), v.literal('/or3/'))),
             host_id: v.optional(v.string()),
             signing_public_key: v.optional(v.string()),
             noise_public_key: v.optional(v.string()),
@@ -290,6 +301,11 @@ export const reserveDeviceAuthorization = internalMutation({
             name: v.string(),
             platform: v.string(),
             architecture: v.string(),
+            runtime: v.optional(
+                v.union(v.literal('intern'), v.literal('openclaw'), v.literal('hermes'))
+            ),
+            driver: v.optional(v.union(v.literal('intern'), v.literal('runs'))),
+            base_path: v.optional(v.union(v.literal('/'), v.literal('/or3/'))),
             host_id: v.optional(v.string()),
             signing_public_key: v.optional(v.string()),
             noise_public_key: v.optional(v.string()),
