@@ -63,6 +63,7 @@ The provider registers itself via the OR3 hook/registry system at startup:
 - **Background jobs**: Convex-backed job queue for background AI streaming
 - **Notifications**: Convex-backed notification emitter
 - **Admin stores**: Convex workspace access store for admin panel
+- **Connect store**: encrypted device enrollment and connected-computer persistence when `OR3_CONNECT_PROVIDER=convex`
 
 `ConvexAuthWorkspaceStore` keeps provider subjects and internal user IDs as
 separate identifiers. Provisioning and existing-user lookup both return the
@@ -112,6 +113,7 @@ an explicit empty view until upload-intent persistence is installed.
 | `src/runtime/server/background-jobs/convex-provider.ts` | Background job provider |
 | `src/runtime/server/rate-limit/convex-provider.ts` | Rate limit provider |
 | `src/runtime/server/notifications/emit.ts` | Notification emitter |
+| `src/runtime/server/connect/convex-connect-store.ts` | OR3 Connect persistence adapter |
 | `src/runtime/server/utils/convex-client.ts` | Convex HTTP client factory |
 | `src/runtime/server/utils/convex-gateway.ts` | Gateway utility helpers |
 | `src/runtime/app/sync/convex-sync-provider.ts` | Client-side sync provider |

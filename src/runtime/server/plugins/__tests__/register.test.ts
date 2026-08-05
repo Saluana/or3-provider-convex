@@ -9,7 +9,12 @@ const registerBackgroundJobProviderMock = vi.hoisted(() => vi.fn());
 const registerRateLimitProviderMock = vi.hoisted(() => vi.fn());
 const registerNotificationEmitterMock = vi.hoisted(() => vi.fn());
 const registerDeploymentAdminCheckerMock = vi.hoisted(() => vi.fn());
+const registerConnectStoreMock = vi.hoisted(() => vi.fn());
 const useRuntimeConfigMock = vi.hoisted(() => vi.fn());
+
+vi.mock('nitropack/runtime/plugin', () => ({
+    defineNitroPlugin: (plugin: () => unknown) => plugin(),
+}));
 
 vi.mock('~~/server/auth/store/registry', () => ({
     registerAuthWorkspaceStore: registerAuthWorkspaceStoreMock as unknown,
@@ -38,6 +43,9 @@ vi.mock('~~/server/utils/notifications/registry', () => ({
 vi.mock('~~/server/auth/deployment-admin', () => ({
     registerDeploymentAdminChecker: registerDeploymentAdminCheckerMock as unknown,
 }));
+vi.mock('~~/server/connect/store/registry', () => ({
+    registerConnectStore: registerConnectStoreMock as unknown,
+}));
 vi.mock('#imports', () => ({
     useRuntimeConfig: (...args: unknown[]) => useRuntimeConfigMock(...args),
 }));
@@ -54,14 +62,12 @@ describe('convex register plugin', () => {
         registerRateLimitProviderMock.mockReset();
         registerNotificationEmitterMock.mockReset();
         registerDeploymentAdminCheckerMock.mockReset();
+        registerConnectStoreMock.mockReset();
         useRuntimeConfigMock.mockReset();
 
         process.env.NODE_ENV = 'test';
         delete process.env.OR3_CONVEX_ALLOW_INSECURE_HTTP;
 
-        (globalThis as typeof globalThis & { defineNitroPlugin?: unknown }).defineNitroPlugin = (
-            plugin: () => unknown
-        ) => plugin();
         useRuntimeConfigMock.mockReturnValue({
             auth: { enabled: true, provider: 'clerk' },
             sync: { enabled: true, provider: 'convex', convexUrl: 'https://example.convex.cloud' },
@@ -112,5 +118,27 @@ describe('convex register plugin', () => {
         });
 
         await expect(import('../register')).resolves.toBeDefined();
+    });
+
+    it('registers Connect when Convex is selected only for Connect', async () => {
+        useRuntimeConfigMock.mockReturnValue({
+            auth: { enabled: true, provider: 'clerk' },
+            sync: {
+                enabled: true,
+                provider: 'sqlite',
+                convexUrl: 'https://example.convex.cloud',
+            },
+            storage: { enabled: true, provider: 's3' },
+            connect: { enabled: true, provider: 'convex' },
+            public: {
+                sync: { convexUrl: 'https://example.convex.cloud' },
+            },
+        });
+
+        await import('../register');
+
+        expect(registerConnectStoreMock).toHaveBeenCalledWith(
+            expect.objectContaining({ id: 'convex' })
+        );
     });
 });

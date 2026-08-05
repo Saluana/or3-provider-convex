@@ -1,3 +1,4 @@
+import { defineNuxtPlugin, useRuntimeConfig } from '#imports';
 import { CONVEX_STORAGE_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 import { registerStorageProvider, listStorageProviderIds } from '~/core/storage/provider-registry';
 import { createConvexStorageProvider } from '../app/storage/convex-storage-provider';

@@ -12,7 +12,7 @@
         "verbatimModuleSyntax": true,
         "types": ["node"],
         "paths": {
-            "h3": ["../or3-chat/node_modules/h3"],
+            "h3": ["./node_modules/h3"],
             "vue": ["../or3-chat/node_modules/vue"],
             "@vue/reactivity": ["../or3-chat/node_modules/@vue/reactivity"],
             "~~/convex/*": ["../or3-chat/convex/*"],

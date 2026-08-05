@@ -5,4 +5,10 @@
  * This shim provides the subset that provider packages actually use,
  * sourced from their real origin modules.
  */
-export { useRuntimeConfig, useNuxtApp, useFetch, useState } from 'nuxt/app';
+export {
+    defineNuxtPlugin,
+    useRuntimeConfig,
+    useNuxtApp,
+    useFetch,
+    useState,
+} from 'nuxt/app';

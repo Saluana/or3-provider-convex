@@ -1,3 +1,4 @@
+import { defineNitroPlugin } from 'nitropack/runtime/plugin';
 import { CONVEX_PROVIDER_ID, CONVEX_STORAGE_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 import { registerAuthWorkspaceStore } from '~~/server/auth/store/registry';
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
@@ -9,6 +10,7 @@ import { registerRateLimitProvider } from '~~/server/utils/rate-limit/registry';
 import { registerNotificationEmitter } from '~~/server/utils/notifications/registry';
 import { registerWebhookStore } from '~~/server/utils/webhooks/store/registry';
 import { registerDeploymentAdminChecker } from '~~/server/auth/deployment-admin';
+import { registerConnectStore } from '~~/server/connect/store/registry';
 import { createConvexAuthWorkspaceStore } from '../auth/convex-auth-workspace-store';
 import { createConvexSyncGatewayAdapter } from '../sync/convex-sync-gateway-adapter';
 import { createConvexStorageGatewayAdapter } from '../storage/convex-storage-gateway-adapter';
@@ -28,6 +30,7 @@ import {
     emitBackgroundJobError,
 } from '../notifications/emit';
 import { useRuntimeConfig } from '#imports';
+import { createConvexConnectStore } from '../connect/convex-connect-store';
 
 const ALLOW_INSECURE_CONVEX_HTTP_ENV = 'OR3_CONVEX_ALLOW_INSECURE_HTTP';
 
@@ -38,6 +41,10 @@ type RuntimeConfigWithConvex = ReturnType<typeof useRuntimeConfig> & {
         convexUrl?: string;
     };
     storage?: {
+        enabled?: boolean;
+        provider?: string;
+    };
+    connect?: {
         enabled?: boolean;
         provider?: string;
     };
@@ -55,7 +62,10 @@ function isConvexSelected(config: RuntimeConfigWithConvex): boolean {
     const storageSelected =
         config.storage?.enabled === true &&
         config.storage?.provider === CONVEX_STORAGE_PROVIDER_ID;
-    return syncSelected || storageSelected;
+    const connectSelected =
+        config.connect?.enabled === true &&
+        config.connect?.provider === CONVEX_PROVIDER_ID;
+    return syncSelected || storageSelected || connectSelected;
 }
 
 function validateConvexStartupConfig(config: RuntimeConfigWithConvex): string[] {
@@ -120,6 +130,17 @@ export default defineNitroPlugin(() => {
         order: 100,
         create: createConvexStorageGatewayAdapter,
     });
+
+    if (
+        config.connect?.enabled === true &&
+        config.connect.provider === CONVEX_PROVIDER_ID
+    ) {
+        registerConnectStore({
+            id: CONVEX_PROVIDER_ID,
+            order: 100,
+            create: createConvexConnectStore,
+        });
+    }
 
     registerProviderAdminAdapter(convexSyncAdminAdapter);
     registerProviderAdminAdapter(convexStorageAdminAdapter);
