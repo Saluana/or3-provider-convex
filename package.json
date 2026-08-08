@@ -45,6 +45,7 @@
         "build": "nuxt-module-build build",
         "build:templates": "node ./scripts/build-template-pack.mjs",
         "type-check": "tsc --noEmit",
+        "type-check:standalone": "tsc -p tsconfig.release.json --noEmit",
         "init": "node ./scripts/init.mjs",
         "test": "vitest run"
     },

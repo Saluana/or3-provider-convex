@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noImplicitAny": false,
+    "paths": {
+      "h3": ["./node_modules/h3"],
+      "vue": ["./node_modules/vue"],
+      "@vue/reactivity": ["./node_modules/@vue/reactivity"],
+      "convex/browser": ["./src/shims/convex-browser.ts"],
+      "~~/convex/*": ["./src/shims/or3-chat-contract.ts"],
+      "~~/*": ["./src/shims/or3-chat-contract.ts"],
+      "~~": ["./src/shims/or3-chat-contract.ts"],
+      "~/*": ["./src/shims/or3-chat-contract.ts"],
+      "~": ["./src/shims/or3-chat-contract.ts"],
+      "#imports": ["./src/shims/imports.ts"],
+      "#app": ["./src/shims/or3-chat-contract.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "src/**/__tests__/**"]
+}
