@@ -77,7 +77,9 @@ The provider registers itself via the OR3 hook/registry system at startup (Nitro
 - **Connect store**: encrypted device enrollment and connected-computer persistence when `OR3_CONNECT_PROVIDER=convex`
 - **Admin sync + storage adapters**: deployment health status and maintenance actions for the admin panel
 - **Admin store provider**: Convex workspace access, workspace settings, and admin user stores
-- **Background jobs**: Convex-backed job queue for background AI streaming (abort is poll-based, not AbortController)
+- **Background jobs**: Convex-backed background AI streaming with atomic
+  per-user/global admission, duplicate suppression, renewable worker leases,
+  fenced writes, and process-restart recovery (abort is poll-based)
 - **Rate limiter**: Convex-backed request rate limiting with an in-memory fallback
 - **Webhook store**: `ConvexWebhookStore` — webhook definitions, signing secrets, and delivery logs
 - **Notifications**: Convex-backed notification emitter for background-job completion/error
@@ -152,6 +154,9 @@ bun run init             # run the scaffolder against the current directory
 - Startup error `Convex URL must use HTTPS`: set `OR3_CONVEX_ALLOW_INSECURE_HTTP=true` only for intentionally `http://` local endpoints.
 - Startup error `Missing Convex URL`: `VITE_CONVEX_URL` must be present when the Nuxt module evaluates (or `convex.url` in nuxt.config).
 - Background jobs, notifications, and webhook storage fail closed without `CONVEX_SELF_HOSTED_ADMIN_KEY`; the rate-limit provider uses its in-memory fallback instead.
+- After upgrading the provider, run the provider init/update flow and deploy the
+  generated Convex schema/functions before enabling background streaming; the
+  lease and atomic-admission mutations must match the server adapter version.
 - Background-job abort is poll-based (`checkJobAborted`); there is no in-process AbortController.
 - Never hand-edit `convex/_generated/`; codegen regenerates it.
 - `init --update` never overwrites modified scaffold files — it reports them as conflicts.

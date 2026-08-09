@@ -14,10 +14,9 @@
  * Constraints:
  * - Every function is internal and may only be called by trusted server code.
  * - User-scoped reads and aborts still require an exact stored-owner match.
- * - Status transitions are not strictly enforced beyond simple guards.
+ * - Admission and lease claims are atomic Convex mutations.
  *
  * Non-Goals:
- * - Distributed job scheduling or retries
  * - Rich audit logging for job changes
  */
 
@@ -54,8 +53,73 @@ export const create = internalMutation({
         kind: v.optional(v.union(v.literal('chat'), v.literal('workflow'))),
         tool_calls: v.optional(v.any()),
         workflow_state: v.optional(v.any()),
+        execution: v.optional(v.any()),
+        idempotency_key: v.optional(v.string()),
+        max_concurrent_jobs: v.number(),
+        max_concurrent_jobs_per_user: v.number(),
     },
     handler: async (ctx, args) => {
+        if (args.idempotency_key) {
+            const matching = await ctx.db
+                .query('background_jobs')
+                .withIndex('by_user_idempotency', (q) =>
+                    q
+                        .eq('user_id', args.user_id)
+                        .eq('idempotency_key', args.idempotency_key)
+                )
+                .collect();
+            const existing = matching[0];
+            if (existing) {
+                if (
+                    existing.status === 'streaming' &&
+                    existing.execution === undefined
+                ) {
+                    await ctx.db.patch(existing._id, {
+                        status: 'error',
+                        error:
+                            'Background job predates durable recovery. Retry the message.',
+                        completed_at: Date.now(),
+                    });
+                }
+                return existing._id;
+            }
+        }
+
+        // Convex mutations are serialized transactions, so the count checks
+        // and insert form one atomic admission decision across instances.
+        const active = await ctx.db
+            .query('background_jobs')
+            .withIndex('by_status', (q) => q.eq('status', 'streaming'))
+            .collect();
+        // Jobs admitted before resumable execution payloads existed cannot be
+        // safely claimed after a rolling upgrade. Terminalize them atomically
+        // so they neither hang forever nor consume all admission capacity.
+        const recoverable = active.filter(
+            (job) => job.execution !== undefined
+        );
+        for (const job of active) {
+            if (job.execution !== undefined) continue;
+            await ctx.db.patch(job._id, {
+                status: 'error',
+                error:
+                    'Background job predates durable recovery. Retry the message.',
+                completed_at: Date.now(),
+            });
+        }
+        if (recoverable.length >= args.max_concurrent_jobs) {
+            throw new Error(
+                `Max concurrent background jobs reached (${args.max_concurrent_jobs})`
+            );
+        }
+        const activeForUser = recoverable.filter(
+            (job) => job.user_id === args.user_id
+        ).length;
+        if (activeForUser >= args.max_concurrent_jobs_per_user) {
+            throw new Error(
+                `Max concurrent background jobs per user reached (${args.max_concurrent_jobs_per_user})`
+            );
+        }
+
         const jobId = await ctx.db.insert('background_jobs', {
             user_id: args.user_id,
             thread_id: args.thread_id,
@@ -71,6 +135,13 @@ export const create = internalMutation({
             ...(args.workflow_state !== undefined
                 ? { workflow_state: args.workflow_state }
                 : {}),
+            ...(args.execution !== undefined
+                ? { execution: args.execution }
+                : {}),
+            ...(args.idempotency_key !== undefined
+                ? { idempotency_key: args.idempotency_key }
+                : {}),
+            attempts: 0,
             started_at: Date.now(),
         });
 
@@ -115,6 +186,10 @@ export const get = internalQuery({
             error: job.error,
             tool_calls: job.tool_calls,
             workflow_state: job.workflow_state,
+            execution: job.execution,
+            leaseOwner: job.lease_owner,
+            leaseExpiresAt: job.lease_expires_at,
+            attempts: job.attempts ?? 0,
         };
     },
 });
@@ -135,10 +210,18 @@ export const update = internalMutation({
         chunks_received: v.optional(v.number()),
         tool_calls: v.optional(v.any()),
         workflow_state: v.optional(v.any()),
+        lease_owner: v.optional(v.string()),
     },
     handler: async (ctx, args) => {
         const job = await ctx.db.get(args.job_id);
-        if (!job || job.status !== 'streaming') return;
+        if (!job || job.status !== 'streaming') return false;
+        if (
+            job.lease_owner !== undefined &&
+            (job.lease_owner !== args.lease_owner ||
+                (job.lease_expires_at ?? 0) <= Date.now())
+        ) {
+            return false;
+        }
 
         const patch: Record<string, unknown> = {};
 
@@ -158,6 +241,7 @@ export const update = internalMutation({
         if (Object.keys(patch).length > 0) {
             await ctx.db.patch(args.job_id, patch);
         }
+        return true;
     },
 });
 
@@ -173,10 +257,18 @@ export const complete = internalMutation({
         content: v.string(),
         tool_calls: v.optional(v.any()),
         workflow_state: v.optional(v.any()),
+        lease_owner: v.optional(v.string()),
     },
     handler: async (ctx, args) => {
         const job = await ctx.db.get(args.job_id);
-        if (!job) return;
+        if (!job || job.status !== 'streaming') return false;
+        if (
+            job.lease_owner !== undefined &&
+            (job.lease_owner !== args.lease_owner ||
+                (job.lease_expires_at ?? 0) <= Date.now())
+        ) {
+            return false;
+        }
 
         const patch: Record<string, unknown> = {
             status: 'complete',
@@ -190,6 +282,7 @@ export const complete = internalMutation({
             patch.workflow_state = args.workflow_state;
         }
         await ctx.db.patch(args.job_id, patch);
+        return true;
     },
 });
 
@@ -203,16 +296,187 @@ export const fail = internalMutation({
     args: {
         job_id: v.id('background_jobs'),
         error: v.string(),
+        lease_owner: v.optional(v.string()),
     },
     handler: async (ctx, args) => {
         const job = await ctx.db.get(args.job_id);
-        if (!job) return;
+        if (!job || job.status !== 'streaming') return false;
+        if (
+            job.lease_owner !== undefined &&
+            (job.lease_owner !== args.lease_owner ||
+                (job.lease_expires_at ?? 0) <= Date.now())
+        ) {
+            return false;
+        }
 
         await ctx.db.patch(args.job_id, {
             status: 'error',
             error: args.error,
             completed_at: Date.now(),
         });
+        return true;
+    },
+});
+
+/** Atomically claim a specific recoverable job. */
+export const claim = internalMutation({
+    args: {
+        job_id: v.id('background_jobs'),
+        lease_owner: v.string(),
+        lease_ms: v.number(),
+    },
+    handler: async (ctx, args) => {
+        const now = Date.now();
+        const leaseExpiresAt = now + Math.max(1, args.lease_ms);
+        const job = await ctx.db.get(args.job_id);
+        if (
+            !job ||
+            job.status !== 'streaming' ||
+            job.execution === undefined ||
+            (job.lease_owner !== undefined &&
+                (job.lease_expires_at ?? 0) > now)
+        ) {
+            return null;
+        }
+        const execution = job.execution as { contentBase?: unknown };
+        const contentBase =
+            typeof execution.contentBase === 'string'
+                ? execution.contentBase
+                : '';
+        const attempts = (job.attempts ?? 0) + 1;
+        await ctx.db.patch(job._id, {
+            lease_owner: args.lease_owner,
+            lease_expires_at: leaseExpiresAt,
+            attempts,
+            ...(attempts > 1
+                ? { content: contentBase, chunks_received: 0 }
+                : {}),
+        });
+        return {
+            id: job._id,
+            userId: job.user_id,
+            threadId: job.thread_id,
+            messageId: job.message_id,
+            model: job.model,
+            kind: job.kind,
+            status: job.status,
+            content: attempts > 1 ? contentBase : job.content,
+            chunksReceived: attempts > 1 ? 0 : job.chunks_received,
+            startedAt: job.started_at,
+            completedAt: job.completed_at,
+            error: job.error,
+            tool_calls: job.tool_calls,
+            workflow_state: job.workflow_state,
+            execution: job.execution,
+            leaseOwner: args.lease_owner,
+            leaseExpiresAt,
+            attempts,
+        };
+    },
+});
+
+/** Atomically claim the next unowned or expired recoverable job. */
+export const claimNext = internalMutation({
+    args: {
+        lease_owner: v.string(),
+        lease_ms: v.number(),
+    },
+    handler: async (ctx, args) => {
+        const now = Date.now();
+        const leaseExpiresAt = now + Math.max(1, args.lease_ms);
+        const candidates = await ctx.db
+            .query('background_jobs')
+            .withIndex('by_status', (q) => q.eq('status', 'streaming'))
+            .collect();
+        const job = candidates.find(
+            (candidate) =>
+                candidate.execution !== undefined &&
+                (candidate.lease_owner === undefined ||
+                    (candidate.lease_expires_at ?? 0) <= now)
+        );
+        if (!job) return null;
+
+        const execution = job.execution as { contentBase?: unknown };
+        const contentBase =
+            typeof execution.contentBase === 'string'
+                ? execution.contentBase
+                : '';
+        const attempts = (job.attempts ?? 0) + 1;
+        await ctx.db.patch(job._id, {
+            lease_owner: args.lease_owner,
+            lease_expires_at: leaseExpiresAt,
+            attempts,
+            ...(attempts > 1
+                ? { content: contentBase, chunks_received: 0 }
+                : {}),
+        });
+        return {
+            id: job._id,
+            userId: job.user_id,
+            threadId: job.thread_id,
+            messageId: job.message_id,
+            model: job.model,
+            kind: job.kind,
+            status: job.status,
+            content: attempts > 1 ? contentBase : job.content,
+            chunksReceived: attempts > 1 ? 0 : job.chunks_received,
+            startedAt: job.started_at,
+            completedAt: job.completed_at,
+            error: job.error,
+            tool_calls: job.tool_calls,
+            workflow_state: job.workflow_state,
+            execution: job.execution,
+            leaseOwner: args.lease_owner,
+            leaseExpiresAt,
+            attempts,
+        };
+    },
+});
+
+/** Renew a claim only while the caller still owns a live lease. */
+export const renewLease = internalMutation({
+    args: {
+        job_id: v.id('background_jobs'),
+        lease_owner: v.string(),
+        lease_ms: v.number(),
+    },
+    handler: async (ctx, args) => {
+        const now = Date.now();
+        const job = await ctx.db.get(args.job_id);
+        if (
+            !job ||
+            job.status !== 'streaming' ||
+            job.lease_owner !== args.lease_owner ||
+            (job.lease_expires_at ?? 0) <= now
+        ) {
+            return false;
+        }
+        await ctx.db.patch(job._id, {
+            lease_expires_at: now + Math.max(1, args.lease_ms),
+        });
+        return true;
+    },
+});
+
+/** Persist a recovery checkpoint under the active lease. */
+export const updateExecution = internalMutation({
+    args: {
+        job_id: v.id('background_jobs'),
+        execution: v.any(),
+        lease_owner: v.string(),
+    },
+    handler: async (ctx, args) => {
+        const job = await ctx.db.get(args.job_id);
+        if (
+            !job ||
+            job.status !== 'streaming' ||
+            job.lease_owner !== args.lease_owner ||
+            (job.lease_expires_at ?? 0) <= Date.now()
+        ) {
+            return false;
+        }
+        await ctx.db.patch(job._id, { execution: args.execution });
+        return true;
     },
 });
 
@@ -302,7 +566,15 @@ export const cleanup = internalMutation({
 
         for (const job of streamingJobs) {
             const age = now - job.started_at;
-            if (age > timeoutMs) {
+            if (job.execution === undefined) {
+                await ctx.db.patch(job._id, {
+                    status: 'error',
+                    error:
+                        'Background job predates durable recovery. Retry the message.',
+                    completed_at: now,
+                });
+                cleaned++;
+            } else if (age > timeoutMs) {
                 await ctx.db.patch(job._id, {
                     status: 'error',
                     error: 'Job timed out',

@@ -534,13 +534,19 @@ export default defineSchema({
         chunks_received: v.number(), // Progress tracking
         tool_calls: v.optional(v.any()), // Tool call state snapshots
         workflow_state: v.optional(v.any()), // Workflow execution state snapshots
+        execution: v.optional(v.any()), // Encrypted server-only resume input
+        idempotency_key: v.optional(v.string()),
+        lease_owner: v.optional(v.string()),
+        lease_expires_at: v.optional(v.number()),
+        attempts: v.optional(v.number()),
         started_at: v.number(), // Unix timestamp
         completed_at: v.optional(v.number()),
         error: v.optional(v.string()),
     })
         .index('by_user', ['user_id'])
         .index('by_status', ['status'])
-        .index('by_message', ['message_id']),
+        .index('by_message', ['message_id'])
+        .index('by_user_idempotency', ['user_id', 'idempotency_key']),
 
     // ============================================================
     // OR3 CONNECT

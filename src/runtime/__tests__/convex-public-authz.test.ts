@@ -440,8 +440,12 @@ describe('Convex authorization boundary', () => {
             backgroundJobFunctions.fail,
             backgroundJobFunctions.abort,
             backgroundJobFunctions.checkAborted,
+            backgroundJobFunctions.claim,
+            backgroundJobFunctions.claimNext,
             backgroundJobFunctions.cleanup,
             backgroundJobFunctions.getActiveCount,
+            backgroundJobFunctions.renewLease,
+            backgroundJobFunctions.updateExecution,
             notificationFunctions.create,
             notificationFunctions.getByUser,
             notificationFunctions.markRead,
@@ -501,6 +505,122 @@ describe('Convex authorization boundary', () => {
             user_id: '*',
         })).resolves.toBe(false);
         expect(patch).not.toHaveBeenCalled();
+    });
+
+    it('enforces background admission and insert in one atomic mutation', async () => {
+        const insert = vi.fn(async () => 'job-new');
+        const active = [{
+            _id: 'job-active', user_id: 'user-1', status: 'streaming',
+            execution: { version: 1 },
+        }];
+        const query = vi.fn(() => ({
+            withIndex: (index: string, build: (q: any) => unknown) => {
+                const chain = { eq: vi.fn(() => chain) };
+                build(chain);
+                return index === 'by_user_idempotency'
+                    ? { collect: vi.fn(async () => []) }
+                    : { collect: vi.fn(async () => active) };
+            },
+        }));
+        const ctx = { db: { query, insert } } as any;
+        const input = {
+            user_id: 'user-1',
+            thread_id: 'thread-1',
+            message_id: 'message-1',
+            model: 'model-1',
+            idempotency_key: 'message-1',
+            max_concurrent_jobs: 2,
+            max_concurrent_jobs_per_user: 1,
+        };
+
+        await expect(
+            registered(backgroundJobFunctions.create)._handler(ctx, input)
+        ).rejects.toThrow('per user');
+        expect(insert).not.toHaveBeenCalled();
+
+        await expect(
+            registered(backgroundJobFunctions.create)._handler(ctx, {
+                ...input,
+                user_id: 'user-2',
+            })
+        ).resolves.toBe('job-new');
+        expect(insert).toHaveBeenCalledOnce();
+    });
+
+    it('retains terminal admission idempotency and frees legacy job capacity', async () => {
+        const insert = vi.fn(async () => 'job-new');
+        const patch = vi.fn(async () => undefined);
+        const terminal = {
+            _id: 'job-terminal', user_id: 'user-1', status: 'complete',
+            execution: { version: 1 },
+        };
+        const legacy = {
+            _id: 'job-legacy', user_id: 'user-2', status: 'streaming',
+        };
+        let idempotencyMatches: unknown[] = [terminal];
+        const query = vi.fn(() => ({
+            withIndex: (index: string, build: (q: any) => unknown) => {
+                const chain = { eq: vi.fn(() => chain) };
+                build(chain);
+                return {
+                    collect: vi.fn(async () =>
+                        index === 'by_user_idempotency'
+                            ? idempotencyMatches
+                            : [legacy]
+                    ),
+                };
+            },
+        }));
+        const ctx = { db: { query, insert, patch } } as any;
+        const input = {
+            user_id: 'user-1', thread_id: 'thread-1',
+            message_id: 'message-1', model: 'model-1',
+            idempotency_key: 'admission-1', max_concurrent_jobs: 1,
+            max_concurrent_jobs_per_user: 1, execution: { version: 1 },
+        };
+
+        await expect(
+            registered(backgroundJobFunctions.create)._handler(ctx, input)
+        ).resolves.toBe('job-terminal');
+        expect(insert).not.toHaveBeenCalled();
+
+        idempotencyMatches = [];
+        await expect(
+            registered(backgroundJobFunctions.create)._handler(ctx, {
+                ...input, user_id: 'user-3', idempotency_key: 'admission-2',
+            })
+        ).resolves.toBe('job-new');
+        expect(patch).toHaveBeenCalledWith(
+            'job-legacy',
+            expect.objectContaining({ status: 'error' })
+        );
+    });
+
+    it('terminalizes legacy streaming jobs during startup cleanup', async () => {
+        const patch = vi.fn(async () => undefined);
+        let queryCount = 0;
+        const query = vi.fn(() => ({
+            withIndex: (_index: string, build: (q: any) => unknown) => {
+                const chain = { eq: vi.fn(() => chain) };
+                build(chain);
+                const jobs = queryCount++ === 0
+                    ? [{
+                          _id: 'job-legacy', status: 'streaming',
+                          started_at: Date.now(),
+                      }]
+                    : [];
+                return { take: vi.fn(async () => jobs) };
+            },
+        }));
+        const ctx = { db: { query, patch, delete: vi.fn() } } as any;
+
+        await expect(
+            registered(backgroundJobFunctions.cleanup)._handler(ctx, {})
+        ).resolves.toBe(1);
+        expect(patch).toHaveBeenCalledWith(
+            'job-legacy',
+            expect.objectContaining({ status: 'error' })
+        );
     });
 
     it('subject-binds notification changes crossing the public sync boundary', async () => {
@@ -766,7 +886,7 @@ describe('Convex authorization boundary', () => {
         expect(sync).toContain('isChangeVisibleToUser(');
         expect(sync).toContain('export const gcTombstones = internalMutation({');
         expect(sync).toContain('export const gcChangeLog = internalMutation({');
-        expect(backgroundJobs.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(9);
+        expect(backgroundJobs.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(13);
         expect(backgroundJobs).not.toContain("args.user_id !== '*'");
         expect(notifications.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
         expect(rateLimits.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
@@ -786,7 +906,7 @@ describe('Convex authorization boundary', () => {
         expect(payload.files['workspaces.ts']).toContain('listInvitesInternal = internalQuery({');
         expect(payload.files['sync.ts']).toContain('gcTombstones = internalMutation({');
         expect(payload.files['backgroundJobs.ts']).not.toContain("args.user_id !== '*'");
-        expect(payload.files['backgroundJobs.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(9);
+        expect(payload.files['backgroundJobs.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(13);
         expect(payload.files['notifications.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
         expect(payload.files['rateLimits.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
         expect(payload.files['webhooks.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(20);
