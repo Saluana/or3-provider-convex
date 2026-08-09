@@ -15,8 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out OR3 Chat test contracts
-        run: git clone --depth=1 https://github.com/Saluana/or3-chat.git ../or3-chat
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -43,7 +41,7 @@ jobs:
             grep -Eq 'E404|404 Not Found|not found' <<<"$output" || { echo "$output" >&2; exit "${status}"; }
           fi
       - run: bun run type-check:standalone
-      - run: bun run test
+      - run: bun run test:release
       - run: bun run build
       - name: Validate package archive
         run: npm pack --dry-run --json > "$RUNNER_TEMP/package-pack.json"
