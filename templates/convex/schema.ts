@@ -540,6 +540,7 @@ export default defineSchema({
         lease_expires_at: v.optional(v.number()),
         attempts: v.optional(v.number()),
         started_at: v.number(), // Unix timestamp
+        last_activity_at: v.optional(v.number()),
         completed_at: v.optional(v.number()),
         error: v.optional(v.string()),
     })

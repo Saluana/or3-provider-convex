@@ -72,6 +72,7 @@ export const create = internalMutation({
             if (existing) {
                 if (
                     existing.status === 'streaming' &&
+                    existing.kind !== 'workflow' &&
                     existing.execution === undefined
                 ) {
                     await ctx.db.patch(existing._id, {
@@ -95,10 +96,11 @@ export const create = internalMutation({
         // safely claimed after a rolling upgrade. Terminalize them atomically
         // so they neither hang forever nor consume all admission capacity.
         const recoverable = active.filter(
-            (job) => job.execution !== undefined
+            (job) => job.kind === 'workflow' || job.execution !== undefined
         );
         for (const job of active) {
-            if (job.execution !== undefined) continue;
+            if (job.kind === 'workflow' || job.execution !== undefined)
+                continue;
             await ctx.db.patch(job._id, {
                 status: 'error',
                 error:
@@ -120,6 +122,7 @@ export const create = internalMutation({
             );
         }
 
+        const now = Date.now();
         const jobId = await ctx.db.insert('background_jobs', {
             user_id: args.user_id,
             thread_id: args.thread_id,
@@ -142,7 +145,8 @@ export const create = internalMutation({
                 ? { idempotency_key: args.idempotency_key }
                 : {}),
             attempts: 0,
-            started_at: Date.now(),
+            started_at: now,
+            last_activity_at: now
         });
 
         return jobId;
@@ -182,6 +186,7 @@ export const get = internalQuery({
             content: job.content,
             chunksReceived: job.chunks_received,
             startedAt: job.started_at,
+            lastActivityAt: job.last_activity_at ?? job.started_at,
             completedAt: job.completed_at,
             error: job.error,
             tool_calls: job.tool_calls,
@@ -223,7 +228,9 @@ export const update = internalMutation({
             return false;
         }
 
-        const patch: Record<string, unknown> = {};
+        const patch: Record<string, unknown> = {
+            last_activity_at: Date.now()
+        };
 
         if (args.content_chunk !== undefined) {
             patch.content = job.content + args.content_chunk;
@@ -274,6 +281,7 @@ export const complete = internalMutation({
             status: 'complete',
             content: args.content,
             completed_at: Date.now(),
+            last_activity_at: Date.now()
         };
         if (args.tool_calls !== undefined) {
             patch.tool_calls = args.tool_calls;
@@ -313,6 +321,7 @@ export const fail = internalMutation({
             status: 'error',
             error: args.error,
             completed_at: Date.now(),
+            last_activity_at: Date.now()
         });
         return true;
     },
@@ -347,6 +356,7 @@ export const claim = internalMutation({
         await ctx.db.patch(job._id, {
             lease_owner: args.lease_owner,
             lease_expires_at: leaseExpiresAt,
+            last_activity_at: now,
             attempts,
             ...(attempts > 1
                 ? { content: contentBase, chunks_received: 0 }
@@ -363,6 +373,7 @@ export const claim = internalMutation({
             content: attempts > 1 ? contentBase : job.content,
             chunksReceived: attempts > 1 ? 0 : job.chunks_received,
             startedAt: job.started_at,
+            lastActivityAt: now,
             completedAt: job.completed_at,
             error: job.error,
             tool_calls: job.tool_calls,
@@ -405,6 +416,7 @@ export const claimNext = internalMutation({
         await ctx.db.patch(job._id, {
             lease_owner: args.lease_owner,
             lease_expires_at: leaseExpiresAt,
+            last_activity_at: now,
             attempts,
             ...(attempts > 1
                 ? { content: contentBase, chunks_received: 0 }
@@ -421,6 +433,7 @@ export const claimNext = internalMutation({
             content: attempts > 1 ? contentBase : job.content,
             chunksReceived: attempts > 1 ? 0 : job.chunks_received,
             startedAt: job.started_at,
+            lastActivityAt: now,
             completedAt: job.completed_at,
             error: job.error,
             tool_calls: job.tool_calls,
@@ -453,6 +466,7 @@ export const renewLease = internalMutation({
         }
         await ctx.db.patch(job._id, {
             lease_expires_at: now + Math.max(1, args.lease_ms),
+            last_activity_at: now
         });
         return true;
     },
@@ -475,7 +489,10 @@ export const updateExecution = internalMutation({
         ) {
             return false;
         }
-        await ctx.db.patch(job._id, { execution: args.execution });
+        await ctx.db.patch(job._id, {
+            execution: args.execution,
+            last_activity_at: Date.now()
+        });
         return true;
     },
 });
@@ -510,6 +527,7 @@ export const abort = internalMutation({
         await ctx.db.patch(args.job_id, {
             status: 'aborted',
             completed_at: Date.now(),
+            last_activity_at: Date.now()
         });
 
         return true;
@@ -565,8 +583,8 @@ export const cleanup = internalMutation({
             .take(CLEANUP_BATCH_SIZE);
 
         for (const job of streamingJobs) {
-            const age = now - job.started_at;
-            if (job.execution === undefined) {
+            const idleAge = now - (job.last_activity_at ?? job.started_at);
+            if (job.kind !== 'workflow' && job.execution === undefined) {
                 await ctx.db.patch(job._id, {
                     status: 'error',
                     error:
@@ -574,7 +592,7 @@ export const cleanup = internalMutation({
                     completed_at: now,
                 });
                 cleaned++;
-            } else if (age > timeoutMs) {
+            } else if (idleAge > timeoutMs) {
                 await ctx.db.patch(job._id, {
                     status: 'error',
                     error: 'Job timed out',

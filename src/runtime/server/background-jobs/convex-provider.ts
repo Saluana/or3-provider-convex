@@ -47,6 +47,7 @@ function toBackgroundJob(job: any): BackgroundJob {
         content: job.content,
         chunksReceived: job.chunksReceived,
         startedAt: job.startedAt,
+        lastActivityAt: job.lastActivityAt ?? job.startedAt,
         completedAt: job.completedAt ?? undefined,
         error: job.error ?? undefined,
         tool_calls: job.tool_calls ?? undefined,
