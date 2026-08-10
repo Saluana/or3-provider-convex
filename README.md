@@ -133,7 +133,7 @@ The `init` command installs the Convex backend into `convex/`:
 
 ## How it works
 
-- **Sync** — Direct mode: the client sync plugin binds the token-broker JWT to the Convex client and pushes/pulls via Convex functions with reactive subscriptions (`watchChanges`). Gateway mode (SSR auth enabled): the sync gateway adapter resolves the SSR session, mints an identity-bound client, and calls the same functions through the Nuxt server; the browser never talks to Convex directly.
+- **Sync** — Direct mode: the client sync plugin binds the token-broker JWT to the Convex client and pushes/pulls via Convex functions with reactive subscriptions (`watchChanges`). Gateway mode (SSR auth enabled): the sync gateway adapter resolves the SSR session, mints an identity-bound client, and calls the same functions through the Nuxt server; the browser never talks to Convex directly. Both paths enforce the shared 256 KB serialized payload ceiling per operation.
 - **Storage** — The client storage provider calls `/api/storage/*` SSR endpoints that proxy Convex upload URL generation, commit, and signed URLs. Uploads are reserved via upload intents; quota and GC read only canonical `file_meta` + message/post `file_hashes` pages.
 - **Internal persistence** (background jobs, notifications, webhooks, rate limits, connect) is invoked only by admin-authenticated server adapters; the underlying Convex functions are internal-only.
 

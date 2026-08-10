@@ -103,8 +103,8 @@ const SNAPSHOT_TTL_SECONDS = 60 * 60;
 /** Maximum operation ID length in characters */
 const MAX_OP_ID_LENGTH = 64;
 
-/** Maximum payload size in bytes (64KB) */
-const MAX_PAYLOAD_SIZE_BYTES = 64 * 1024;
+/** Maximum payload size in bytes (256KB) */
+const MAX_PAYLOAD_SIZE_BYTES = 256 * 1024;
 
 const SYNC_READ_ROLES = new Set(['owner', 'editor', 'viewer'] as const);
 const SYNC_WRITE_ROLES = new Set(['owner', 'editor'] as const);
@@ -714,7 +714,11 @@ function validateSyncOperation(
     } catch {
         return `Invalid payload for ${op.table_name}: payload is not serializable`;
     }
-    if ((serializedPayload?.length ?? 0) > MAX_PAYLOAD_SIZE_BYTES) {
+    if (
+        serializedPayload !== undefined &&
+        new TextEncoder().encode(serializedPayload).byteLength >
+            MAX_PAYLOAD_SIZE_BYTES
+    ) {
         return `Payload too large for ${op.table_name}: exceeds ${MAX_PAYLOAD_SIZE_BYTES} bytes`;
     }
     if (op.payload !== undefined &&
