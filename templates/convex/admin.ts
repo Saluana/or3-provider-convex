@@ -24,6 +24,7 @@ import { mutation, query, type MutationCtx, type QueryCtx } from './_generated/s
 import { v } from 'convex/values';
 import type { Id } from './_generated/dataModel';
 import { ADMIN_IDENTITY_ISSUER } from '../shared/cloud/admin-identity';
+import { applyServerAuthoredOp } from './syncAuthoring';
 
 // ============================================================
 // CONSTANTS
@@ -1035,33 +1036,16 @@ export const setWorkspaceSetting = mutation({
         // Verify caller is an admin
         await requireAdmin(ctx);
 
-        const now = Date.now();
-        const existing = await ctx.db
-            .query('kv')
-            .withIndex('by_workspace_name', (q) =>
-                q.eq('workspace_id', args.workspace_id).eq('name', args.key)
-            )
-            .first();
-
-        if (existing) {
-            await ctx.db.patch(existing._id, {
-                value: args.value,
-                deleted: false,
-                deleted_at: undefined,
-                updated_at: now,
-                clock: now,
-            });
-        } else {
-            await ctx.db.insert('kv', {
-                workspace_id: args.workspace_id,
+        await applyServerAuthoredOp(ctx, args.workspace_id, {
+            table: 'kv',
+            operation: 'put',
+            pk: `${args.workspace_id}:${args.key}`,
+            payload: {
                 id: `${args.workspace_id}:${args.key}`,
                 name: args.key,
                 value: args.value,
                 deleted: false,
-                created_at: now,
-                updated_at: now,
-                clock: now,
-            });
-        }
+            },
+        });
     },
 });

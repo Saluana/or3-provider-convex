@@ -10,3 +10,18 @@ export const SYNC_HISTORY_GC_POLICY = Object.freeze({
     reason:
         'Convex history GC is guarded by the verified snapshot-v1 retention contract.',
 });
+
+export function computePullRetention(input: {
+    cursor: number;
+    oldestLogVersion: number | null;
+    highWatermark: number;
+}): { oldestRetainedVersion: number; requiresSnapshot: boolean } {
+    const oldestRetainedVersion =
+        input.oldestLogVersion ?? Math.max(0, input.highWatermark) + 1;
+    return {
+        oldestRetainedVersion,
+        requiresSnapshot:
+            oldestRetainedVersion > 0 &&
+            input.cursor < Math.max(0, oldestRetainedVersion - 1),
+    };
+}

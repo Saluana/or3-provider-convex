@@ -22,5 +22,6 @@ const crons = cronJobs();
 
 // Run rate limit cleanup daily at 3:00 UTC
 crons.daily('gc:rate-limits', { hourUTC: 3, minuteUTC: 0 }, internal.rateLimits.cleanup);
+crons.interval('gc:sync-history', { hours: 1 }, internal.sync.runScheduledGc);
 
 export default crons;

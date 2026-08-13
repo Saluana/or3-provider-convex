@@ -25,33 +25,19 @@ const actionContext = {
 } as never;
 
 describe('Convex sync admin GC safety gate', () => {
-    it('does not advertise destructive history actions', async () => {
+    it('advertises history GC actions when snapshot bootstrap is verified', async () => {
         const status = await convexSyncAdminAdapter.getStatus(event, statusContext);
 
-        expect(status.actions).toEqual([]);
+        expect(status.actions.map((action) => action.id)).toEqual([
+            'sync.gc-change-log',
+            'sync.gc-tombstones',
+        ]);
         expect(status.warnings).toEqual(
             expect.arrayContaining([
                 expect.objectContaining({
-                    message: expect.stringContaining('snapshot bootstrap'),
+                    message: expect.stringContaining('snapshot-v1'),
                 }),
             ])
         );
     });
-
-    it.each(['sync.gc-change-log', 'sync.gc-tombstones'])(
-        'rejects stale admin action %s',
-        async (actionId) => {
-            await expect(
-                convexSyncAdminAdapter.runAction!(
-                    event,
-                    actionId,
-                    { retentionSeconds: 1 },
-                    actionContext
-                )
-            ).rejects.toMatchObject({
-                statusCode: 503,
-                message: expect.stringContaining('snapshot bootstrap'),
-            });
-        }
-    );
 });

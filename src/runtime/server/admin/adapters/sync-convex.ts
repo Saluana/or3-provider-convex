@@ -21,7 +21,17 @@ import type {
     ProviderActionContext,
 } from '~~/server/admin/providers/types';
 import { useRuntimeConfig } from '#imports';
-import { SYNC_HISTORY_GC_POLICY } from '../../../utils/sync-history-gc-policy';
+import { SYNC_HISTORY_GC_POLICY, canRunSyncHistoryGc } from '../../../utils/sync-history-gc-policy';
+import { createConvexSyncGatewayAdapter } from '../../sync/convex-sync-gateway-adapter';
+import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
+
+const SYNC_MAINTENANCE_RETENTION_SECONDS = 7 * 24 * 60 * 60;
+let gatewayInstance: SyncGatewayAdapter | undefined;
+
+function getGateway(): SyncGatewayAdapter {
+    gatewayInstance ??= createConvexSyncGatewayAdapter();
+    return gatewayInstance;
+}
 
 /**
  * Singleton implementation of the Convex Sync admin adapter.
@@ -71,7 +81,22 @@ export const convexSyncAdminAdapter: ProviderAdminAdapter = {
                 convexUrl: config.sync.convexUrl,
             },
             warnings,
-            actions: [],
+            actions: canRunSyncHistoryGc()
+                ? [
+                    {
+                        id: 'sync.gc-change-log',
+                        label: 'GC change log',
+                        description: `Prune change-log entries older than ${SYNC_MAINTENANCE_RETENTION_SECONDS / 86400} days and behind every device cursor.`,
+                        danger: true,
+                    },
+                    {
+                        id: 'sync.gc-tombstones',
+                        label: 'GC tombstones',
+                        description: `Prune tombstones older than ${SYNC_MAINTENANCE_RETENTION_SECONDS / 86400} days and behind every device cursor.`,
+                        danger: true,
+                    },
+                ]
+                : [],
         };
     },
 
@@ -80,7 +105,7 @@ export const convexSyncAdminAdapter: ProviderAdminAdapter = {
      * Rejects stale history-GC action IDs while snapshot bootstrap is absent.
      */
     async runAction(
-        _event: H3Event,
+        event: H3Event,
         actionId: string,
         _payload: Record<string, unknown> | undefined,
         ctx: ProviderActionContext
@@ -96,10 +121,31 @@ export const convexSyncAdminAdapter: ProviderAdminAdapter = {
             actionId === 'sync.gc-change-log' ||
             actionId === 'sync.gc-tombstones'
         ) {
-            throw createError({
-                statusCode: 503,
-                statusMessage: SYNC_HISTORY_GC_POLICY.reason,
-            });
+            if (!canRunSyncHistoryGc()) {
+                throw createError({
+                    statusCode: 503,
+                    statusMessage: SYNC_HISTORY_GC_POLICY.reason,
+                });
+            }
+            const workspaceId = ctx.session.workspace.id;
+            const gateway = getGateway();
+            if (actionId === 'sync.gc-change-log') {
+                await gateway.gcChangeLog!(event, {
+                    scope: { workspaceId },
+                    retentionSeconds: SYNC_MAINTENANCE_RETENTION_SECONDS,
+                });
+            } else {
+                await gateway.gcTombstones!(event, {
+                    scope: { workspaceId },
+                    retentionSeconds: SYNC_MAINTENANCE_RETENTION_SECONDS,
+                });
+            }
+            return {
+                ok: true,
+                actionId,
+                workspaceId,
+                retentionSeconds: SYNC_MAINTENANCE_RETENTION_SECONDS,
+            };
         }
 
         throw createError({ statusCode: 400, statusMessage: 'Unknown action' });

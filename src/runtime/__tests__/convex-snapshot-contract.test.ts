@@ -3,10 +3,17 @@ import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { verifySyncContract } from "~~/shared/testing/contracts/sync";
 import { compareSyncRevision } from "~~/shared/sync/revision";
+import { ChangeStampSchema } from "~~/shared/sync/schemas";
 
 const syncFunctions = await import(
   /* @vite-ignore */ new URL(
     "../../../templates/convex/sync.ts",
+    import.meta.url,
+  ).href
+);
+const notificationFunctions = await import(
+  /* @vite-ignore */ new URL(
+    "../../../templates/convex/notifications.ts",
     import.meta.url,
   ).href
 );
@@ -16,6 +23,13 @@ type RegisteredFunction = {
 };
 
 type Row = Record<string, any> & { _id: string };
+
+function uuidOp(label: string): string {
+  let hex = "";
+  for (const ch of label) hex += ch.charCodeAt(0).toString(16).padStart(2, "0");
+  hex = hex.padEnd(32, "0").slice(0, 32);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
 
 const INDEX_FIELDS: Record<string, string[]> = {
   by_provider: ["provider", "provider_user_id"],
@@ -551,7 +565,7 @@ describe("Convex materialized snapshot contract", () => {
       server_deleted_at: 1005,
       clock: 5,
       hlc: "5:0:dev",
-      op_id: "op-delete",
+      op_id: uuidOp("op-delete"),
       server_version: 5,
       created_at: 1005,
     });
@@ -561,7 +575,7 @@ describe("Convex materialized snapshot contract", () => {
       workspace_id: "ws-1",
       ops: [
         {
-          op_id: "op-before-delete",
+          op_id: uuidOp("op-before-delete"),
           table_name: "messages",
           operation: "put",
           pk: "message-dead",
@@ -586,7 +600,7 @@ describe("Convex materialized snapshot contract", () => {
       workspace_id: "ws-1",
       ops: [
         {
-          op_id: "op-z-newer",
+          op_id: uuidOp("op-z-newer"),
           table_name: "messages",
           operation: "put",
           pk: "message-dead",
@@ -608,7 +622,7 @@ describe("Convex materialized snapshot contract", () => {
     ).toMatchObject({
       clock: 5,
       hlc: "5:0:dev",
-      op_id: "op-z-newer",
+      op_id: uuidOp("op-z-newer"),
     });
   });
 
@@ -620,7 +634,7 @@ describe("Convex materialized snapshot contract", () => {
     await push(fixture.ctx, {
       workspace_id: "ws-1",
       ops: [{
-        op_id: "op-file-create",
+        op_id: uuidOp("op-file-create"),
         table_name: "file_meta",
         operation: "put",
         pk: hash,
@@ -645,7 +659,7 @@ describe("Convex materialized snapshot contract", () => {
     await push(fixture.ctx, {
       workspace_id: "ws-1",
       ops: [{
-        op_id: "op-file-update",
+        op_id: uuidOp("op-file-update"),
         table_name: "file_meta",
         operation: "put",
         pk: hash,
@@ -670,7 +684,7 @@ describe("Convex materialized snapshot contract", () => {
       workspace_id: "ws-1",
       ops: [
         {
-          op_id: "op-stale-delete",
+          op_id: uuidOp("op-stale-delete"),
           table_name: "threads",
           operation: "delete",
           pk: "thread-b",
@@ -694,7 +708,7 @@ describe("Convex materialized snapshot contract", () => {
     const fixture = createFixture("editor");
     const push = (syncFunctions.push as RegisteredFunction)._handler;
     const op = {
-      op_id: "op-identical",
+      op_id: uuidOp("op-identical"),
       table_name: "threads",
       operation: "put",
       pk: "thread-identical",
@@ -723,7 +737,7 @@ describe("Convex materialized snapshot contract", () => {
     });
     expect(fixture.tables.server_version_counter[0]!.value).toBe(6);
     expect(
-      fixture.tables.change_log.filter((row) => row.op_id === "op-identical"),
+      fixture.tables.change_log.filter((row) => row.op_id === uuidOp("op-identical")),
     ).toHaveLength(1);
   });
 
@@ -735,7 +749,7 @@ describe("Convex materialized snapshot contract", () => {
       workspace_id: "ws-1",
       ops: [
         {
-          op_id: "op-conflict",
+          op_id: uuidOp("op-conflict"),
           table_name: "threads",
           operation: "put",
           pk: "thread-a",
@@ -745,7 +759,7 @@ describe("Convex materialized snapshot contract", () => {
           device_id: "device-a",
         },
         {
-          op_id: "op-conflict",
+          op_id: uuidOp("op-conflict"),
           table_name: "threads",
           operation: "delete",
           pk: "thread-a",
@@ -774,7 +788,7 @@ describe("Convex materialized snapshot contract", () => {
       workspace_id: "ws-1",
       ops: [
         {
-          op_id: "op-invalid-table",
+          op_id: uuidOp("op-invalid-table"),
           table_name: "not_a_table",
           operation: "put",
           pk: "bad",
@@ -784,7 +798,7 @@ describe("Convex materialized snapshot contract", () => {
           device_id: "device-a",
         },
         {
-          op_id: "op-key-mutation",
+          op_id: uuidOp("op-key-mutation"),
           table_name: "threads",
           operation: "put",
           pk: "thread-key",
@@ -794,7 +808,7 @@ describe("Convex materialized snapshot contract", () => {
           device_id: "device-a",
         },
         {
-          op_id: "op-workspace-mutation",
+          op_id: uuidOp("op-workspace-mutation"),
           table_name: "threads",
           operation: "put",
           pk: "thread-workspace",
@@ -808,7 +822,7 @@ describe("Convex materialized snapshot contract", () => {
           device_id: "device-a",
         },
         {
-          op_id: "op-valid-sibling",
+          op_id: uuidOp("op-valid-sibling"),
           table_name: "threads",
           operation: "put",
           pk: "thread-valid",
@@ -1104,6 +1118,82 @@ describe("Convex materialized snapshot contract", () => {
     ).rejects.toThrow("unavailable");
   });
 
+  it("mints UUID op_ids for notifications.create and skips legacy prefixed ids on pull", async () => {
+    const fixture = createFixture("editor");
+    const create = (notificationFunctions.create as RegisteredFunction)._handler;
+    const pull = (syncFunctions.pull as RegisteredFunction)._handler;
+    const id = await create(fixture.ctx, {
+      workspace_id: "ws-1",
+      user_id: "user-1",
+      type: "info",
+      title: "hello",
+    });
+    const created = fixture.tables.change_log.find(
+      (row) => row.table_name === "notifications" && row.pk === id,
+    );
+    expect(created).toBeTruthy();
+    expect(ChangeStampSchema.shape.opId.safeParse(created!.op_id).success).toBe(
+      true,
+    );
+    expect(created!.op_id).not.toMatch(/^server:/);
+
+    fixture.tables.change_log.push({
+      _id: "legacy-notif",
+      workspace_id: "ws-1",
+      server_version: created!.server_version + 1,
+      table_name: "notifications",
+      pk: "legacy-note",
+      op: "put",
+      payload: { id: "legacy-note", user_id: "user-1" },
+      clock: 9,
+      hlc: "9:0:server",
+      device_id: "server",
+      op_id: `server:notif:${id}`,
+      created_at: 9,
+    });
+    fixture.tables.server_version_counter[0]!.value = created!.server_version + 1;
+
+    const page = await pull(fixture.ctx, {
+      workspace_id: "ws-1",
+      cursor: created!.server_version - 1,
+      limit: 50,
+    });
+    expect(page.changes.every((change: { stamp: { opId: string } }) =>
+      ChangeStampSchema.shape.opId.safeParse(change.stamp.opId).success
+    )).toBe(true);
+    expect(page.changes.map((change: { pk: string }) => change.pk)).toContain(id);
+    expect(page.changes.map((change: { pk: string }) => change.pk)).not.toContain(
+      "legacy-note",
+    );
+    expect(page.nextCursor).toBe(created!.server_version + 1);
+    expect(page.oldestRetainedVersion).toBeGreaterThan(0);
+    expect(page.requiresSnapshot).toBe(false);
+  });
+
+  it("rejects a non-UUID op_id before allocating a server version", async () => {
+    const fixture = createFixture("editor");
+    const before = fixture.tables.server_version_counter[0]!.value;
+    const push = (syncFunctions.push as RegisteredFunction)._handler;
+    const result = await push(fixture.ctx, {
+      workspace_id: "ws-1",
+      ops: [{
+        op_id: "not-a-uuid",
+        table_name: "threads",
+        operation: "put",
+        pk: "thread-uuid-check",
+        payload: { id: "thread-uuid-check", title: "nope" },
+        clock: 8,
+        hlc: "8:0:dev",
+        device_id: "dev",
+      }],
+    });
+    expect(result.results[0]).toMatchObject({
+      success: false,
+      error: expect.stringContaining("UUID"),
+    });
+    expect(fixture.tables.server_version_counter[0]!.value).toBe(before);
+  });
+
   it("ships the snapshot mutation, schema, helper, and ignored host mirror", () => {
     const packPath = new URL(
       "../../../templates/convex.pack.json.gz",
@@ -1131,6 +1221,8 @@ describe("Convex materialized snapshot contract", () => {
       "sync_snapshot_sessions: defineTable",
     );
     expect(packed.files["snapshot.ts"]).toContain("resolveSnapshotWinner");
+    expect(packed.files["tsconfig.json"]).toContain('"strict": true');
+    expect(packed.files["tsconfig.json"]).toContain('"noEmit": true');
 
     const mirrorSync = readFileSync(
       new URL("../../../../or3-chat/convex/sync.ts", import.meta.url),

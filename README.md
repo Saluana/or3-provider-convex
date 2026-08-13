@@ -43,7 +43,7 @@ Then run codegen:
 bunx convex dev --once
 ```
 
-This generates `convex/_generated/` in your host repo. The `_generated/` directory should be gitignored. `convex dev --once` fails when `convex/` is absent, so `init` must run first.
+This generates `convex/_generated/` in your host repo. The `_generated/` directory should be gitignored. The scaffold includes `convex/tsconfig.json`, so `convex dev --typecheck enable` checks the generated functions instead of skipping them. `convex dev --once` fails when `convex/` is absent, so `init` must run first.
 
 ### 3. Required environment variables
 
@@ -99,6 +99,12 @@ Sync `change_log` and tombstone retention is available through internal,
 admin-authenticated mutations. Collection is bounded, requires the explicit
 `snapshot-v1` capability, and deletes only old revisions acknowledged by every
 registered device; fresh devices bootstrap from canonical snapshots.
+
+Server-authored notification, storage, and workspace-setting writes mint a
+fresh UUID `op_id` (never a `server:*` prefix), allocate `server_version`, and
+append `change_log`. Pull and watch skip historical non-UUID `op_id`s without
+failing the request. Pull responses include `oldestRetainedVersion` and
+`requiresSnapshot`. Direct subscribe advances the watch cursor after each page.
 
 The provider exposes the shared materialized snapshot contract in both direct
 and gateway modes. The first page records one Convex server-version

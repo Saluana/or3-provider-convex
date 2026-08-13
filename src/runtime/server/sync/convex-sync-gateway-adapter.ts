@@ -347,6 +347,8 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                 })),
                 nextCursor: result.nextCursor,
                 hasMore: result.hasMore,
+                oldestRetainedVersion: result.oldestRetainedVersion,
+                requiresSnapshot: result.requiresSnapshot,
             };
         } catch (error) {
             throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
@@ -452,10 +454,10 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                     userId: sessionUserId,
                     wasExisting:
                         resultItem.wasExisting ?? inferWasExistingFallback(op),
-                    applied: resultItem.applied ?? true,
+                    applied: resultItem.applied === true,
                 });
 
-                if (emission) {
+                if (emission && resultItem.wasExisting !== true && resultItem.applied === true) {
                     emissions.push(emission);
                 }
             }
@@ -494,12 +496,19 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
     ): Promise<void> {
         if (!canRunSyncHistoryGc()) return;
         const client = await getSyncGcAdminClient(event);
-        await withConvexTransportRetry('sync.gcTombstones', () =>
-            client.mutation(internalApi.sync.gcTombstones, {
-                workspace_id: toWorkspaceId(input.scope.workspaceId),
-                retention_seconds: input.retentionSeconds,
-            })
-        );
+        let cursor = 0;
+        for (;;) {
+            const page = await withConvexTransportRetry('sync.gcTombstones', () =>
+                client.mutation(internalApi.sync.gcTombstones, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    retention_seconds: input.retentionSeconds,
+                    cursor,
+                })
+            ) as { hasMore?: boolean; nextCursor?: number };
+            if (!page?.hasMore) break;
+            cursor = page.nextCursor ?? cursor;
+            if (typeof cursor !== 'number') break;
+        }
     }
 
     async gcChangeLog(
@@ -508,12 +517,19 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
     ): Promise<void> {
         if (!canRunSyncHistoryGc()) return;
         const client = await getSyncGcAdminClient(event);
-        await withConvexTransportRetry('sync.gcChangeLog', () =>
-            client.mutation(internalApi.sync.gcChangeLog, {
-                workspace_id: toWorkspaceId(input.scope.workspaceId),
-                retention_seconds: input.retentionSeconds,
-            })
-        );
+        let cursor = 0;
+        for (;;) {
+            const page = await withConvexTransportRetry('sync.gcChangeLog', () =>
+                client.mutation(internalApi.sync.gcChangeLog, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    retention_seconds: input.retentionSeconds,
+                    cursor,
+                })
+            ) as { hasMore?: boolean; nextCursor?: number };
+            if (!page?.hasMore) break;
+            cursor = page.nextCursor ?? cursor;
+            if (typeof cursor !== 'number') break;
+        }
     }
 }
 

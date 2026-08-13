@@ -158,6 +158,8 @@ describe('ConvexSyncGatewayAdapter', () => {
             ],
             nextCursor: 2,
             hasMore: false,
+            oldestRetainedVersion: 1,
+            requiresSnapshot: false,
         });
 
         const result = await adapter.pull(makeEvent(), {
@@ -173,6 +175,8 @@ describe('ConvexSyncGatewayAdapter', () => {
             ],
             nextCursor: 2,
             hasMore: false,
+            oldestRetainedVersion: 1,
+            requiresSnapshot: false,
         });
 
         expect(queryMock).toHaveBeenCalledWith('sync.pull', {
@@ -308,17 +312,25 @@ describe('ConvexSyncGatewayAdapter', () => {
         expect(mutationMock).toHaveBeenCalledWith('sync.gcTombstones', {
             workspace_id: 'ws-1',
             retention_seconds: 3600,
+            cursor: 0,
         });
         expect(mutationMock).toHaveBeenCalledWith('sync.gcChangeLog', {
             workspace_id: 'ws-1',
             retention_seconds: 3600,
+            cursor: 0,
         });
         expect(resolveProviderTokenMock).toHaveBeenCalledTimes(2);
     });
 
     it('calls resolveProviderToken for each method with provider/template', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
-        queryMock.mockResolvedValue({ changes: [], nextCursor: 0, hasMore: false });
+        queryMock.mockResolvedValue({
+            changes: [],
+            nextCursor: 0,
+            hasMore: false,
+            oldestRetainedVersion: 0,
+            requiresSnapshot: false,
+        });
         mutationMock.mockResolvedValue({ results: [], serverVersion: 0 });
 
         await adapter.pull(makeEvent(), { scope: { workspaceId: 'ws-1' }, cursor: 0, limit: 10 });
@@ -332,6 +344,63 @@ describe('ConvexSyncGatewayAdapter', () => {
     });
 
     it('emits webhook runtime hooks for successful push operations', async () => {
+        const adapter = new ConvexSyncGatewayAdapter();
+        resolveSessionContextMock.mockResolvedValue({
+            authenticated: true,
+            user: { id: 'user-1' },
+        });
+        mutationMock.mockResolvedValue({
+            results: [
+                {
+                    opId: 'op-1',
+                    success: true,
+                    serverVersion: 7,
+                    tableName: 'threads',
+                    operation: 'put',
+                    payload: {
+                        id: 'thread-1',
+                        title: 'Renamed',
+                    },
+                    wasExisting: false,
+                    applied: true,
+                },
+            ],
+            serverVersion: 7,
+        });
+
+        await adapter.push(makeEvent(), {
+            scope: { workspaceId: 'ws-1' },
+            ops: [
+                {
+                    id: 'pending-1',
+                    tableName: 'threads',
+                    operation: 'put',
+                    pk: 'thread-1',
+                    payload: { id: 'thread-1', title: 'Renamed' },
+                    stamp: {
+                        opId: 'op-1',
+                        deviceId: 'device-1',
+                        hlc: '1:0:device-1',
+                        clock: 2,
+                    },
+                    createdAt: Date.now(),
+                    attempts: 0,
+                    status: 'pending',
+                },
+            ],
+        });
+
+        expect(emitWebhookSystemHookMock).toHaveBeenCalledWith(
+            'db.threads.create:action:after',
+            expect.objectContaining({
+                id: 'thread-1',
+                workspace_id: 'ws-1',
+                user_id: 'user-1',
+            })
+        );
+    });
+
+    it('does not emit webhook hooks for idempotent replay', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
         resolveSessionContextMock.mockResolvedValue({
             authenticated: true,
@@ -378,14 +447,7 @@ describe('ConvexSyncGatewayAdapter', () => {
             ],
         });
 
-        expect(emitWebhookSystemHookMock).toHaveBeenCalledWith(
-            'db.threads.update:action:after',
-            expect.objectContaining({
-                id: 'thread-1',
-                workspace_id: 'ws-1',
-                user_id: 'user-1',
-            })
-        );
+        expect(emitWebhookSystemHookMock).not.toHaveBeenCalled();
     });
 
     it('maps posts table pushes to document webhook hooks', async () => {
@@ -454,7 +516,13 @@ describe('ConvexSyncGatewayAdapter', () => {
         const adapter = new ConvexSyncGatewayAdapter();
         queryMock
             .mockRejectedValueOnce(createTransientTransportError())
-            .mockResolvedValueOnce({ changes: [], nextCursor: 0, hasMore: false });
+            .mockResolvedValueOnce({
+                changes: [],
+                nextCursor: 0,
+                hasMore: false,
+                oldestRetainedVersion: 0,
+                requiresSnapshot: false,
+            });
 
         await expect(
             adapter.pull(makeEvent(), {
@@ -466,6 +534,8 @@ describe('ConvexSyncGatewayAdapter', () => {
             changes: [],
             nextCursor: 0,
             hasMore: false,
+            oldestRetainedVersion: 0,
+            requiresSnapshot: false,
         });
 
         expect(queryMock).toHaveBeenCalledTimes(2);

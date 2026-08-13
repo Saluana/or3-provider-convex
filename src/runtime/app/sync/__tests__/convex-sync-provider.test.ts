@@ -87,6 +87,47 @@ describe('createConvexSyncProvider', () => {
         expect(errorSpy).toHaveBeenCalled();
     });
 
+    it('resubscribes with an advanced cursor after a filtered empty page', async () => {
+        const provider = createConvexSyncProvider(client as any);
+        const onChanges = vi.fn();
+        const callbacks: Array<(result: {
+            changes: unknown[];
+            latestVersion?: number;
+        }) => void> = [];
+        onUpdateMock.mockImplementation((_query, args, cb) => {
+            callbacks.push(cb);
+            return vi.fn();
+        });
+
+        await provider.subscribe(
+            { workspaceId: 'ws-1' },
+            ['messages'],
+            onChanges,
+            { cursor: 0 }
+        );
+
+        callbacks[0]?.({
+            changes: [{
+                serverVersion: 4,
+                tableName: 'threads',
+                pk: 't1',
+                op: 'put',
+                payload: {},
+                stamp: {
+                    clock: 1,
+                    hlc: '1:0:dev',
+                    deviceId: 'dev',
+                    opId: crypto.randomUUID(),
+                },
+            }],
+            latestVersion: 4,
+        });
+
+        expect(onChanges).toHaveBeenCalledWith([]);
+        expect(onUpdateMock).toHaveBeenCalledTimes(2);
+        expect(onUpdateMock.mock.calls[1]?.[1]).toMatchObject({ cursor: 4 });
+    });
+
     it('suppresses known Convex unwatch race during cleanup', async () => {
         const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
         const knownRaceError = new TypeError("Cannot read properties of undefined (reading 'numSubscribers')");
@@ -183,6 +224,8 @@ describe('createConvexSyncProvider', () => {
             changes: [],
             nextCursor: 1,
             hasMore: false,
+            oldestRetainedVersion: 0,
+            requiresSnapshot: false,
         });
         mutationMock.mockResolvedValue({ results: [], serverVersion: 1 });
 

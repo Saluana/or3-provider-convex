@@ -24,6 +24,7 @@
 import { v } from 'convex/values';
 import { mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id } from './_generated/dataModel';
+import { applyServerAuthoredOp } from './syncAuthoring';
 
 // ============================================================
 // CONSTANTS
@@ -298,10 +299,24 @@ export const commitUpload = mutation({
             .first();
 
         if (existing) {
-            await ctx.db.patch(existing._id, {
-                storage_id: args.storage_id,
-                storage_provider_id: args.storage_provider_id,
-                updated_at: nowSec(),
+            await applyServerAuthoredOp(ctx, args.workspace_id, {
+                table: 'file_meta',
+                operation: 'put',
+                pk: args.hash,
+                payload: {
+                    hash: args.hash,
+                    name: existing.name,
+                    mime_type: existing.mime_type,
+                    kind: existing.kind,
+                    size_bytes: existing.size_bytes,
+                    width: existing.width,
+                    height: existing.height,
+                    page_count: existing.page_count,
+                    ref_count: existing.ref_count,
+                    storage_id: args.storage_id,
+                    storage_provider_id: args.storage_provider_id,
+                    deleted: false,
+                },
             });
             await ctx.db.patch(intent._id, {
                 status: 'consumed', storage_id: args.storage_id, consumed_at: nowSec(),
@@ -309,23 +324,24 @@ export const commitUpload = mutation({
             return;
         }
 
-        const createdId = await ctx.db.insert('file_meta', {
-            workspace_id: args.workspace_id,
-            hash: args.hash,
-            name: args.name,
-            mime_type: args.mime_type,
-            kind: args.kind,
-            size_bytes: args.size_bytes,
-            width: args.width,
-            height: args.height,
-            page_count: args.page_count,
-            ref_count: 1,
-            storage_id: args.storage_id,
-            storage_provider_id: args.storage_provider_id,
-            deleted: false,
-            created_at: nowSec(),
-            updated_at: nowSec(),
-            clock: 0,
+        await applyServerAuthoredOp(ctx, args.workspace_id, {
+            table: 'file_meta',
+            operation: 'put',
+            pk: args.hash,
+            payload: {
+                hash: args.hash,
+                name: args.name,
+                mime_type: args.mime_type,
+                kind: args.kind,
+                size_bytes: args.size_bytes,
+                width: args.width,
+                height: args.height,
+                page_count: args.page_count,
+                ref_count: 1,
+                storage_id: args.storage_id,
+                storage_provider_id: args.storage_provider_id,
+                deleted: false,
+            },
         });
 
         // Cleanup any race condition duplicates (should be rare with .first() check above)
@@ -347,7 +363,7 @@ export const commitUpload = mutation({
                 if (file._id === keeper._id) continue;
                 await ctx.db.delete(file._id);
             }
-            if (keeper._id !== createdId) {
+            if (keeper.hash === args.hash) {
                 await ctx.db.patch(keeper._id, {
                     storage_id: args.storage_id,
                     storage_provider_id: args.storage_provider_id,
@@ -432,6 +448,20 @@ export const deleteObject = mutation({
         if (file.storage_id) {
             await ctx.storage.delete(file.storage_id);
         }
+        await applyServerAuthoredOp(ctx, args.workspace_id, {
+            table: 'file_meta',
+            operation: 'delete',
+            pk: file.hash,
+            payload: {
+                hash: file.hash,
+                name: file.name,
+                mime_type: file.mime_type,
+                kind: file.kind,
+                size_bytes: file.size_bytes,
+                ref_count: file.ref_count,
+                deleted: true,
+            },
+        });
         await ctx.db.delete(file._id);
         return { deleted: true };
     },

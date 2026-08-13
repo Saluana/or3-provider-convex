@@ -63,12 +63,8 @@ export function resolveSnapshotWinner(
 ): SnapshotCandidate | null {
     let winner: SnapshotCandidate | null = null;
     for (const candidate of candidates) {
-        if (
-            typeof candidate.serverVersion === 'number' &&
-            candidate.serverVersion > highWatermark
-        ) {
-            continue;
-        }
+        if (typeof candidate.serverVersion !== 'number') continue;
+        if (candidate.serverVersion > highWatermark) continue;
         if (!winner) {
             winner = candidate;
             continue;

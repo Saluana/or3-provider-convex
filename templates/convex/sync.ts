@@ -27,7 +27,7 @@ import { mutation, query, internalMutation, type MutationCtx, type QueryCtx } fr
 import type { Id, TableNames } from './_generated/dataModel';
 import { getPkField } from '../shared/sync/table-metadata';
 import { requireWorkspaceRole } from './authz';
-import { SYNC_HISTORY_GC_POLICY } from './syncHistoryGcPolicy';
+import { SYNC_HISTORY_GC_POLICY, computePullRetention } from './syncHistoryGcPolicy';
 import {
     decodeSnapshotCursor,
     encodeSnapshotCursor,
@@ -37,6 +37,7 @@ import {
     type SnapshotCandidate,
     type SnapshotRevision,
 } from './snapshot';
+import { isSyncUuid } from './syncAuthoring';
 
 const nowSec = (): number => Math.floor(Date.now() / 1000);
 const MIN_SYNC_RETENTION_SECONDS = 60 * 60;
@@ -99,9 +100,6 @@ const MAX_CANONICAL_STORAGE_PAGE_SIZE = 500;
 
 /** Snapshot page chains expire after one hour. */
 const SNAPSHOT_TTL_SECONDS = 60 * 60;
-
-/** Maximum operation ID length in characters */
-const MAX_OP_ID_LENGTH = 64;
 
 /** Maximum payload size in bytes (256KB) */
 const MAX_PAYLOAD_SIZE_BYTES = 256 * 1024;
@@ -703,8 +701,8 @@ function validateSyncOperation(
     workspaceId: Id<'workspaces'>,
     op: SyncOperation
 ): string | undefined {
-    if (op.op_id.length > MAX_OP_ID_LENGTH) {
-        return `op_id too long: ${op.op_id.length} exceeds ${MAX_OP_ID_LENGTH}`;
+    if (!isSyncUuid(op.op_id)) {
+        return `op_id must be a UUID`;
     }
     if (!TABLE_INDEX_MAP[op.table_name]) return `Invalid table: ${op.table_name}`;
 
@@ -1046,6 +1044,57 @@ function isChangeVisibleToUser(
     return (change.payload as Record<string, unknown>).user_id === String(callerUserId);
 }
 
+function toWireChange(c: {
+    server_version: number;
+    table_name: string;
+    pk: string;
+    op: string;
+    payload?: unknown;
+    clock: number;
+    hlc: string;
+    device_id: string;
+    op_id: string;
+}) {
+    return {
+        serverVersion: c.server_version,
+        tableName: c.table_name,
+        pk: c.pk,
+        op: c.op,
+        payload: c.payload,
+        stamp: {
+            clock: c.clock,
+            hlc: c.hlc,
+            deviceId: c.device_id,
+            opId: c.op_id,
+        },
+    };
+}
+
+function isWireCompatibleChange(change: { op_id: string }): boolean {
+    return isSyncUuid(change.op_id);
+}
+
+async function pullRetentionForWorkspace(
+    ctx: QueryCtx,
+    workspaceId: Id<'workspaces'>,
+    cursor: number
+) {
+    const oldest = await ctx.db
+        .query('change_log')
+        .withIndex('by_workspace_version', (q) => q.eq('workspace_id', workspaceId))
+        .order('asc')
+        .first();
+    const counter = await ctx.db
+        .query('server_version_counter')
+        .withIndex('by_workspace', (q) => q.eq('workspace_id', workspaceId))
+        .first();
+    return computePullRetention({
+        cursor,
+        oldestLogVersion: oldest?.server_version ?? null,
+        highWatermark: counter?.value ?? 0,
+    });
+}
+
 // ============================================================
 // SYNC MUTATIONS
 // ============================================================
@@ -1225,6 +1274,8 @@ export const push = mutation({
                     opId: candidate.op.op_id,
                     success: true,
                     serverVersion: existing.server_version,
+                    wasExisting: true,
+                    applied: true,
                 };
             }
         });
@@ -1898,6 +1949,19 @@ export const pull = query({
     },
     handler: async (ctx, args) => {
         const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
+        const retention = await pullRetentionForWorkspace(
+            ctx,
+            args.workspace_id,
+            args.cursor
+        );
+        if (retention.requiresSnapshot) {
+            return {
+                changes: [],
+                nextCursor: args.cursor,
+                hasMore: false,
+                ...retention,
+            };
+        }
 
         // Cap limit to prevent abuse
         const limit = Math.min(args.limit, MAX_PULL_LIMIT);
@@ -1927,10 +1991,11 @@ export const pull = query({
         const visibleWindow = window.filter((change) =>
             isChangeVisibleToUser(change, callerUserId)
         );
+        const compatibleWindow = visibleWindow.filter(isWireCompatibleChange);
         const changes =
             tableFilter.length > 0
-                ? visibleWindow.filter((c) => tableFilter.includes(c.table_name))
-                : visibleWindow;
+                ? compatibleWindow.filter((c) => tableFilter.includes(c.table_name))
+                : compatibleWindow;
 
         const lastChange = window[window.length - 1];
         const nextCursor = lastChange ? lastChange.server_version : args.cursor;
@@ -1945,21 +2010,10 @@ export const pull = query({
         });
 
         return {
-            changes: changes.map((c) => ({
-                serverVersion: c.server_version,
-                tableName: c.table_name,
-                pk: c.pk,
-                op: c.op,
-                payload: c.payload,
-                stamp: {
-                    clock: c.clock,
-                    hlc: c.hlc,
-                    deviceId: c.device_id,
-                    opId: c.op_id,
-                },
-            })),
+            changes: changes.map(toWireChange),
             nextCursor,
             hasMore,
+            ...retention,
         };
     },
 });
@@ -2008,7 +2062,7 @@ export const watchChanges = query({
         const latestVersion = latestChange ? latestChange.server_version : since;
         const visibleChanges = changes.filter((change) =>
             isChangeVisibleToUser(change, callerUserId)
-        );
+        ).filter(isWireCompatibleChange);
 
         console.debug('[sync] watchChanges', {
             workspace: args.workspace_id,
@@ -2019,19 +2073,7 @@ export const watchChanges = query({
         });
 
         return {
-            changes: visibleChanges.map((c) => ({
-                serverVersion: c.server_version,
-                tableName: c.table_name,
-                pk: c.pk,
-                op: c.op,
-                payload: c.payload,
-                stamp: {
-                    clock: c.clock,
-                    hlc: c.hlc,
-                    deviceId: c.device_id,
-                    opId: c.op_id,
-                },
-            })),
+            changes: visibleChanges.map(toWireChange),
             latestVersion,
         };
     },
@@ -2168,17 +2210,57 @@ export const runWorkspaceGc = internalMutation({
         changelog_cursor: v.optional(v.number()),
         continuation_count: v.optional(v.number()),
     },
-    handler: async (_ctx, args) => {
+    handler: async (ctx, args) => {
         validateGcArguments(args);
         const startTombstoneCursor = args.tombstone_cursor ?? 0;
         const startChangelogCursor = args.changelog_cursor ?? 0;
+        if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
+            return {
+                purged: 0,
+                hasMore: false,
+                nextTombstoneCursor: startTombstoneCursor,
+                nextChangelogCursor: startChangelogCursor,
+                disabled: true,
+                reason: SYNC_HISTORY_GC_POLICY.reason,
+            };
+        }
+        let tombstoneCursor = startTombstoneCursor;
+        let changelogCursor = startChangelogCursor;
+        let purged = 0;
+        let continuation = args.continuation_count ?? 0;
+        let hasMore = true;
+        while (hasMore && continuation < MAX_SYNC_GC_CONTINUATIONS) {
+            const tomb = await (gcTombstones as unknown as {
+                _handler: (ctx: MutationCtx, args: Record<string, unknown>) => Promise<{
+                    purged: number; hasMore: boolean; nextCursor: number;
+                }>;
+            })._handler(ctx, {
+                workspace_id: args.workspace_id,
+                retention_seconds: args.retention_seconds ?? MIN_SYNC_RETENTION_SECONDS,
+                cursor: tombstoneCursor,
+            });
+            const log = await (gcChangeLog as unknown as {
+                _handler: (ctx: MutationCtx, args: Record<string, unknown>) => Promise<{
+                    purged: number; hasMore: boolean; nextCursor: number;
+                }>;
+            })._handler(ctx, {
+                workspace_id: args.workspace_id,
+                retention_seconds: args.retention_seconds ?? MIN_SYNC_RETENTION_SECONDS,
+                cursor: changelogCursor,
+            });
+            purged += tomb.purged + log.purged;
+            tombstoneCursor = tomb.nextCursor;
+            changelogCursor = log.nextCursor;
+            hasMore = tomb.hasMore || log.hasMore;
+            continuation += 1;
+            if (!hasMore) break;
+        }
         return {
-            purged: 0,
-            hasMore: false,
-            nextTombstoneCursor: startTombstoneCursor,
-            nextChangelogCursor: startChangelogCursor,
-            disabled: true,
-            reason: SYNC_HISTORY_GC_POLICY.reason,
+            purged,
+            hasMore,
+            nextTombstoneCursor: tombstoneCursor,
+            nextChangelogCursor: changelogCursor,
+            disabled: false,
         };
     },
 });
@@ -2192,11 +2274,23 @@ export const runWorkspaceGc = internalMutation({
  */
 export const runScheduledGc = internalMutation({
     args: {},
-    handler: async () => {
+    handler: async (ctx) => {
+        if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
+            return {
+                workspacesScheduled: 0,
+                disabled: true,
+                reason: SYNC_HISTORY_GC_POLICY.reason,
+            };
+        }
+        const workspaces = await ctx.db.query('workspaces').take(100);
+        for (const workspace of workspaces) {
+            await (runWorkspaceGc as unknown as {
+                _handler: (ctx: MutationCtx, args: { workspace_id: Id<'workspaces'> }) => Promise<unknown>;
+            })._handler(ctx, { workspace_id: workspace._id });
+        }
         return {
-            workspacesScheduled: 0,
-            disabled: true,
-            reason: SYNC_HISTORY_GC_POLICY.reason,
+            workspacesScheduled: workspaces.length,
+            disabled: false,
         };
     },
 });

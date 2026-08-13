@@ -19,6 +19,9 @@ function fixture() {
     upload_intents: [],
     messages: [],
     posts: [],
+    change_log: [],
+    server_version_counter: [],
+    tombstones: [],
   };
   const objects = new Map<string, any>();
   const deletedObjects: string[] = [];
@@ -44,6 +47,7 @@ function fixture() {
       get: async (id: string) => Object.values(tables).flat().find((row: any) => row._id === id) ?? null,
       insert: async (table: string, value: any) => {
         const id = `${table}-${nextId++}`;
+        if (!tables[table]) tables[table] = [];
         tables[table].push({ _id: id, _creationTime: nextId, ...value });
         return id;
       },
@@ -114,6 +118,16 @@ describe('Convex persisted upload intents', () => {
 
     expect(f.deletedObjects).toEqual(['blob-delete']);
     expect(f.tables.file_meta).toEqual([]);
+    expect(f.tables.change_log).toEqual([
+      expect.objectContaining({
+        table_name: 'file_meta',
+        pk: HASH,
+        op: 'delete',
+        op_id: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        ),
+      }),
+    ]);
   });
 
   it('rejects mismatched storage ids and canonical live references', async () => {
@@ -180,6 +194,16 @@ describe('Convex persisted upload intents', () => {
       .rejects.toThrow();
     await expect(commit(f.ctx, input)).resolves.toBeUndefined();
     expect(f.tables.upload_intents[0]).toMatchObject({ status: 'consumed', storage_id: 'storage-good' });
+    expect(f.tables.change_log).toEqual([
+      expect.objectContaining({
+        table_name: 'file_meta',
+        pk: `sha256:${HASH}`,
+        op: 'put',
+        op_id: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        ),
+      }),
+    ]);
     await expect(commit(f.ctx, input)).rejects.toThrow('already consumed');
   });
 

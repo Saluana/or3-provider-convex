@@ -28,33 +28,8 @@ import { v } from 'convex/values';
 import {
     internalMutation,
     internalQuery,
-    type MutationCtx,
 } from './_generated/server';
-import type { Id } from './_generated/dataModel';
-
-const nowSec = (): number => Math.floor(Date.now() / 1000);
-
-async function allocateServerVersion(
-    ctx: MutationCtx,
-    workspaceId: Id<'workspaces'>
-): Promise<number> {
-    const existing = await ctx.db
-        .query('server_version_counter')
-        .withIndex('by_workspace', (q) => q.eq('workspace_id', workspaceId))
-        .first();
-
-    if (existing) {
-        const next = existing.value + 1;
-        await ctx.db.patch(existing._id, { value: next });
-        return next;
-    }
-
-    await ctx.db.insert('server_version_counter', {
-        workspace_id: workspaceId,
-        value: 1,
-    });
-    return 1;
-}
+import { applyServerAuthoredOp } from './syncAuthoring';
 
 /**
  * `notifications.create` (internal mutation)
@@ -83,36 +58,11 @@ export const create = internalMutation({
         actions: v.optional(v.any()),
     },
     handler: async (ctx, args) => {
-        const now = nowSec();
         const id = crypto.randomUUID();
-        const hlc = `${now}:server:${id.slice(0, 8)}`;
-
-        await ctx.db.insert('notifications', {
-            workspace_id: args.workspace_id,
-            id,
-            user_id: args.user_id,
-            thread_id: args.thread_id,
-            document_id: args.document_id,
-            type: args.type,
-            title: args.title,
-            body: args.body,
-            actions: args.actions,
-            deleted: false,
-            created_at: now,
-            updated_at: now,
-            clock: now,
-            hlc,
-        });
-
-        const serverVersion = await allocateServerVersion(ctx, args.workspace_id);
-        const opId = `server:notif:${id}`;
-
-        await ctx.db.insert('change_log', {
-            workspace_id: args.workspace_id,
-            server_version: serverVersion,
-            table_name: 'notifications',
+        await applyServerAuthoredOp(ctx, args.workspace_id, {
+            table: 'notifications',
+            operation: 'put',
             pk: id,
-            op: 'put',
             payload: {
                 id,
                 user_id: args.user_id,
@@ -123,18 +73,8 @@ export const create = internalMutation({
                 body: args.body,
                 actions: args.actions,
                 deleted: false,
-                created_at: now,
-                updated_at: now,
-                clock: now,
-                hlc,
             },
-            clock: now,
-            hlc,
-            device_id: 'server',
-            op_id: opId,
-            created_at: now,
         });
-
         return id;
     },
 });
@@ -198,10 +138,22 @@ export const markRead = internalMutation({
 
         if (!notification) return false;
 
-        const now = Math.floor(Date.now() / 1000);
-        await ctx.db.patch(notification._id, {
-            read_at: now,
-            updated_at: now,
+        await applyServerAuthoredOp(ctx, args.workspace_id, {
+            table: 'notifications',
+            operation: 'put',
+            pk: args.notification_id,
+            payload: {
+                id: notification.id,
+                user_id: notification.user_id,
+                thread_id: notification.thread_id,
+                document_id: notification.document_id,
+                type: notification.type,
+                title: notification.title,
+                body: notification.body,
+                actions: notification.actions,
+                read_at: Math.floor(Date.now() / 1000),
+                deleted: false,
+            },
         });
 
         return true;

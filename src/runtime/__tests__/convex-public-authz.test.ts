@@ -38,6 +38,13 @@ const webhookFunctions = await import(
 
 type Role = 'owner' | 'editor' | 'viewer';
 
+function uuidOp(label: string): string {
+    let hex = '';
+    for (const ch of label) hex += ch.charCodeAt(0).toString(16).padStart(2, '0');
+    hex = hex.padEnd(32, '0').slice(0, 32);
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
 type RegisteredFunction = {
     _handler: (ctx: any, args: any) => Promise<any>;
     isInternal?: boolean;
@@ -182,6 +189,12 @@ function makeNotificationSyncCtx(changes: Array<Record<string, unknown>> = []) {
                 }),
                 order: vi.fn(() => ({
                     take: vi.fn(async () => changes),
+                    first: vi.fn(async () => {
+                        if (table === 'change_log' && changes[0]) {
+                            return changes[0];
+                        }
+                        return null;
+                    }),
                 })),
             };
         },
@@ -634,7 +647,7 @@ describe('Convex authorization boundary', () => {
                 clock: 1,
                 hlc: '1:a',
                 device_id: 'device-1',
-                op_id: 'op-thread',
+                op_id: uuidOp('op-thread'),
             },
             {
                 server_version: 2,
@@ -645,7 +658,7 @@ describe('Convex authorization boundary', () => {
                 clock: 2,
                 hlc: '2:a',
                 device_id: 'server',
-                op_id: 'op-own',
+                op_id: uuidOp('op-own'),
             },
             {
                 server_version: 3,
@@ -656,7 +669,7 @@ describe('Convex authorization boundary', () => {
                 clock: 3,
                 hlc: '3:a',
                 device_id: 'server',
-                op_id: 'op-other',
+                op_id: uuidOp('op-other'),
             },
         ];
         const readCtx = makeNotificationSyncCtx(changes);
@@ -691,7 +704,7 @@ describe('Convex authorization boundary', () => {
             workspace_id: 'workspace-1',
             ops: [
                 {
-                    op_id: 'op-cross-user',
+                    op_id: uuidOp('op-cross-user'),
                     table_name: 'notifications',
                     operation: 'put',
                     pk: 'notification-cross-user',
@@ -707,7 +720,7 @@ describe('Convex authorization boundary', () => {
         });
         expect(pushed.results).toEqual([
             expect.objectContaining({
-                opId: 'op-cross-user',
+                opId: uuidOp('op-cross-user'),
                 success: false,
                 error: expect.stringContaining('notification owner mismatch'),
             }),
@@ -721,7 +734,7 @@ describe('Convex authorization boundary', () => {
                 workspace_id: 'workspace-1',
                 ops: [
                     {
-                        op_id: 'op-own-user',
+                        op_id: uuidOp('op-own-user'),
                         table_name: 'notifications',
                         operation: 'put',
                         pk: 'notification-own-user',
@@ -740,7 +753,7 @@ describe('Convex authorization boundary', () => {
         );
         expect(ownPush.results).toEqual([
             expect.objectContaining({
-                opId: 'op-own-user',
+                opId: uuidOp('op-own-user'),
                 success: true,
                 payload: expect.objectContaining({ user_id: 'user-1' }),
             }),

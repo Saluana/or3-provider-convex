@@ -89,44 +89,63 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         ): Promise<() => void> {
             const tablesToWatch = tables.length > 0 ? tables : SYNCED_TABLES;
             let disposed = false;
-            const cursor = options?.cursor ?? 0;
+            let currentCursor = options?.cursor ?? 0;
             const limit = options?.limit ?? 200;
+            let unwatch: (() => void) | undefined;
 
-            const unwatch = client.onUpdate(
-                api.sync.watchChanges,
-                {
-                    workspace_id: scope.workspaceId as Id<'workspaces'>,
-                    cursor,
-                    limit,
-                },
-                (result) => {
-                    if (disposed) return;
+            const startWatch = () => {
+                return client.onUpdate(
+                    api.sync.watchChanges,
+                    {
+                        workspace_id: scope.workspaceId as Id<'workspaces'>,
+                        cursor: currentCursor,
+                        limit,
+                    },
+                    (result) => {
+                        if (disposed) return;
 
-                    try {
-                        const safeChanges = SyncChangesSchema.safeParse(
-                            result.changes
-                        );
-                        if (!safeChanges.success) {
-                            console.error('[convex-sync] Invalid watch changes:', safeChanges.error);
-                            return;
-                        }
+                        try {
+                            const safeChanges = SyncChangesSchema.safeParse(
+                                result.changes
+                            );
+                            if (!safeChanges.success) {
+                                console.error('[convex-sync] Invalid watch changes:', safeChanges.error);
+                                return;
+                            }
 
-                        const changes = safeChanges.data;
-                        const filtered = tables.length > 0
-                            ? changes.filter((c) => tables.includes(c.tableName))
-                            : changes;
-
-                        if (filtered.length > 0) {
+                            const changes = safeChanges.data;
+                            const filtered = tables.length > 0
+                                ? changes.filter((c) => tables.includes(c.tableName))
+                                : changes;
                             onChanges(filtered);
-                        }
-                        // Cursor advancement is handled by SubscriptionManager.handleChanges()
-                    } catch (error) {
-                        console.error('[convex-sync] onChanges error:', error);
-                    }
-                }
-            );
 
-            const key = `${scope.workspaceId}:${tablesToWatch.join(',')}:${cursor}:${limit}`;
+                            const latestVersion = Number(result.latestVersion);
+                            if (
+                                Number.isFinite(latestVersion) &&
+                                latestVersion > currentCursor
+                            ) {
+                                currentCursor = latestVersion;
+                                if (typeof unwatch === 'function') {
+                                    try {
+                                        unwatch();
+                                    } catch {
+                                        // Watcher may already be torn down.
+                                    }
+                                }
+                                if (!disposed) {
+                                    unwatch = startWatch();
+                                }
+                            }
+                        } catch (error) {
+                            console.error('[convex-sync] onChanges error:', error);
+                        }
+                    }
+                );
+            };
+
+            unwatch = startWatch();
+
+            const key = `${scope.workspaceId}:${tablesToWatch.join(',')}:${options?.cursor ?? 0}:${limit}`;
             const cleanup = () => {
                 disposed = true;
                 if (typeof unwatch === 'function') {
@@ -164,6 +183,8 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
                 changes: result.changes,
                 nextCursor: result.nextCursor,
                 hasMore: result.hasMore,
+                oldestRetainedVersion: result.oldestRetainedVersion,
+                requiresSnapshot: result.requiresSnapshot,
             });
 
             if (!parsed.success) {
