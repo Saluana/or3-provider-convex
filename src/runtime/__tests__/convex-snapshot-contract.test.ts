@@ -129,6 +129,15 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
         user_id: "user-1",
       },
     ],
+    workspaces: [
+      {
+        _id: "ws-1",
+        name: "Workspace",
+        owner_user_id: "user-1",
+        created_at: 1,
+        deleted: false,
+      },
+    ],
     workspace_members: [
       {
         _id: "member-1",
@@ -520,6 +529,11 @@ describe("Convex materialized snapshot contract", () => {
       hash,
     });
     expect(first.items).toHaveLength(1);
+    const unfilteredFirst = await queryCanonicalStorage(fixture.ctx, {
+      workspace_id: "ws-1",
+      kind: "live_metadata",
+      page_size: 1,
+    });
     await expect(
       queryCanonicalStorage(fixture.ctx, {
         workspace_id: "ws-1",
@@ -532,7 +546,7 @@ describe("Convex materialized snapshot contract", () => {
         workspace_id: "ws-1",
         kind: "reference_edges",
         page_size: 1,
-        cursor: first.nextCursor,
+        cursor: unfilteredFirst.nextCursor,
       }),
     ).rejects.toThrow("Invalid canonical storage cursor");
     await expect(
@@ -1216,6 +1230,12 @@ describe("Convex materialized snapshot contract", () => {
     );
     expect(packed.files["sync.ts"]).toContain(
       "const shouldApplyDelete = incomingWinsStoredRevision",
+    );
+    expect(packed.files["sync.ts"]).toContain(
+      "from './tableMetadata'",
+    );
+    expect(packed.files["tableMetadata.ts"]).toContain(
+      "export function getPkField",
     );
     expect(packed.files["schema.ts"]).toContain(
       "sync_snapshot_sessions: defineTable",

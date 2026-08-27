@@ -14,6 +14,7 @@ const handler = (fn: unknown): Handler => (fn as { _handler: Handler })._handler
 function fixture() {
   const tables: Record<string, any[]> = {
     auth_accounts: [{ _id: 'account-1', provider: 'clerk', provider_user_id: 'subject-1', user_id: 'user-1' }],
+    workspaces: [{ _id: 'ws-1', name: 'Workspace', owner_user_id: 'user-1', created_at: 1, deleted: false }],
     workspace_members: [{ _id: 'member-1', workspace_id: 'ws-1', user_id: 'user-1', role: 'editor' }],
     file_meta: [],
     upload_intents: [],
@@ -31,16 +32,31 @@ function fixture() {
     storage: {
       generateUploadUrl: async () => 'https://upload.test',
       delete: async (id: string) => { deletedObjects.push(id); },
+      getUrl: async (id: string) => objects.has(id) ? `https://download.test/${id}` : null,
     },
     db: {
       system: { get: async (id: string) => objects.get(id) ?? null },
       query(table: string) {
+        let rows = [...(tables[table] ?? [])];
         const builder: any = {
-          withIndex: () => builder,
+          withIndex: (_name: string, constrain: (query: any) => unknown) => {
+            const constraints: Array<[string, unknown]> = [];
+            const query = {
+              eq(field: string, value: unknown) {
+                constraints.push([field, value]);
+                return query;
+              },
+            };
+            constrain(query);
+            rows = rows.filter((row) =>
+              constraints.every(([field, value]) => row[field] === value)
+            );
+            return builder;
+          },
           filter: () => builder,
-          first: async () => tables[table]?.[0] ?? null,
-          collect: async () => [...(tables[table] ?? [])],
-          take: async (limit: number) => (tables[table] ?? []).slice(0, limit),
+          first: async () => rows[0] ?? null,
+          collect: async () => [...rows],
+          take: async (limit: number) => rows.slice(0, limit),
         };
         return builder;
       },
@@ -73,6 +89,58 @@ const hashBase64 = Buffer.from(HASH, 'hex').toString('base64');
 describe('Convex persisted upload intents', () => {
   beforeEach(() => vi.useFakeTimers().setSystemTime(new Date('2026-01-01T00:00:00Z')));
   afterEach(() => vi.useRealTimers());
+
+  it('only returns URLs for live committed metadata', async () => {
+    const f = fixture();
+    const getFileUrl = handler(storageFunctions.getFileUrl);
+    f.tables.file_meta.push({
+      _id: 'file-deleted', workspace_id: 'ws-1', hash: `sha256:${HASH}`,
+      deleted: true, storage_id: 'blob-deleted',
+    });
+    f.objects.set('blob-deleted', { size: 1 });
+
+    await expect(getFileUrl(f.ctx, { workspace_id: 'ws-1', hash: `sha256:${HASH}` }))
+      .resolves.toBeNull();
+  });
+
+  it('keeps valid prefixed and legacy bare SHA-256 metadata readable', async () => {
+    const prefixed = fixture();
+    const getFileUrl = handler(storageFunctions.getFileUrl);
+    prefixed.tables.file_meta.push({
+      _id: 'file-live', workspace_id: 'ws-1', hash: `sha256:${HASH}`,
+      deleted: false, storage_id: 'blob-live',
+    });
+    prefixed.objects.set('blob-live', { size: 1 });
+    await expect(getFileUrl(prefixed.ctx, { workspace_id: 'ws-1', hash: HASH }))
+      .resolves.toEqual({ url: 'https://download.test/blob-live' });
+
+    const bare = fixture();
+    bare.tables.file_meta.push({
+      _id: 'file-bare', workspace_id: 'ws-1', hash: HASH,
+      deleted: false, storage_id: 'blob-bare',
+    });
+    bare.objects.set('blob-bare', { size: 1 });
+    await expect(getFileUrl(bare.ctx, { workspace_id: 'ws-1', hash: `sha256:${HASH}` }))
+      .resolves.toEqual({ url: 'https://download.test/blob-bare' });
+  });
+
+  it('denies storage access for a soft-deleted workspace', async () => {
+    const f = fixture();
+    f.tables.workspaces[0].deleted = true;
+    const generate = handler(storageFunctions.generateUploadUrl);
+    const getFileUrl = handler(storageFunctions.getFileUrl);
+    const gc = handler(storageFunctions.gcDeletedFiles);
+
+    await expect(generate(f.ctx, {
+      workspace_id: 'ws-1', hash: HASH, mime_type: 'image/png', size_bytes: 10,
+    })).rejects.toThrow('Forbidden');
+    await expect(getFileUrl(f.ctx, {
+      workspace_id: 'ws-1', hash: `sha256:${HASH}`,
+    })).rejects.toThrow('Forbidden');
+    await expect(gc(f.ctx, {
+      workspace_id: 'ws-1', retention_seconds: 0, limit: 1,
+    })).rejects.toThrow('Forbidden');
+  });
 
   it('executes the shared canonical reference contract', async () => {
     const f = fixture();

@@ -25,7 +25,7 @@
 import { v } from 'convex/values';
 import { mutation, query, internalMutation, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
-import { getPkField } from '../shared/sync/table-metadata';
+import { getPkField } from './tableMetadata';
 import { requireWorkspaceRole } from './authz';
 import { SYNC_HISTORY_GC_POLICY, computePullRetention } from './syncHistoryGcPolicy';
 import {
@@ -1772,12 +1772,25 @@ export const queryCanonicalStorage = query({
         }
 
         if (args.kind === 'live_metadata') {
-            const rows = await ctx.db
+            const queryByHash = (storedHash: string) => ctx.db
                 .query('file_meta')
                 .withIndex('by_workspace_hash', (q) =>
-                    q.eq('workspace_id', args.workspace_id).gt('hash', cursor.afterPk)
+                    q.eq('workspace_id', args.workspace_id).eq('hash', storedHash)
                 )
                 .take(args.page_size + 1);
+            let rows = hash !== undefined
+                ? await queryByHash(`sha256:${hash}`)
+                : await ctx.db
+                    .query('file_meta')
+                    .withIndex('by_workspace_hash', (q) =>
+                        q.eq('workspace_id', args.workspace_id).gt('hash', cursor.afterPk)
+                    )
+                    .take(args.page_size + 1);
+            if (hash !== undefined && rows.length === 0) {
+                // New rows use the sha256 prefix; retain a fallback for older
+                // rows that stored the bare digest.
+                rows = await queryByHash(hash);
+            }
             const hasMore = rows.length > args.page_size;
             const scanned = hasMore ? rows.slice(0, args.page_size) : rows;
             const items = scanned.flatMap((row) => {

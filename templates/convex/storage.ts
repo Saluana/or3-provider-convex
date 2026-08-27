@@ -25,6 +25,7 @@ import { v } from 'convex/values';
 import { mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id } from './_generated/dataModel';
 import { applyServerAuthoredOp } from './syncAuthoring';
+import { requireActiveWorkspace } from './authz';
 
 // ============================================================
 // CONSTANTS
@@ -127,6 +128,7 @@ async function verifyWorkspaceMembership(
     if (!identity) {
         throw new Error('Unauthorized: No identity');
     }
+    await requireActiveWorkspace(ctx, workspaceId);
     const provider = inferProviderFromIssuer(identity.issuer);
 
     const authAccount = await ctx.db
@@ -394,14 +396,28 @@ export const getFileUrl = query({
     handler: async (ctx, args) => {
         await verifyWorkspaceMembership(ctx, args.workspace_id);
 
-        const file = await ctx.db
+        const normalizedHash = normalizeHash(args.hash);
+        const canonicalHash = `sha256:${normalizedHash}`;
+        let file = await ctx.db
             .query('file_meta')
             .withIndex('by_workspace_hash', (q: any) =>
-                q.eq('workspace_id', args.workspace_id).eq('hash', args.hash)
+                q.eq('workspace_id', args.workspace_id).eq('hash', canonicalHash)
             )
             .first();
 
-        if (!file?.storage_id) return null;
+        // Older metadata rows may store the digest without the sha256 prefix.
+        // Keep those rows readable while treating the canonical workspace row
+        // as the only source of the storage object ID.
+        if (!file) {
+            file = await ctx.db
+                .query('file_meta')
+                .withIndex('by_workspace_hash', (q: any) =>
+                    q.eq('workspace_id', args.workspace_id).eq('hash', normalizedHash)
+                )
+                .first();
+        }
+
+        if (!file || file.deleted || !file.storage_id) return null;
 
         const url = await ctx.storage.getUrl(file.storage_id);
         // Handle case where storage object was deleted but metadata remains

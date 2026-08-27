@@ -32,6 +32,7 @@ import type { Id, TableNames } from './_generated/dataModel';
 import {
     requireCallerSubject,
     requireInviteAcceptance,
+    requireActiveWorkspace,
     requireWorkspaceRole,
 } from './authz';
 
@@ -205,6 +206,7 @@ async function requireWorkspaceMembership(
     workspaceId: Id<'workspaces'>,
     userId: Id<'users'>
 ) {
+    await requireActiveWorkspace(ctx, workspaceId);
     const membership = await ctx.db
         .query('workspace_members')
         .withIndex('by_workspace_user', (q) =>
@@ -326,7 +328,7 @@ export const listMyWorkspaces = query({
         const workspaces = memberships
             .map((m) => {
                 const workspace = workspaceMap.get(m.workspace_id);
-                if (!workspace) return null;
+                if (!workspace || workspace.deleted === true) return null;
                 return {
                     _id: workspace._id,
                     name: workspace.name,
@@ -584,11 +586,21 @@ export const ensure = mutation({
 
         const user = await ctx.db.get(userId);
 
-        const firstMembership = await ctx.db
+        const memberships = await ctx.db
             .query('workspace_members')
             .withIndex('by_user', (q) => q.eq('user_id', userId))
             .order('asc') // Deterministic: oldest workspace first
-            .first();
+            .collect();
+        const workspaceRows = await Promise.all(
+            memberships.map((membership) => ctx.db.get(membership.workspace_id))
+        );
+        const workspaceMap = new Map(
+            workspaceRows.filter(Boolean).map((workspace) => [workspace!._id, workspace!] as const)
+        );
+        const firstMembership = memberships.find((membership) => {
+            const workspace = workspaceMap.get(membership.workspace_id);
+            return workspace && workspace.deleted !== true;
+        });
 
         let workspaceId = user?.active_workspace_id ?? undefined;
 
@@ -600,7 +612,11 @@ export const ensure = mutation({
                     q.eq('workspace_id', activeWorkspaceId).eq('user_id', userId)
                 )
                 .first();
-            if (!activeMembership) {
+            if (
+                !activeMembership
+                || !workspaceMap.has(activeWorkspaceId)
+                || workspaceMap.get(activeWorkspaceId)?.deleted === true
+            ) {
                 workspaceId = undefined;
             }
         }
@@ -644,7 +660,7 @@ export const ensure = mutation({
             )
             .first();
 
-        if (!membership) {
+        if (!workspace || workspace.deleted === true || !membership) {
             throw new Error('No workspace membership found');
         }
 
@@ -696,6 +712,18 @@ export const resolveSession = internalQuery({
         const userId = authAccount.user_id;
         const user = await ctx.db.get(userId);
 
+        const memberships = await ctx.db
+            .query('workspace_members')
+            .withIndex('by_user', (q) => q.eq('user_id', userId))
+            .order('asc')
+            .collect();
+        const workspaceRows = await Promise.all(
+            memberships.map((membership) => ctx.db.get(membership.workspace_id))
+        );
+        const workspaceMap = new Map(
+            workspaceRows.filter(Boolean).map((workspace) => [workspace!._id, workspace!] as const)
+        );
+
         let workspaceId = user?.active_workspace_id ?? undefined;
 
         if (workspaceId) {
@@ -706,24 +734,27 @@ export const resolveSession = internalQuery({
                     q.eq('workspace_id', activeWorkspaceId).eq('user_id', userId)
                 )
                 .first();
-            if (!activeMembership) {
+            if (
+                !activeMembership
+                || !workspaceMap.has(activeWorkspaceId)
+                || workspaceMap.get(activeWorkspaceId)?.deleted === true
+            ) {
                 workspaceId = undefined;
             }
         }
 
         if (!workspaceId) {
-            const firstMembership = await ctx.db
-                .query('workspace_members')
-                .withIndex('by_user', (q) => q.eq('user_id', userId))
-                .order('asc')
-                .first();
+            const firstMembership = memberships.find((membership) => {
+                const workspace = workspaceMap.get(membership.workspace_id);
+                return workspace && workspace.deleted !== true;
+            });
             workspaceId = firstMembership?.workspace_id;
         }
 
         if (!workspaceId) return null;
 
         const workspace = await ctx.db.get(workspaceId);
-        if (!workspace) return null;
+        if (!workspace || workspace.deleted === true) return null;
 
         const membership = await ctx.db
             .query('workspace_members')
@@ -804,6 +835,10 @@ export const validateInviteInternal = internalQuery({
         token_hash: v.string(),
     },
     handler: async (ctx, args) => {
+        const workspace = await ctx.db.get(args.workspace_id);
+        if (!workspace || workspace.deleted === true) {
+            return { ok: false as const, reason: 'not_found' as const };
+        }
         const invite = await findInviteByTokenHash(
             ctx,
             args.workspace_id,
@@ -825,6 +860,10 @@ export const acceptInviteAndProvisionUser = internalMutation({
         token_hash: v.string(),
     },
     handler: async (ctx, args) => {
+        const workspace = await ctx.db.get(args.workspace_id);
+        if (!workspace || workspace.deleted === true) {
+            return { ok: false as const, reason: 'not_found' as const };
+        }
         const identity = await requireCallerSubject(
             ctx,
             {
@@ -942,6 +981,10 @@ export const consumeInvite = mutation({
         token_hash: v.string(),
     },
     handler: async (ctx, args) => {
+        const workspace = await ctx.db.get(args.workspace_id);
+        if (!workspace || workspace.deleted === true) {
+            return { ok: false as const, reason: 'not_found' as const };
+        }
         const now = Date.now();
         await markExpiredInvites(ctx, args.workspace_id, now);
         const email = normalizeEmail(args.email);

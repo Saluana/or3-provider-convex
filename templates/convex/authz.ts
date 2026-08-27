@@ -43,6 +43,20 @@ async function requireIdentity(ctx: ConvexCtx): Promise<AuthIdentity> {
     return identity;
 }
 
+/**
+ * Rejects workspace operations after an administrative soft delete while
+ * keeping the workspace row available to privileged admin restore flows.
+ */
+export async function requireActiveWorkspace(
+    ctx: ConvexCtx,
+    workspaceId: Id<'workspaces'>
+): Promise<void> {
+    const workspace = await ctx.db.get(workspaceId);
+    if (!workspace || workspace.deleted === true) {
+        throw new Error('Forbidden');
+    }
+}
+
 export async function requireCallerSubject(
     ctx: ConvexCtx,
     expected: { provider: string; providerUserId: string },
@@ -120,6 +134,7 @@ export async function requireWorkspaceRole(
     options: { allowTrustedServer?: boolean } = {}
 ): Promise<{ userId: Id<'users'> | null; role: 'owner' | 'editor' | 'viewer' }> {
     const identity = await requireIdentity(ctx);
+    await requireActiveWorkspace(ctx, workspaceId);
     if (options.allowTrustedServer && isTrustedServerIdentity(identity)) {
         return { userId: null, role: 'owner' };
     }

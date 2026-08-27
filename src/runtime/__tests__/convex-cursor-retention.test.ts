@@ -42,7 +42,16 @@ function makeCursorContext(input: {
     return {
         ctx: {
             auth: { getUserIdentity: vi.fn(async () => ({ subject: 'subject-a', issuer: 'issuer-a' })) },
-            db: { query, insert: inserted, patch: patched },
+            db: {
+                query,
+                insert: inserted,
+                patch: patched,
+                get: vi.fn(async (id: string) =>
+                    id === 'workspace-1'
+                        ? { _id: id, deleted: false }
+                        : null
+                ),
+            },
         },
         inserted,
         patched,

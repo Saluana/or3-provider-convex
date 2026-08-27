@@ -64,6 +64,7 @@ function makeCtx(options: {
     } | null;
     userId?: string;
     role?: Role;
+    workspaceDeleted?: boolean;
 }) {
     const userId = options.userId ?? 'user-1';
     const query = vi.fn((table: string) => ({
@@ -90,7 +91,13 @@ function makeCtx(options: {
         auth: {
             getUserIdentity: vi.fn(async () => options.identity ?? null),
         },
-        db: { query },
+        db: {
+            query,
+            get: vi.fn(async () => ({
+                _id: 'workspace-1',
+                deleted: options.workspaceDeleted === true,
+            })),
+        },
     } as any;
 }
 
@@ -149,11 +156,13 @@ function makeDirectCtx(options: {
             },
             db: {
                 query,
+                get: vi.fn(async (id: string) => id === 'workspace-1'
+                    ? { _id: 'workspace-1', deleted: false }
+                    : options.invite ?? null),
                 insert: vi.fn(async (table: string, value: Record<string, unknown>) => {
                     inserted.push({ table, value });
                     return `${table}-1`;
                 }),
-                get: vi.fn(async () => options.invite ?? null),
                 patch: vi.fn(async () => undefined),
             },
         } as any,
@@ -210,6 +219,7 @@ function makeNotificationSyncCtx(changes: Array<Record<string, unknown>> = []) {
             },
             db: {
                 query,
+                get: vi.fn(async () => ({ _id: 'workspace-1', deleted: false })),
                 insert: vi.fn(async (table: string, value: Record<string, unknown>) => {
                     inserted.push({ table, value });
                     return `${table}-1`;
@@ -431,6 +441,21 @@ describe('Convex authorization boundary', () => {
         await expect(
             requireWorkspaceRole(ctx, 'workspace-1' as any, allowedRoles)
         ).resolves.toMatchObject({ role, userId: 'user-1' });
+    });
+
+    it('denies all ordinary workspace roles after a soft delete', async () => {
+        const ctx = makeCtx({
+            identity: {
+                subject: 'subject-owner',
+                issuer: 'https://clerk.example.test',
+            },
+            role: 'owner',
+            workspaceDeleted: true,
+        });
+
+        await expect(
+            requireWorkspaceRole(ctx, 'workspace-1' as any, new Set(['owner', 'editor', 'viewer']))
+        ).rejects.toThrow('Forbidden');
     });
 
     it('registers identity and session enumeration as internal-only functions', () => {
