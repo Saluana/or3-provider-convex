@@ -41,7 +41,7 @@ const CommitInputSchema = z.object({
     mime_type: z.string().min(1),
     size_bytes: z.number().int().nonnegative(),
     name: z.string().min(1),
-    kind: z.enum(['image', 'pdf']),
+    kind: z.enum(['image', 'pdf', 'file']),
     width: z.number().int().positive().optional(),
     height: z.number().int().positive().optional(),
     page_count: z.number().int().positive().optional(),

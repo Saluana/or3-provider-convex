@@ -241,6 +241,24 @@ describe('Convex persisted upload intents', () => {
     })).resolves.toMatchObject({ uploadUrl: 'https://upload.test' });
   });
 
+  it('accepts zero-byte generic file intents', async () => {
+    const f = fixture();
+    const generate = handler(storageFunctions.generateUploadUrl);
+    const result = await generate(f.ctx, {
+      workspace_id: 'ws-1', hash: HASH, mime_type: 'application/octet-stream', size_bytes: 0,
+      workspace_quota_bytes: 1,
+    });
+
+    expect(result).toMatchObject({ uploadUrl: 'https://upload.test' });
+    expect(f.tables.upload_intents[0]).toMatchObject({
+      hash: HASH,
+      mime_type: 'application/octet-stream',
+      size_bytes: 0,
+      reserved_bytes: 0,
+      status: 'active',
+    });
+  });
+
   it('binds commit to subject, workspace, object bytes and consumes exactly once', async () => {
     const f = fixture();
     const generate = handler(storageFunctions.generateUploadUrl);
@@ -273,6 +291,32 @@ describe('Convex persisted upload intents', () => {
       }),
     ]);
     await expect(commit(f.ctx, input)).rejects.toThrow('already consumed');
+  });
+
+  it('commits zero-byte generic files with the file kind', async () => {
+    const f = fixture();
+    const generate = handler(storageFunctions.generateUploadUrl);
+    const commit = handler(storageFunctions.commitUpload);
+    const { intentId } = await generate(f.ctx, {
+      workspace_id: 'ws-1', hash: HASH, mime_type: 'application/octet-stream', size_bytes: 0,
+    });
+    f.objects.set('storage-empty', {
+      size: 0,
+      contentType: 'application/octet-stream',
+      sha256: hashBase64,
+    });
+
+    await expect(commit(f.ctx, {
+      workspace_id: 'ws-1', intent_id: intentId, hash: `sha256:${HASH}`,
+      storage_id: 'storage-empty', storage_provider_id: 'convex',
+      mime_type: 'application/octet-stream', size_bytes: 0,
+      name: 'empty.bin', kind: 'file',
+    })).resolves.toBeUndefined();
+    expect(f.tables.file_meta[0]).toMatchObject({
+      kind: 'file',
+      mime_type: 'application/octet-stream',
+      size_bytes: 0,
+    });
   });
 
   it('rejects expiry and cancellation before attaching an object', async () => {

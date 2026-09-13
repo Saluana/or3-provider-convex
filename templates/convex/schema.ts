@@ -341,7 +341,7 @@ export default defineSchema({
         hash: v.string(), // sha256:<hex> or md5:<hex>
         name: v.string(),
         mime_type: v.string(),
-        kind: v.union(v.literal('image'), v.literal('pdf')),
+        kind: v.union(v.literal('image'), v.literal('pdf'), v.literal('file')),
         size_bytes: v.number(),
         width: v.optional(v.number()),
         height: v.optional(v.number()),

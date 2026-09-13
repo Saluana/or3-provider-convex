@@ -177,8 +177,8 @@ export const generateUploadUrl = mutation({
         const userId = await verifyWorkspaceMembership(ctx, args.workspace_id);
 
         // Enforce file size limit
-        if (!Number.isSafeInteger(args.size_bytes) || args.size_bytes < 1) {
-            throw new Error('File size must be a positive integer');
+        if (!Number.isSafeInteger(args.size_bytes) || args.size_bytes < 0) {
+            throw new Error('File size must be a nonnegative integer');
         }
         if (args.size_bytes > MAX_FILE_SIZE_BYTES) {
             throw new Error(
@@ -266,7 +266,7 @@ export const commitUpload = mutation({
         mime_type: v.string(),
         size_bytes: v.number(),
         name: v.string(),
-        kind: v.union(v.literal('image'), v.literal('pdf')),
+        kind: v.union(v.literal('image'), v.literal('pdf'), v.literal('file')),
         width: v.optional(v.number()),
         height: v.optional(v.number()),
         page_count: v.optional(v.number()),

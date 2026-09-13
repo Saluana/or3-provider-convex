@@ -1804,6 +1804,11 @@ export const queryCanonicalStorage = query({
                     hash: normalizedHash,
                     sizeBytes: row.size_bytes,
                     ...(row.storage_id ? { storageId: String(row.storage_id) } : {}),
+                    ...(typeof row.mime_type === 'string' ? { mimeType: row.mime_type } : {}),
+                    ...(typeof row.name === 'string' ? { name: row.name } : {}),
+                    ...(row.kind === 'image' || row.kind === 'pdf' || row.kind === 'file'
+                        ? { fileKind: row.kind }
+                        : {}),
                     updatedAt: row.updated_at,
                 }];
             });
