@@ -20,6 +20,9 @@ import type {
     BackgroundJob,
     CreateJobParams,
     JobUpdate,
+    AdmissionCancellationResult,
+    GenerationHistoryPhase,
+    TerminalGenerationSnapshot,
 } from '~~/server/utils/background-jobs/types';
 import { getJobConfig } from '~~/server/utils/background-jobs/store';
 import { convexInternalApi as internalApi } from '../../utils/convex-api';
@@ -45,6 +48,10 @@ function toBackgroundJob(job: any): BackgroundJob {
         kind: job.kind ?? undefined,
         status: job.status,
         content: job.content,
+        reasoning: typeof job.reasoning === 'string' ? job.reasoning : '',
+        generationId: job.generation_id ?? undefined,
+        historyPhase: job.history_phase ?? undefined,
+        syncProviderId: job.sync_provider_id ?? undefined,
         chunksReceived: job.chunksReceived,
         startedAt: job.startedAt,
         lastActivityAt: job.lastActivityAt ?? job.startedAt,
@@ -81,7 +88,7 @@ export const convexJobProvider: BackgroundJobProvider = {
         const client = getClient();
         const config = getJobConfig();
 
-        const jobId = await client.mutation(internalApi.backgroundJobs.create, {
+        const result = await client.mutation(internalApi.backgroundJobs.create, {
             user_id: params.userId,
             thread_id: params.threadId,
             message_id: params.messageId,
@@ -91,11 +98,30 @@ export const convexJobProvider: BackgroundJobProvider = {
             workflow_state: params.workflow_state,
             execution: params.execution,
             idempotency_key: params.idempotencyKey,
+            generation_id: params.generationId,
+            sync_provider_id: params.syncProviderId,
+            history_phase: params.historyPhase,
+            initial_content: params.initialContent,
+            initial_reasoning: params.initialReasoning,
             max_concurrent_jobs: config.maxConcurrentJobs,
             max_concurrent_jobs_per_user: config.maxConcurrentJobsPerUser,
         });
 
-        return jobId as string;
+        if (
+            result &&
+            typeof result === 'object' &&
+            (result as { kind?: unknown }).kind === 'cancelled'
+        ) {
+            const error = new Error(
+                `Background admission ${params.idempotencyKey ?? params.messageId} was cancelled`
+            );
+            error.name = 'AdmissionCancelledError';
+            throw error;
+        }
+
+        return typeof result === 'string'
+            ? result
+            : String((result as { jobId: string }).jobId);
     },
 
     async getJob(jobId: string, userId: string): Promise<BackgroundJob | null> {
@@ -116,6 +142,9 @@ export const convexJobProvider: BackgroundJobProvider = {
             job_id: jobId as Id<'background_jobs'>,
             ...(update.contentChunk !== undefined
                 ? { content_chunk: update.contentChunk }
+                : {}),
+            ...(update.reasoningChunk !== undefined
+                ? { reasoning_chunk: update.reasoningChunk }
                 : {}),
             ...(update.chunksReceived !== undefined
                 ? { chunks_received: update.chunksReceived }
@@ -164,12 +193,71 @@ export const convexJobProvider: BackgroundJobProvider = {
         assertLeaseWrite(result, leaseOwner);
     },
 
+    async saveTerminalSnapshot(
+        jobId: string,
+        snapshot: TerminalGenerationSnapshot,
+        leaseOwner?: string
+    ): Promise<boolean> {
+        const client = getClient();
+        return (
+            (await client.mutation(
+                internalApi.backgroundJobs.saveTerminalSnapshot,
+                {
+                    job_id: jobId as Id<'background_jobs'>,
+                    status: snapshot.status,
+                    content: snapshot.content,
+                    reasoning: snapshot.reasoning,
+                    tool_calls: snapshot.toolCalls,
+                    error: snapshot.error,
+                    completed_at: snapshot.completedAt,
+                    lease_owner: leaseOwner,
+                }
+            )) === true
+        );
+    },
+
+    async setHistoryPhase(
+        jobId: string,
+        phase: GenerationHistoryPhase,
+        options?: { from?: GenerationHistoryPhase[] }
+    ): Promise<boolean> {
+        const client = getClient();
+        return (
+            (await client.mutation(internalApi.backgroundJobs.setHistoryPhase, {
+                job_id: jobId as Id<'background_jobs'>,
+                phase,
+                from: options?.from,
+            })) === true
+        );
+    },
+
     async abortJob(jobId: string, userId: string): Promise<boolean> {
         const client = getClient();
         return await client.mutation(internalApi.backgroundJobs.abort, {
             job_id: jobId as Id<'background_jobs'>,
             user_id: userId,
         });
+    },
+
+    async cancelAdmission(
+        userId: string,
+        admissionId: string
+    ): Promise<AdmissionCancellationResult> {
+        const client = getClient();
+        const result = await client.mutation(
+            internalApi.backgroundJobs.requestAdmissionCancel,
+            {
+                user_id: userId,
+                admission_id: admissionId,
+                ttl_ms: 10 * 60 * 1000,
+            }
+        );
+        return {
+            aborted: result?.aborted === true,
+            pending: result?.pending === true,
+            jobId:
+                typeof result?.jobId === 'string' ? result.jobId : undefined,
+        };
     },
 
     // Convex provider does not expose AbortControllers.
@@ -222,6 +310,15 @@ export const convexJobProvider: BackgroundJobProvider = {
                 lease_owner: leaseOwner,
             }
         );
+    },
+
+    async getPendingHistoryJobs(limit) {
+        const client = getClient();
+        const jobs = await client.query(
+            internalApi.backgroundJobs.listPendingHistory,
+            { limit }
+        );
+        return Array.isArray(jobs) ? jobs.map(toBackgroundJob) : [];
     },
 
     async cleanupExpired(): Promise<number> {

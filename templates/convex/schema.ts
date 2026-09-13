@@ -531,6 +531,10 @@ export default defineSchema({
             v.literal('aborted')
         ),
         content: v.string(), // Accumulated content
+        reasoning: v.optional(v.string()), // Accumulated model reasoning
+        generation_id: v.optional(v.string()), // Stable generation identity
+        history_phase: v.optional(v.string()), // Canonical history phase
+        sync_provider_id: v.optional(v.string()), // Canonical sync provider
         chunks_received: v.number(), // Progress tracking
         tool_calls: v.optional(v.any()), // Tool call state snapshots
         workflow_state: v.optional(v.any()), // Workflow execution state snapshots
@@ -546,8 +550,35 @@ export default defineSchema({
     })
         .index('by_user', ['user_id'])
         .index('by_status', ['status'])
+        .index('by_history_phase', ['history_phase'])
         .index('by_message', ['message_id'])
         .index('by_user_idempotency', ['user_id', 'idempotency_key']),
+
+    /**
+     * Durable admission cancellations. Creation and cancellation both read
+     * this table so a Stop that arrives before the job row commits cannot
+     * launch work.
+     */
+    background_admission_cancels: defineTable({
+        user_id: v.string(),
+        admission_id: v.string(),
+        expires_at: v.number(),
+    }).index('by_user_admission', ['user_id', 'admission_id']),
+
+    /** Idempotent receipts for atomic canonical generation writes. */
+    background_generation_receipts: defineTable({
+        workspace_id: v.id('workspaces'),
+        generation_id: v.string(),
+        stage: v.union(v.literal('admission'), v.literal('finalization')),
+        fingerprint: v.string(),
+        outcome: v.string(),
+        server_version: v.optional(v.number()),
+        created_at: v.number(),
+    }).index('by_workspace_generation_stage', [
+        'workspace_id',
+        'generation_id',
+        'stage',
+    ]),
 
     // ============================================================
     // OR3 CONNECT

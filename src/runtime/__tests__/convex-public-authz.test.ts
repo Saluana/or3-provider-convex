@@ -484,6 +484,9 @@ describe('Convex authorization boundary', () => {
             backgroundJobFunctions.getActiveCount,
             backgroundJobFunctions.renewLease,
             backgroundJobFunctions.updateExecution,
+            backgroundJobFunctions.requestAdmissionCancel,
+            backgroundJobFunctions.saveTerminalSnapshot,
+            backgroundJobFunctions.setHistoryPhase,
             notificationFunctions.create,
             notificationFunctions.getByUser,
             notificationFunctions.markRead,
@@ -581,7 +584,7 @@ describe('Convex authorization boundary', () => {
                 ...input,
                 user_id: 'user-2',
             })
-        ).resolves.toBe('job-new');
+        ).resolves.toEqual({ kind: 'created', jobId: 'job-new' });
         expect(insert).toHaveBeenCalledOnce();
     });
 
@@ -627,7 +630,7 @@ describe('Convex authorization boundary', () => {
             registered(backgroundJobFunctions.create)._handler(ctx, {
                 ...input, user_id: 'user-3', idempotency_key: 'admission-2',
             })
-        ).resolves.toBe('job-new');
+        ).resolves.toEqual({ kind: 'created', jobId: 'job-new' });
         expect(patch).toHaveBeenCalledWith(
             'job-legacy',
             expect.objectContaining({ status: 'error' })
@@ -924,7 +927,7 @@ describe('Convex authorization boundary', () => {
         expect(sync).toContain('isChangeVisibleToUser(');
         expect(sync).toContain('export const gcTombstones = internalMutation({');
         expect(sync).toContain('export const gcChangeLog = internalMutation({');
-        expect(backgroundJobs.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(13);
+        expect(backgroundJobs.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(17);
         expect(backgroundJobs).not.toContain("args.user_id !== '*'");
         expect(notifications.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
         expect(rateLimits.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
@@ -944,7 +947,7 @@ describe('Convex authorization boundary', () => {
         expect(payload.files['workspaces.ts']).toContain('listInvitesInternal = internalQuery({');
         expect(payload.files['sync.ts']).toContain('gcTombstones = internalMutation({');
         expect(payload.files['backgroundJobs.ts']).not.toContain("args.user_id !== '*'");
-        expect(payload.files['backgroundJobs.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(13);
+        expect(payload.files['backgroundJobs.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(17);
         expect(payload.files['notifications.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
         expect(payload.files['rateLimits.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
         expect(payload.files['webhooks.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(20);
