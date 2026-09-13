@@ -79,7 +79,14 @@ The provider registers itself via the OR3 hook/registry system at startup (Nitro
 - **Admin store provider**: Convex workspace access, workspace settings, and admin user stores
 - **Background jobs**: Convex-backed background AI streaming with atomic
   per-user/global admission, duplicate suppression, renewable worker leases,
-  fenced writes, and process-restart recovery (abort is poll-based)
+  fenced writes, and process-restart recovery (abort is poll-based). Admission
+  cancellation is durable via `background_admission_cancels`: creation and
+  `cancelAdmission` read the same table inside their mutations, so a Stop
+  recorded before the job row commits cannot launch work
+  Canonical chat history uses version-1 internal admission/finalization
+  mutations and `background_generation_receipts`; each Convex mutation
+  atomically allocates sync versions, applies LWW materialized rows, appends the
+  change log, and records replay outcome before returning.
 - **Rate limiter**: Convex-backed request rate limiting with an in-memory fallback
 - **Webhook store**: `ConvexWebhookStore` — webhook definitions, signing secrets, and delivery logs
 - **Notifications**: Convex-backed notification emitter for background-job completion/error
@@ -128,7 +135,7 @@ The `init` command installs the Convex backend into `convex/`:
 - `auth.config.ts` — Clerk JWT issuer configuration (`CLERK_ISSUER_URL`)
 - `authz.ts` — subject-bound identity, invite, and workspace authorization guards
 - `users.ts`, `workspaces.ts` — identity/account lookups and workspace lifecycle/membership functions
-- `sync.ts` — push/pull/watch, device cursors, snapshot pages, canonical storage pages, internal bounded GC
+- `sync.ts` — push/pull/watch, device cursors, snapshot pages, canonical storage pages, atomic background-generation history, internal bounded GC
 - `snapshot.ts` — snapshot cursor/winner helpers shared with the contract fixtures
 - `storage.ts` — upload intents, `file_meta` commits, blob and deleted-file GC
 - `backgroundJobs.ts`, `rateLimits.ts`, `notifications.ts`, `webhooks.ts`, `connect.ts` — internal auxiliary persistence

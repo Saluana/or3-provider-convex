@@ -26,7 +26,7 @@ import { v } from 'convex/values';
 import { mutation, query, internalMutation, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
 import { getPkField } from './tableMetadata';
-import { requireWorkspaceRole } from './authz';
+import { requireActiveWorkspace, requireWorkspaceRole } from './authz';
 import { SYNC_HISTORY_GC_POLICY, computePullRetention } from './syncHistoryGcPolicy';
 import {
     decodeSnapshotCursor,
@@ -903,6 +903,11 @@ async function applyOpToTable(
                 );
                 await ctx.db.patch(existing._id, {
                     ...(payload ?? {}),
+                    ...(op.table_name === 'messages' &&
+                    payload &&
+                    !Object.prototype.hasOwnProperty.call(payload, 'error')
+                        ? { error: undefined }
+                        : {}),
                     clock: op.clock,
                     hlc: op.hlc,
                     op_id: op.op_id,
@@ -1356,6 +1361,329 @@ export const push = mutation({
             results: results.filter((result): result is Result => Boolean(result)),
             serverVersion: latestVersion,
         };
+    },
+});
+
+async function requireCanonicalGenerationActor(
+    ctx: MutationCtx,
+    workspaceId: Id<'workspaces'>,
+    actorUserId: Id<'users'>
+): Promise<void> {
+    await requireActiveWorkspace(ctx, workspaceId);
+    const membership = await ctx.db
+        .query('workspace_members')
+        .withIndex('by_workspace_user', (q: any) =>
+            q.eq('workspace_id', workspaceId).eq('user_id', actorUserId)
+        )
+        .first();
+    if (!membership || !SYNC_WRITE_ROLES.has(membership.role)) {
+        throw new Error('Forbidden background history actor');
+    }
+}
+
+async function generationReceipt(
+    ctx: MutationCtx,
+    workspaceId: Id<'workspaces'>,
+    generationId: string,
+    stage: 'admission' | 'finalization'
+) {
+    return await ctx.db
+        .query('background_generation_receipts')
+        .withIndex('by_workspace_generation_stage', (q: any) =>
+            q.eq('workspace_id', workspaceId)
+                .eq('generation_id', generationId)
+                .eq('stage', stage)
+        )
+        .first();
+}
+
+/** Atomically admits the rows a background generation owns before execution. */
+export const admitChatGeneration = internalMutation({
+    args: {
+        workspace_id: v.id('workspaces'),
+        actor_user_id: v.id('users'),
+        generation_id: v.string(),
+        message_id: v.string(),
+        kind: v.union(v.literal('new-turn'), v.literal('continuation')),
+        expected_clock: v.optional(v.number()),
+        expected_generation_id: v.optional(v.string()),
+        fingerprint: v.string(),
+        device_id: v.string(),
+        records: v.array(v.object({
+            table_name: v.union(v.literal('threads'), v.literal('messages')),
+            record: v.any(),
+            op_id: v.string(),
+        })),
+    },
+    handler: async (ctx, args) => {
+        await requireCanonicalGenerationActor(
+            ctx,
+            args.workspace_id,
+            args.actor_user_id
+        );
+        const receipt = await generationReceipt(
+            ctx,
+            args.workspace_id,
+            args.generation_id,
+            'admission'
+        );
+        if (receipt) {
+            if (receipt.fingerprint !== args.fingerprint) {
+                throw new Error('Conflicting background admission replay');
+            }
+            return {
+                status: 'admitted' as const,
+                replayed: true,
+                serverVersion: receipt.server_version ?? 0,
+            };
+        }
+
+        if (args.kind === 'continuation') {
+            const current = await ctx.db
+                .query('messages')
+                .withIndex('by_workspace_id', (q: any) =>
+                    q.eq('workspace_id', args.workspace_id).eq('id', args.message_id)
+                )
+                .first();
+            const data = current?.data && typeof current.data === 'object'
+                ? current.data as Record<string, unknown>
+                : {};
+            const expectedClock = args.expected_clock ?? -1;
+            const admissionRecord = args.records.at(-1)?.record as
+                | Record<string, unknown>
+                | undefined;
+            const admissionClock = admissionRecord?.clock;
+            if (
+                current?.deleted ||
+                (current && typeof admissionClock === 'number' &&
+                    current.clock > admissionClock) ||
+                (current && current.clock === admissionClock &&
+                    data.generation_id !== args.generation_id) ||
+                (current && typeof admissionClock === 'number' &&
+                    current.clock > expectedClock && current.clock < admissionClock) ||
+                (current &&
+                    current.clock === expectedClock &&
+                    args.expected_generation_id !== undefined &&
+                    data.generation_id !== args.expected_generation_id)
+            ) {
+                throw new Error('Conflicting continuation admission');
+            }
+        }
+
+        if (args.records.length < 1 || args.records.length > 3) {
+            throw new Error('Invalid background history records');
+        }
+        const startVersion = await allocateServerVersions(
+            ctx,
+            args.workspace_id,
+            args.records.length
+        );
+        const preimageVersion = startVersion - 1;
+        for (let offset = 0; offset < args.records.length; offset += 1) {
+            const entry = args.records[offset]!;
+            const record = entry.record as Record<string, unknown>;
+            const pk = typeof record.id === 'string' ? record.id : '';
+            const clock = record.clock;
+            if (!pk || !Number.isSafeInteger(clock) || (clock as number) < 0) {
+                throw new Error('Invalid background history record');
+            }
+            const hlc = typeof record.hlc === 'string' && record.hlc
+                ? record.hlc
+                : `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+            const payload = { ...record, hlc, op_id: entry.op_id };
+            const encoded = JSON.stringify(payload);
+            if (new TextEncoder().encode(encoded).byteLength > MAX_PAYLOAD_SIZE_BYTES) {
+                throw new Error('Invalid background history payload size');
+            }
+            const serverVersion = startVersion + offset;
+            await applyOpToTable(ctx, args.workspace_id, {
+                table_name: entry.table_name,
+                operation: 'put',
+                pk,
+                payload,
+                clock: clock as number,
+                hlc,
+                op_id: entry.op_id,
+            }, serverVersion, preimageVersion);
+            await ctx.db.insert('change_log', {
+                workspace_id: args.workspace_id,
+                server_version: serverVersion,
+                table_name: entry.table_name,
+                pk,
+                op: 'put',
+                payload,
+                clock: clock as number,
+                hlc,
+                device_id: args.device_id,
+                op_id: entry.op_id,
+                created_at: nowSec(),
+            });
+        }
+
+        const assistant = await ctx.db
+            .query('messages')
+            .withIndex('by_workspace_id', (q: any) =>
+                q.eq('workspace_id', args.workspace_id).eq('id', args.message_id)
+            )
+            .first();
+        const assistantData = assistant?.data && typeof assistant.data === 'object'
+            ? assistant.data as Record<string, unknown>
+            : {};
+        if (!assistant || assistant.deleted === true ||
+            assistant.clock !== (args.records.at(-1)?.record as any)?.clock ||
+            assistantData.generation_id !== args.generation_id) {
+            throw new Error('Background assistant admission was superseded');
+        }
+        const serverVersion = startVersion + args.records.length - 1;
+        await ctx.db.insert('background_generation_receipts', {
+            workspace_id: args.workspace_id,
+            generation_id: args.generation_id,
+            stage: 'admission',
+            fingerprint: args.fingerprint,
+            outcome: 'admitted',
+            server_version: serverVersion,
+            created_at: nowSec(),
+        });
+        return { status: 'admitted' as const, replayed: false, serverVersion };
+    },
+});
+
+/** Atomically commits a terminal snapshot if this generation still owns the row. */
+export const finalizeChatGeneration = internalMutation({
+    args: {
+        workspace_id: v.id('workspaces'),
+        actor_user_id: v.id('users'),
+        generation_id: v.string(),
+        message_id: v.string(),
+        admission_clock: v.number(),
+        fingerprint: v.string(),
+        device_id: v.string(),
+        op_id: v.string(),
+        snapshot: v.any(),
+    },
+    handler: async (ctx, args) => {
+        await requireCanonicalGenerationActor(ctx, args.workspace_id, args.actor_user_id);
+        const receipt = await generationReceipt(
+            ctx,
+            args.workspace_id,
+            args.generation_id,
+            'finalization'
+        );
+        if (receipt) {
+            if (receipt.fingerprint !== args.fingerprint) {
+                throw new Error('Conflicting background finalization replay');
+            }
+            return receipt.outcome === 'committed'
+                ? { status: 'committed' as const, replayed: true, serverVersion: receipt.server_version ?? 0 }
+                : { status: 'superseded' as const, reason: receipt.outcome };
+        }
+
+        const current = await ctx.db
+            .query('messages')
+            .withIndex('by_workspace_id', (q: any) =>
+                q.eq('workspace_id', args.workspace_id).eq('id', args.message_id)
+            )
+            .first();
+        const data = current?.data && typeof current.data === 'object'
+            ? current.data as Record<string, unknown>
+            : {};
+        const reason = !current
+            ? 'missing'
+            : current.deleted
+              ? 'deleted'
+              : data.generation_id !== args.generation_id
+                ? 'newer_generation'
+                : current.clock !== args.admission_clock
+                  ? 'edited'
+                  : null;
+        if (reason) {
+            await ctx.db.insert('background_generation_receipts', {
+                workspace_id: args.workspace_id,
+                generation_id: args.generation_id,
+                stage: 'finalization',
+                fingerprint: args.fingerprint,
+                outcome: reason,
+                created_at: nowSec(),
+            });
+            return { status: 'superseded' as const, reason };
+        }
+
+        const snapshot = args.snapshot as {
+            status: 'complete' | 'error' | 'aborted';
+            content: string;
+            reasoning: string;
+            toolCalls?: unknown[];
+            error?: string;
+            completedAt: number;
+        };
+        if (!['complete', 'error', 'aborted'].includes(snapshot.status) ||
+            typeof snapshot.content !== 'string' || typeof snapshot.reasoning !== 'string' ||
+            !Number.isFinite(snapshot.completedAt)) {
+            throw new Error('Invalid background terminal snapshot');
+        }
+        const clock = current!.clock + 1;
+        const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+        const {
+            _id: _currentId,
+            _creationTime: _currentCreationTime,
+            workspace_id: _currentWorkspaceId,
+            server_version: _currentServerVersion,
+            error: _oldError,
+            ...currentWithoutError
+        } = current!;
+        const terminalState = snapshot.status === 'complete'
+            ? 'complete'
+            : snapshot.status === 'aborted' ? 'aborted' : 'failed';
+        const payload = {
+            ...currentWithoutError,
+            ...(snapshot.error ? { error: snapshot.error } : {}),
+            pending: false,
+            updated_at: Math.floor(snapshot.completedAt / 1000),
+            clock,
+            hlc,
+            op_id: args.op_id,
+            data: {
+                ...data,
+                content: snapshot.content,
+                reasoning_text: snapshot.reasoning || null,
+                tool_calls: snapshot.toolCalls ?? null,
+                generation_state: terminalState,
+                background_job_status: snapshot.status,
+                background_job_error: snapshot.error ?? null,
+                error: snapshot.error ?? null,
+            },
+        };
+        if (new TextEncoder().encode(JSON.stringify(payload)).byteLength > MAX_PAYLOAD_SIZE_BYTES) {
+            throw new Error('Invalid background history payload size');
+        }
+        const serverVersion = await allocateServerVersions(ctx, args.workspace_id, 1);
+        await applyOpToTable(ctx, args.workspace_id, {
+            table_name: 'messages', operation: 'put', pk: args.message_id,
+            payload, clock, hlc, op_id: args.op_id,
+        }, serverVersion, serverVersion - 1);
+        await ctx.db.insert('change_log', {
+            workspace_id: args.workspace_id,
+            server_version: serverVersion,
+            table_name: 'messages',
+            pk: args.message_id,
+            op: 'put',
+            payload,
+            clock,
+            hlc,
+            device_id: args.device_id,
+            op_id: args.op_id,
+            created_at: nowSec(),
+        });
+        await ctx.db.insert('background_generation_receipts', {
+            workspace_id: args.workspace_id,
+            generation_id: args.generation_id,
+            stage: 'finalization',
+            fingerprint: args.fingerprint,
+            outcome: 'committed',
+            server_version: serverVersion,
+            created_at: nowSec(),
+        });
+        return { status: 'committed' as const, replayed: false, serverVersion };
     },
 });
 

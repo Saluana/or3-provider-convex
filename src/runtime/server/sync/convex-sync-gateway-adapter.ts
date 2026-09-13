@@ -8,6 +8,7 @@
  * after the Convex provider package registers the adapter.
  */
 import type { H3Event } from 'h3';
+import { createHash } from 'node:crypto';
 import { createError } from 'h3';
 import { useRuntimeConfig } from '#imports';
 import type {
@@ -24,6 +25,17 @@ import type {
     PushBatch,
     PushResult,
 } from '~~/shared/sync/types';
+import type {
+    AdmitChatGenerationResult,
+    CanonicalGenerationSnapshot,
+    CanonicalHistoryActor,
+    ChatGenerationAdmissionEnvelope,
+    FinalizeChatGenerationResult,
+} from '~~/shared/chat/background-history';
+import {
+    backgroundHistoryDeviceId,
+    parseChatGenerationAdmissionEnvelope,
+} from '~~/shared/chat/background-history';
 import type { GenericId as Id } from 'convex/values';
 import { convexApi as api, convexInternalApi as internalApi } from '../../utils/convex-api';
 import {
@@ -41,6 +53,8 @@ import { resolveProviderToken } from '~~/server/auth/token-broker/resolve';
 import { resolveSessionContext } from '~~/server/auth/session';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { canRunSyncHistoryGc } from '../../utils/sync-history-gc-policy';
+import { getConvexClient } from '../utils/convex-client';
+import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
 
 type ConvexPullChange = {
     serverVersion: number;
@@ -63,6 +77,35 @@ type HookEmission = {
 
 function nowEpoch(): number {
     return Math.floor(Date.now() / 1000);
+}
+
+function stableJson(value: unknown): string {
+    if (value === undefined) return 'undefined';
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) =>
+        `${JSON.stringify(key)}:${stableJson(record[key])}`
+    ).join(',')}}`;
+}
+
+function fingerprint(value: unknown): string {
+    return createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
+function backgroundHistoryOpId(
+    admission: Pick<ChatGenerationAdmissionEnvelope, 'workspaceId' | 'generationId'>,
+    stage: 'thread' | 'user' | 'assistant' | 'finalize'
+): string {
+    const hex = createHash('sha256')
+        .update(`${admission.workspaceId}\0${admission.generationId}\0${stage}`)
+        .digest('hex')
+        .slice(0, 32)
+        .split('');
+    hex[12] = '4';
+    hex[16] = ((Number.parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16);
+    const value = hex.join('');
+    return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
 }
 
 function toWebhookEntityPayload(input: {
@@ -320,7 +363,78 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
     readonly capabilities = {
         snapshotBootstrap: 'snapshot-v1',
         historyRetention: 'snapshot-v1',
+        backgroundGenerationHistory: 'v1',
     } as const;
+
+    async admitChatGeneration(
+        actor: CanonicalHistoryActor,
+        input: ChatGenerationAdmissionEnvelope
+    ): Promise<AdmitChatGenerationResult> {
+        const admission = parseChatGenerationAdmissionEnvelope(input);
+        if (actor.workspaceId !== admission.workspaceId) {
+            throw new Error('Invalid background history workspace');
+        }
+        const records = [
+            admission.thread
+                ? { table_name: 'threads', record: admission.thread, stage: 'thread' }
+                : null,
+            admission.userMessage
+                ? { table_name: 'messages', record: admission.userMessage, stage: 'user' }
+                : null,
+            { table_name: 'messages', record: admission.assistantMessage, stage: 'assistant' },
+        ].filter(Boolean).map((entry) => {
+            const record = sanitizePayloadForSync(
+                entry!.table_name,
+                entry!.record,
+                'put'
+            );
+            if (!record) throw new Error('Invalid background history payload');
+            return {
+                table_name: entry!.table_name,
+                record,
+                op_id: backgroundHistoryOpId(
+                    admission,
+                    entry!.stage as 'thread' | 'user' | 'assistant'
+                ),
+            };
+        });
+        return await getConvexClient().mutation(internalApi.sync.admitChatGeneration, {
+            workspace_id: toWorkspaceId(admission.workspaceId),
+            actor_user_id: actor.userId as Id<'users'>,
+            generation_id: admission.generationId,
+            message_id: admission.messageId,
+            kind: admission.kind,
+            expected_clock: admission.expectedAssistant?.clock,
+            expected_generation_id: admission.expectedAssistant?.generationId,
+            fingerprint: fingerprint(admission),
+            device_id: backgroundHistoryDeviceId(admission.generationId),
+            records,
+        }) as AdmitChatGenerationResult;
+    }
+
+    async finalizeChatGeneration(
+        actor: CanonicalHistoryActor,
+        input: {
+            admission: ChatGenerationAdmissionEnvelope;
+            snapshot: CanonicalGenerationSnapshot;
+        }
+    ): Promise<FinalizeChatGenerationResult> {
+        const admission = parseChatGenerationAdmissionEnvelope(input.admission);
+        if (actor.workspaceId !== admission.workspaceId) {
+            throw new Error('Invalid background history workspace');
+        }
+        return await getConvexClient().mutation(internalApi.sync.finalizeChatGeneration, {
+            workspace_id: toWorkspaceId(admission.workspaceId),
+            actor_user_id: actor.userId as Id<'users'>,
+            generation_id: admission.generationId,
+            message_id: admission.messageId,
+            admission_clock: admission.assistantMessage.clock,
+            fingerprint: fingerprint(input),
+            device_id: backgroundHistoryDeviceId(admission.generationId),
+            op_id: backgroundHistoryOpId(admission, 'finalize'),
+            snapshot: input.snapshot,
+        }) as FinalizeChatGenerationResult;
+    }
 
     async pull(event: H3Event, input: PullRequest): Promise<PullResponse> {
         const client = await getSyncGatewayClient(event);

@@ -30,6 +30,74 @@ import { internalMutation, internalQuery } from './_generated/server';
 /** Batch size for job cleanup operations */
 const CLEANUP_BATCH_SIZE = 100;
 
+/**
+ * Applies an atomic claim to a job row and returns the public projection.
+ * Recovery resets text and reasoning to their durable checkpoints together.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function claimJobRecord(
+    job: any,
+    leaseOwner: string,
+    leaseExpiresAt: number,
+    now: number
+) {
+    const execution = (job.execution ?? {}) as {
+        contentBase?: unknown;
+        reasoningBase?: unknown;
+    };
+    const contentBase =
+        typeof execution.contentBase === 'string' ? execution.contentBase : '';
+    const reasoningBase =
+        typeof execution.reasoningBase === 'string'
+            ? execution.reasoningBase
+            : '';
+    const attempts = ((job.attempts as number | undefined) ?? 0) + 1;
+    const patch: Record<string, unknown> = {
+        lease_owner: leaseOwner,
+        lease_expires_at: leaseExpiresAt,
+        last_activity_at: now,
+        attempts,
+        ...(attempts > 1
+            ? {
+                  content: contentBase,
+                  reasoning: reasoningBase,
+                  chunks_received: 0,
+              }
+            : {}),
+    };
+    const result = {
+        id: job._id,
+        userId: job.user_id,
+        threadId: job.thread_id,
+        messageId: job.message_id,
+        model: job.model,
+        kind: job.kind,
+        status: job.status,
+        content: attempts > 1 ? contentBase : job.content,
+        reasoning:
+            attempts > 1
+                ? reasoningBase
+                : typeof job.reasoning === 'string'
+                  ? job.reasoning
+                  : '',
+        generationId: job.generation_id,
+        historyPhase: job.history_phase,
+        syncProviderId: job.sync_provider_id,
+        chunksReceived: attempts > 1 ? 0 : job.chunks_received,
+        startedAt: job.started_at,
+        lastActivityAt: now,
+        completedAt: job.completed_at,
+        error: job.error,
+        tool_calls: job.tool_calls,
+        workflow_state: job.workflow_state,
+        execution: job.execution,
+        leaseOwner,
+        leaseExpiresAt,
+        attempts,
+    };
+    return { patch, result };
+}
+
 // ============================================================
 // MUTATIONS
 // ============================================================
@@ -55,6 +123,11 @@ export const create = internalMutation({
         workflow_state: v.optional(v.any()),
         execution: v.optional(v.any()),
         idempotency_key: v.optional(v.string()),
+        generation_id: v.optional(v.string()),
+        sync_provider_id: v.optional(v.string()),
+        history_phase: v.optional(v.string()),
+        initial_content: v.optional(v.string()),
+        initial_reasoning: v.optional(v.string()),
         max_concurrent_jobs: v.number(),
         max_concurrent_jobs_per_user: v.number(),
     },
@@ -83,6 +156,19 @@ export const create = internalMutation({
                     });
                 }
                 return existing._id;
+            }
+            const cancelMatches = await ctx.db
+                .query('background_admission_cancels')
+                .withIndex('by_user_admission', (q) =>
+                    q
+                        .eq('user_id', args.user_id)
+                        .eq('admission_id', args.idempotency_key!)
+                )
+                .collect();
+            const cancel = cancelMatches[0];
+            if (cancel && cancel.expires_at > Date.now()) {
+                // A Stop was recorded before this admission committed.
+                return { kind: 'cancelled' as const };
             }
         }
 
@@ -130,7 +216,15 @@ export const create = internalMutation({
             model: args.model,
             kind: args.kind ?? 'chat',
             status: 'streaming',
-            content: '',
+            content: args.initial_content ?? '',
+            reasoning: args.initial_reasoning ?? '',
+            ...(args.generation_id !== undefined
+                ? { generation_id: args.generation_id }
+                : {}),
+            ...(args.sync_provider_id !== undefined
+                ? { sync_provider_id: args.sync_provider_id }
+                : {}),
+            history_phase: args.history_phase ?? 'ready',
             chunks_received: 0,
             ...(args.tool_calls !== undefined
                 ? { tool_calls: args.tool_calls }
@@ -149,7 +243,75 @@ export const create = internalMutation({
             last_activity_at: now
         });
 
-        return jobId;
+        return { kind: 'created' as const, jobId };
+    },
+});
+
+/**
+ * `backgroundJobs.requestAdmissionCancel` (internal mutation)
+ *
+ * Purpose:
+ * Durably cancels an admission, aborting a committed streaming job when one
+ * exists and otherwise leaving a marker that creation observes atomically.
+ */
+export const requestAdmissionCancel = internalMutation({
+    args: {
+        user_id: v.string(),
+        admission_id: v.string(),
+        ttl_ms: v.number(),
+    },
+    handler: async (ctx, args) => {
+        const now = Date.now();
+        const existingMarker = (
+            await ctx.db
+                .query('background_admission_cancels')
+                .withIndex('by_user_admission', (q) =>
+                    q
+                        .eq('user_id', args.user_id)
+                        .eq('admission_id', args.admission_id)
+                )
+                .collect()
+        )[0];
+        if (existingMarker) {
+            await ctx.db.patch(existingMarker._id, {
+                expires_at: now + args.ttl_ms,
+            });
+        } else {
+            await ctx.db.insert('background_admission_cancels', {
+                user_id: args.user_id,
+                admission_id: args.admission_id,
+                expires_at: now + args.ttl_ms,
+            });
+        }
+
+        const matching = await ctx.db
+            .query('background_jobs')
+            .withIndex('by_user_idempotency', (q) =>
+                q
+                    .eq('user_id', args.user_id)
+                    .eq('idempotency_key', args.admission_id)
+            )
+            .collect();
+        const job = matching[0];
+        if (!job) {
+            return { aborted: false, pending: true };
+        }
+        if (job.status === 'streaming') {
+            await ctx.db.patch(job._id, {
+                status: 'aborted',
+                error: 'Cancelled by user',
+                completed_at: now,
+                lease_owner: undefined,
+                lease_expires_at: undefined,
+                history_phase:
+                    job.generation_id !== undefined &&
+                    (job.history_phase ?? 'ready') === 'ready'
+                        ? 'finalization_pending'
+                        : job.history_phase,
+            });
+            return { aborted: true, jobId: job._id, pending: false };
+        }
+        return { aborted: false, jobId: job._id, pending: false };
     },
 });
 
@@ -212,6 +374,7 @@ export const update = internalMutation({
     args: {
         job_id: v.id('background_jobs'),
         content_chunk: v.optional(v.string()),
+        reasoning_chunk: v.optional(v.string()),
         chunks_received: v.optional(v.number()),
         tool_calls: v.optional(v.any()),
         workflow_state: v.optional(v.any()),
@@ -234,6 +397,9 @@ export const update = internalMutation({
 
         if (args.content_chunk !== undefined) {
             patch.content = job.content + args.content_chunk;
+        }
+        if (args.reasoning_chunk !== undefined) {
+            patch.reasoning = (job.reasoning ?? '') + args.reasoning_chunk;
         }
         if (args.chunks_received !== undefined) {
             patch.chunks_received = args.chunks_received;
@@ -328,6 +494,79 @@ export const fail = internalMutation({
 });
 
 /** Atomically claim a specific recoverable job. */
+/**
+ * `backgroundJobs.saveTerminalSnapshot` (internal mutation)
+ *
+ * Purpose:
+ * Atomically persists the terminal generation snapshot and marks history
+ * finalization pending. The canonical history worker consumes this snapshot.
+ */
+export const saveTerminalSnapshot = internalMutation({
+    args: {
+        job_id: v.id('background_jobs'),
+        status: v.union(
+            v.literal('complete'),
+            v.literal('error'),
+            v.literal('aborted')
+        ),
+        content: v.string(),
+        reasoning: v.string(),
+        tool_calls: v.optional(v.any()),
+        error: v.optional(v.string()),
+        completed_at: v.number(),
+        lease_owner: v.optional(v.string()),
+    },
+    handler: async (ctx, args) => {
+        const job = await ctx.db.get(args.job_id);
+        if (!job || job.status !== 'streaming') return false;
+        if (
+            job.lease_owner !== undefined &&
+            (job.lease_owner !== args.lease_owner ||
+                (job.lease_expires_at ?? 0) <= Date.now())
+        ) {
+            return false;
+        }
+        const patch: Record<string, unknown> = {
+            status: args.status,
+            content: args.content,
+            reasoning: args.reasoning,
+            error: args.error,
+            completed_at: args.completed_at,
+            history_phase: 'finalization_pending',
+            lease_owner: undefined,
+            lease_expires_at: undefined,
+        };
+        if (args.tool_calls !== undefined) {
+            patch.tool_calls = args.tool_calls;
+        }
+        await ctx.db.patch(args.job_id, patch);
+        return true;
+    },
+});
+
+/**
+ * `backgroundJobs.setHistoryPhase` (internal mutation)
+ *
+ * Purpose:
+ * Conditionally updates the durable history phase. Supplying `from` prevents a
+ * late failure from moving `committed` back to `finalization_pending`.
+ */
+export const setHistoryPhase = internalMutation({
+    args: {
+        job_id: v.id('background_jobs'),
+        phase: v.string(),
+        from: v.optional(v.array(v.string())),
+    },
+    handler: async (ctx, args) => {
+        const job = await ctx.db.get(args.job_id);
+        if (!job) return false;
+        const current = job.history_phase ?? 'ready';
+        if (args.from && !args.from.includes(current)) return false;
+        await ctx.db.patch(args.job_id, { history_phase: args.phase });
+        return true;
+    },
+});
+
 export const claim = internalMutation({
     args: {
         job_id: v.id('background_jobs'),
@@ -342,47 +581,20 @@ export const claim = internalMutation({
             !job ||
             job.status !== 'streaming' ||
             job.execution === undefined ||
+            (job.history_phase ?? 'ready') !== 'ready' ||
             (job.lease_owner !== undefined &&
                 (job.lease_expires_at ?? 0) > now)
         ) {
             return null;
         }
-        const execution = job.execution as { contentBase?: unknown };
-        const contentBase =
-            typeof execution.contentBase === 'string'
-                ? execution.contentBase
-                : '';
-        const attempts = (job.attempts ?? 0) + 1;
-        await ctx.db.patch(job._id, {
-            lease_owner: args.lease_owner,
-            lease_expires_at: leaseExpiresAt,
-            last_activity_at: now,
-            attempts,
-            ...(attempts > 1
-                ? { content: contentBase, chunks_received: 0 }
-                : {}),
-        });
-        return {
-            id: job._id,
-            userId: job.user_id,
-            threadId: job.thread_id,
-            messageId: job.message_id,
-            model: job.model,
-            kind: job.kind,
-            status: job.status,
-            content: attempts > 1 ? contentBase : job.content,
-            chunksReceived: attempts > 1 ? 0 : job.chunks_received,
-            startedAt: job.started_at,
-            lastActivityAt: now,
-            completedAt: job.completed_at,
-            error: job.error,
-            tool_calls: job.tool_calls,
-            workflow_state: job.workflow_state,
-            execution: job.execution,
-            leaseOwner: args.lease_owner,
+        const { patch, result } = claimJobRecord(
+            job,
+            args.lease_owner,
             leaseExpiresAt,
-            attempts,
-        };
+            now
+        );
+        await ctx.db.patch(job._id, patch);
+        return result;
     },
 });
 
@@ -402,47 +614,20 @@ export const claimNext = internalMutation({
         const job = candidates.find(
             (candidate) =>
                 candidate.execution !== undefined &&
+                (candidate.history_phase ?? 'ready') === 'ready' &&
                 (candidate.lease_owner === undefined ||
                     (candidate.lease_expires_at ?? 0) <= now)
         );
         if (!job) return null;
 
-        const execution = job.execution as { contentBase?: unknown };
-        const contentBase =
-            typeof execution.contentBase === 'string'
-                ? execution.contentBase
-                : '';
-        const attempts = (job.attempts ?? 0) + 1;
-        await ctx.db.patch(job._id, {
-            lease_owner: args.lease_owner,
-            lease_expires_at: leaseExpiresAt,
-            last_activity_at: now,
-            attempts,
-            ...(attempts > 1
-                ? { content: contentBase, chunks_received: 0 }
-                : {}),
-        });
-        return {
-            id: job._id,
-            userId: job.user_id,
-            threadId: job.thread_id,
-            messageId: job.message_id,
-            model: job.model,
-            kind: job.kind,
-            status: job.status,
-            content: attempts > 1 ? contentBase : job.content,
-            chunksReceived: attempts > 1 ? 0 : job.chunks_received,
-            startedAt: job.started_at,
-            lastActivityAt: now,
-            completedAt: job.completed_at,
-            error: job.error,
-            tool_calls: job.tool_calls,
-            workflow_state: job.workflow_state,
-            execution: job.execution,
-            leaseOwner: args.lease_owner,
+        const { patch, result } = claimJobRecord(
+            job,
+            args.lease_owner,
             leaseExpiresAt,
-            attempts,
-        };
+            now
+        );
+        await ctx.db.patch(job._id, patch);
+        return result;
     },
 });
 
@@ -527,7 +712,12 @@ export const abort = internalMutation({
         await ctx.db.patch(args.job_id, {
             status: 'aborted',
             completed_at: Date.now(),
-            last_activity_at: Date.now()
+            last_activity_at: Date.now(),
+            history_phase:
+                job.generation_id !== undefined &&
+                (job.history_phase ?? 'ready') === 'ready'
+                    ? 'finalization_pending'
+                    : job.history_phase,
         });
 
         return true;
@@ -590,6 +780,11 @@ export const cleanup = internalMutation({
                     error:
                         'Background job predates durable recovery. Retry the message.',
                     completed_at: now,
+                    history_phase:
+                        job.generation_id !== undefined &&
+                        (job.history_phase ?? 'ready') === 'ready'
+                            ? 'finalization_pending'
+                            : job.history_phase,
                 });
                 cleaned++;
             } else if (idleAge > timeoutMs) {
@@ -597,6 +792,11 @@ export const cleanup = internalMutation({
                     status: 'error',
                     error: 'Job timed out',
                     completed_at: now,
+                    history_phase:
+                        job.generation_id !== undefined &&
+                        (job.history_phase ?? 'ready') === 'ready'
+                            ? 'finalization_pending'
+                            : job.history_phase,
                 });
                 cleaned++;
             }
@@ -611,7 +811,12 @@ export const cleanup = internalMutation({
 
             for (const job of jobs) {
                 const completedAge = now - (job.completed_at ?? job.started_at);
-                if (completedAge > retentionMs) {
+                const historyPhase = job.history_phase ?? 'ready';
+                const historySettled =
+                    historyPhase === 'ready' ||
+                    historyPhase === 'committed' ||
+                    historyPhase === 'superseded';
+                if (completedAge > retentionMs && historySettled) {
                     await ctx.db.delete(job._id);
                     cleaned++;
                 }
@@ -637,5 +842,53 @@ export const getActiveCount = internalQuery({
             .collect();
 
         return jobs.length;
+    },
+});
+
+/** Return a bounded page of canonical-history deliveries awaiting retry. */
+export const listPendingHistory = internalQuery({
+    args: { limit: v.number() },
+    handler: async (ctx, args) => {
+        const limit = Math.max(1, Math.min(100, Math.floor(args.limit)));
+        const jobs = (
+            await Promise.all([
+                ctx.db.query('background_jobs')
+                    .withIndex('by_history_phase', (q) =>
+                        q.eq('history_phase', 'admission_pending')
+                    ).take(limit),
+                ctx.db.query('background_jobs')
+                    .withIndex('by_history_phase', (q) =>
+                        q.eq('history_phase', 'finalization_pending')
+                    ).take(limit),
+            ])
+        ).flat();
+        return jobs
+            .sort((left, right) => left.started_at - right.started_at)
+            .slice(0, limit)
+            .map((job) => ({
+                id: job._id,
+                userId: job.user_id,
+                threadId: job.thread_id,
+                messageId: job.message_id,
+                model: job.model,
+                kind: job.kind,
+                status: job.status,
+                content: job.content,
+                reasoning: job.reasoning ?? '',
+                generation_id: job.generation_id,
+                history_phase: job.history_phase,
+                sync_provider_id: job.sync_provider_id,
+                chunksReceived: job.chunks_received,
+                startedAt: job.started_at,
+                lastActivityAt: job.last_activity_at,
+                completedAt: job.completed_at,
+                error: job.error,
+                tool_calls: job.tool_calls,
+                workflow_state: job.workflow_state,
+                execution: job.execution,
+                leaseOwner: job.lease_owner,
+                leaseExpiresAt: job.lease_expires_at,
+                attempts: job.attempts,
+            }));
     },
 });

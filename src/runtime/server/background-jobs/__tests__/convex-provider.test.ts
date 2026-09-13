@@ -24,6 +24,9 @@ vi.mock('../../../utils/convex-api', () => ({
             updateExecution: 'backgroundJobs.updateExecution',
             cleanup: 'backgroundJobs.cleanup',
             getActiveCount: 'backgroundJobs.getActiveCount',
+            requestAdmissionCancel: 'backgroundJobs.requestAdmissionCancel',
+            saveTerminalSnapshot: 'backgroundJobs.saveTerminalSnapshot',
+            setHistoryPhase: 'backgroundJobs.setHistoryPhase',
         },
     },
 }));
@@ -78,6 +81,56 @@ describe('convex background job provider', () => {
             idempotency_key: 'message-1',
             max_concurrent_jobs: 20,
             max_concurrent_jobs_per_user: 5,
+        });
+    });
+
+    it('rejects creation when a durable cancellation marker exists', async () => {
+        mutation.mockResolvedValue({ kind: 'cancelled' });
+
+        await expect(
+            convexJobProvider.createJob({
+                userId: 'user-1',
+                threadId: 'thread-1',
+                messageId: 'message-1',
+                model: 'test-model',
+                kind: 'chat',
+                idempotencyKey: 'admission-1',
+            })
+        ).rejects.toMatchObject({ name: 'AdmissionCancelledError' });
+    });
+
+    it('maps admission cancellation results from the durable mutation', async () => {
+        mutation.mockResolvedValueOnce({
+            aborted: false,
+            pending: true,
+        });
+        await expect(
+            convexJobProvider.cancelAdmission!('user-1', 'admission-1')
+        ).resolves.toEqual({
+            aborted: false,
+            pending: true,
+            jobId: undefined,
+        });
+        expect(mutation).toHaveBeenCalledWith(
+            'backgroundJobs.requestAdmissionCancel',
+            {
+                user_id: 'user-1',
+                admission_id: 'admission-1',
+                ttl_ms: 600_000,
+            }
+        );
+
+        mutation.mockResolvedValueOnce({
+            aborted: true,
+            jobId: 'job-1',
+            pending: false,
+        });
+        await expect(
+            convexJobProvider.cancelAdmission!('user-1', 'admission-2')
+        ).resolves.toEqual({
+            aborted: true,
+            pending: false,
+            jobId: 'job-1',
         });
     });
 
