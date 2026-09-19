@@ -125,11 +125,12 @@ export const pollDeviceAuthorization = internalMutation({
                 user_code_display: undefined,
                 updated_at: args.now,
             });
-            if (record.environment_id) {
+            const environmentId = record.environment_id;
+            if (environmentId) {
                 const environment = await ctx.db
                     .query('connect_environments')
                     .withIndex('by_environment_id', (q) =>
-                        q.eq('id', record.environment_id)
+                        q.eq('id', environmentId)
                     )
                     .unique();
                 if (

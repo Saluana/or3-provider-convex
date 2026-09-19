@@ -1,19 +1,26 @@
-export type MutationCtx = any;
-export type QueryCtx = any;
+/** Schema-aware declarations matching the installed Convex code generator. */
+import type {
+    ActionBuilder,
+    GenericActionCtx,
+    GenericDatabaseReader,
+    GenericDatabaseWriter,
+    GenericMutationCtx,
+    GenericQueryCtx,
+    HttpActionBuilder,
+    MutationBuilder,
+    QueryBuilder,
+} from 'convex/server';
+import type { DataModel } from './dataModel';
 
-type MutationDef = {
-    args?: unknown;
-    handler: (ctx: any, args: any) => any;
-};
-
-type QueryDef = {
-    args?: unknown;
-    handler: (ctx: any, args: any) => any;
-};
-
-export declare function mutation<T extends MutationDef>(definition: T): unknown;
-export declare function query<T extends QueryDef>(definition: T): unknown;
-export declare function internalMutation<T extends MutationDef>(definition: T): unknown;
-export declare function internalQuery<T extends QueryDef>(definition: T): unknown;
-export declare function action<T extends { args?: unknown; handler: (ctx: any, args: any) => any }>(definition: T): unknown;
-export declare function internalAction<T extends { args?: unknown; handler: (ctx: any, args: any) => any }>(definition: T): unknown;
+export declare const query: QueryBuilder<DataModel, 'public'>;
+export declare const internalQuery: QueryBuilder<DataModel, 'internal'>;
+export declare const mutation: MutationBuilder<DataModel, 'public'>;
+export declare const internalMutation: MutationBuilder<DataModel, 'internal'>;
+export declare const action: ActionBuilder<DataModel, 'public'>;
+export declare const internalAction: ActionBuilder<DataModel, 'internal'>;
+export declare const httpAction: HttpActionBuilder;
+export type QueryCtx = GenericQueryCtx<DataModel>;
+export type MutationCtx = GenericMutationCtx<DataModel>;
+export type ActionCtx = GenericActionCtx<DataModel>;
+export type DatabaseReader = GenericDatabaseReader<DataModel>;
+export type DatabaseWriter = GenericDatabaseWriter<DataModel>;

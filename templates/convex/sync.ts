@@ -105,7 +105,7 @@ const SNAPSHOT_TTL_SECONDS = 60 * 60;
 const MAX_PAYLOAD_SIZE_BYTES = 256 * 1024;
 
 const SYNC_READ_ROLES = new Set(['owner', 'editor', 'viewer'] as const);
-const SYNC_WRITE_ROLES = new Set(['owner', 'editor'] as const);
+const SYNC_WRITE_ROLES: ReadonlySet<'owner' | 'editor' | 'viewer'> = new Set(['owner', 'editor']);
 
 // ============================================================
 // HELPERS

@@ -75,17 +75,13 @@ async function loadCanonicalReferencedHashes(
 ): Promise<Set<string> | null> {
     const messages = await ctx.db
         .query('messages')
-        .withIndex('by_workspace_id', (q: {
-            eq: (field: 'workspace_id', value: Id<'workspaces'>) => unknown;
-        }) => q.eq('workspace_id', workspaceId))
+        .withIndex('by_workspace_id', (q) => q.eq('workspace_id', workspaceId))
         .take(MAX_GC_REFERENCE_ROWS_PER_TABLE + 1);
     if (messages.length > MAX_GC_REFERENCE_ROWS_PER_TABLE) return null;
 
     const posts = await ctx.db
         .query('posts')
-        .withIndex('by_workspace_id', (q: {
-            eq: (field: 'workspace_id', value: Id<'workspaces'>) => unknown;
-        }) => q.eq('workspace_id', workspaceId))
+        .withIndex('by_workspace_id', (q) => q.eq('workspace_id', workspaceId))
         .take(MAX_GC_REFERENCE_ROWS_PER_TABLE + 1);
     if (posts.length > MAX_GC_REFERENCE_ROWS_PER_TABLE) return null;
     const hashes = new Set<string>();

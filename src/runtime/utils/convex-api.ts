@@ -36,6 +36,7 @@ export const convexInternalApi = {
 } as const;
 
 export const convexApiContractNames = [
+    'admin:compareAndSetWorkspaceSetting',
     'admin:createWorkspace',
     'admin:ensureDeploymentAdmin',
     'admin:getWorkspace',

@@ -325,6 +325,15 @@ export function createConvexWorkspaceSettingsStore(
                 value,
             });
         },
+        async compareAndSet(workspaceId, key, expectedValue, value) {
+            const client = await getConvexClientWithAuth(event);
+            return await client.mutation(api.admin.compareAndSetWorkspaceSetting, {
+                workspace_id: validateWorkspaceId(workspaceId),
+                key,
+                expected_value: expectedValue,
+                value,
+            });
+        },
     };
 }
 

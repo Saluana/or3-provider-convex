@@ -5,5 +5,4 @@ export {
     queryGeneric as query,
 } from 'convex/server';
 
-export type MutationCtx = any;
-export type QueryCtx = any;
+export type { MutationCtx, QueryCtx } from '../../templates/convex/_generated/server';

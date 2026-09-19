@@ -27,6 +27,7 @@ vi.mock('#imports', () => ({
 vi.mock('convex/server', () => ({
     anyApi: {
         admin: {
+            compareAndSetWorkspaceSetting: 'admin.compareAndSetWorkspaceSetting',
             createWorkspace: 'admin.createWorkspace',
             getWorkspace: 'admin.getWorkspace',
             getWorkspaceSetting: 'admin.getWorkspaceSetting',
@@ -112,5 +113,27 @@ describe('createConvexWorkspaceAccessStore', () => {
 
         expect(getConvexAdminGatewayClient).toHaveBeenCalledTimes(1);
         expect(resolveProviderToken).not.toHaveBeenCalled();
+    });
+
+    it('uses the server-side compare-and-set mutation for setup revisions', async () => {
+        useRuntimeConfig.mockReturnValue({
+            auth: { provider: 'clerk' },
+            sync: { convexAdminKey: 'admin-key', convexUrl: 'https://example.convex.cloud' },
+        });
+        const mutation = vi.fn().mockResolvedValue(true);
+        getConvexAdminGatewayClient.mockReturnValue({ mutation });
+
+        const { createConvexWorkspaceSettingsStore } = await import('../convex-store');
+        const event = {
+            context: {
+                admin: { principal: { kind: 'super_admin', username: 'root' } },
+            },
+        } as any;
+        const store = createConvexWorkspaceSettingsStore(event);
+        await expect(store.compareAndSet!('workspaces:123', 'setup', null, 'next')).resolves.toBe(true);
+        expect(mutation).toHaveBeenCalledWith(
+            'admin.compareAndSetWorkspaceSetting',
+            expect.objectContaining({ expected_value: null, value: 'next' })
+        );
     });
 });

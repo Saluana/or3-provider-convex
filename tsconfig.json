@@ -3,6 +3,7 @@
         "target": "ESNext",
         "module": "ESNext",
         "moduleResolution": "bundler",
+        "rootDirs": ["./templates", "../or3-chat"],
         "strict": true,
         "esModuleInterop": true,
         "skipLibCheck": true,
@@ -25,6 +26,6 @@
             "#app": ["../or3-chat/.nuxt/types/app.d.ts"]
         }
     },
-    "include": ["src/**/*.ts"],
+    "include": ["src/**/*.ts", "templates/convex/**/*.ts"],
     "exclude": ["node_modules", "dist"]
 }

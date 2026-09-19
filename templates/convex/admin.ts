@@ -1049,3 +1049,42 @@ export const setWorkspaceSetting = mutation({
         });
     },
 });
+
+/**
+ * Atomically write a workspace setting only when its current value equals the
+ * caller's expected value. Convex mutations are serializable, so the read and
+ * conditional write cannot be interleaved by another instance.
+ */
+export const compareAndSetWorkspaceSetting = mutation({
+    args: {
+        workspace_id: v.id('workspaces'),
+        key: v.string(),
+        expected_value: v.union(v.string(), v.null()),
+        value: v.string(),
+    },
+    handler: async (ctx, args) => {
+        await requireAdmin(ctx);
+
+        const current = await ctx.db
+            .query('kv')
+            .withIndex('by_workspace_name', (q) =>
+                q.eq('workspace_id', args.workspace_id).eq('name', args.key)
+            )
+            .first();
+        const currentValue = !current || current.deleted ? null : current.value ?? null;
+        if (currentValue !== args.expected_value) return false;
+
+        await applyServerAuthoredOp(ctx, args.workspace_id, {
+            table: 'kv',
+            operation: 'put',
+            pk: `${args.workspace_id}:${args.key}`,
+            payload: {
+                id: `${args.workspace_id}:${args.key}`,
+                name: args.key,
+                value: args.value,
+                deleted: false,
+            },
+        });
+        return true;
+    },
+});

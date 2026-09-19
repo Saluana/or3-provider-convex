@@ -162,6 +162,14 @@ bun run build:templates  # rebuild templates/convex.pack.json.gz
 bun run init             # run the scaffolder against the current directory
 ```
 
+`bun run type-check` checks the provider and every bundled Convex template with
+strict schema-derived document, context and function-reference types. Development
+checks use the sibling `or3-chat` checkout for host contracts, including relative
+shared imports used after installation. The declarations under
+`templates/convex/_generated/` support these checks; Convex codegen replaces them
+in an installed project. Rebuild the template pack after changing templates or
+their declarations.
+
 ## Troubleshooting
 
 - `convex dev --once` fails when `convex/` is missing or empty: run `bunx or3-provider-convex init` first.
@@ -204,3 +212,7 @@ bun run init             # run the scaffolder against the current directory
 | `src/runtime/utils/sync-history-gc-policy.ts` | Fail-closed history GC policy gate (snapshot-v1) |
 | `src/runtime/app/sync/convex-sync-provider.ts` | Client-side sync provider (direct mode) |
 | `src/runtime/app/storage/convex-storage-provider.ts` | Client-side storage provider (SSR-endpoint based) |
+
+### Atomic workspace settings
+
+The workspace settings store implements `compareAndSet(workspaceId, key, expectedValue, nextValue)` atomically. A `null` expected value means the key must be absent; a conflict returns `false` without overwriting it. The host uses this for concurrent plugin setup saves and persistent AI spend reservations. Deploy the updated Convex functions alongside the Convex adapter when using that provider.
