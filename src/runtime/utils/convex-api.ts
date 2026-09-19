@@ -27,6 +27,7 @@ export const convexApi = {
 export const convexInternalApi = {
     backgroundJobs: createNamespaceProxy('backgroundJobs'),
     connect: createNamespaceProxy('connect'),
+    hostSettings: createNamespaceProxy('hostSettings'),
     notifications: createNamespaceProxy('notifications'),
     rateLimits: createNamespaceProxy('rateLimits'),
     sync: createNamespaceProxy('sync'),
@@ -114,6 +115,10 @@ export const convexInternalApiContractNames = [
     'connect:rotateEnvironmentCredential',
     'connect:revokeEnvironment',
     'connect:saveEnvironmentRelayProgress',
+    'hostSettings:compareAndSetHostSetting',
+    'hostSettings:getHostSetting',
+    'hostSettings:getLegacyWorkspaceSetting',
+    'hostSettings:setHostSetting',
     'notifications:create',
     'notifications:getByUser',
     'notifications:markRead',

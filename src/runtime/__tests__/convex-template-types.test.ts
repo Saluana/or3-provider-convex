@@ -1,6 +1,6 @@
 import { expectTypeOf, it } from 'vitest';
 import type { FunctionArgs } from 'convex/server';
-import type { api } from '../../../templates/convex/_generated/api';
+import type { api, internal } from '../../../templates/convex/_generated/api';
 import type { Doc, Id } from '../../../templates/convex/_generated/dataModel';
 import type { MutationCtx, QueryCtx } from '../../../templates/convex/_generated/server';
 
@@ -11,6 +11,26 @@ it('derives template contexts, documents and handler arguments from the schema',
     expectTypeOf<FunctionArgs<typeof api.workspaces.setActive>>().toEqualTypeOf<{
         workspace_id: Id<'workspaces'>;
     }>();
+});
+
+it('types private host settings as internal functions on a dedicated table', () => {
+    expectTypeOf<Doc<'host_settings'>>().toMatchTypeOf<{
+        workspace_id: Id<'workspaces'>;
+        key: string;
+        value: string;
+        updated_at: number;
+    }>();
+    expectTypeOf<FunctionArgs<typeof internal.hostSettings.getHostSetting>>().toEqualTypeOf<{
+        workspace_id: Id<'workspaces'>;
+        key: string;
+    }>();
+    expectTypeOf<FunctionArgs<typeof internal.hostSettings.compareAndSetHostSetting>>()
+        .toEqualTypeOf<{
+            workspace_id: Id<'workspaces'>;
+            key: string;
+            expected_value: string | null;
+            value: string;
+        }>();
 });
 
 // This function is checked by tsc, never executed. These errors must remain

@@ -107,6 +107,54 @@ const MAX_PAYLOAD_SIZE_BYTES = 256 * 1024;
 const SYNC_READ_ROLES = new Set(['owner', 'editor', 'viewer'] as const);
 const SYNC_WRITE_ROLES: ReadonlySet<'owner' | 'editor' | 'viewer'> = new Set(['owner', 'editor']);
 
+/**
+ * Key families that were historically stored in the client-writable `kv`
+ * table but are host enforcement state. They now live in the private
+ * `host_settings` table, and ordinary sync must not recreate or delete copies
+ * that later code could mistake for authority.
+ */
+const RESERVED_KV_SETTING_KEYS: ReadonlySet<string> = new Set([
+    'admin.guest_access.enabled',
+]);
+const RESERVED_KV_SETTING_PREFIXES: readonly string[] = ['plugins.'];
+
+/**
+ * Setup values are private host-managed user data and the host migration
+ * copies them verbatim. Sync must not be able to seed a crafted setup document
+ * (including revision/operation metadata) before the first host read. Matches
+ * `plugin:<id>:setup-values` plus the digest- and operation-scoped variants;
+ * unknown `plugin:` keys are not part of the private namespace.
+ */
+function isReservedSetupValuesKey(key: string): boolean {
+    if (!key.startsWith('plugin:')) return false;
+    const rest = key.slice('plugin:'.length);
+    const separatorIndex = rest.indexOf(':');
+    if (separatorIndex <= 0) return false;
+    const suffix = rest.slice(separatorIndex + 1);
+    return suffix === 'setup-values' || suffix.startsWith('setup-values.');
+}
+
+function reservedKvSettingKey(op: SyncOperation): string | null {
+    if (op.table_name !== 'kv') return null;
+    const payload =
+        typeof op.payload === 'object' && op.payload !== null
+            ? (op.payload as Record<string, unknown>)
+            : undefined;
+    const candidates: string[] = [];
+    if (typeof payload?.name === 'string') candidates.push(payload.name);
+    const separatorIndex = op.pk.indexOf(':');
+    if (separatorIndex !== -1) candidates.push(op.pk.slice(separatorIndex + 1));
+    for (const candidate of candidates) {
+        if (!candidate) continue;
+        if (RESERVED_KV_SETTING_KEYS.has(candidate)) return candidate;
+        if (RESERVED_KV_SETTING_PREFIXES.some((prefix) => candidate.startsWith(prefix))) {
+            return candidate;
+        }
+        if (isReservedSetupValuesKey(candidate)) return candidate;
+    }
+    return null;
+}
+
 // ============================================================
 // HELPERS
 // ============================================================
@@ -705,6 +753,10 @@ function validateSyncOperation(
         return `op_id must be a UUID`;
     }
     if (!TABLE_INDEX_MAP[op.table_name]) return `Invalid table: ${op.table_name}`;
+    const reservedKey = reservedKvSettingKey(op);
+    if (reservedKey) {
+        return `Reserved host setting key: ${reservedKey}`;
+    }
 
     let serializedPayload: string | undefined;
     try {

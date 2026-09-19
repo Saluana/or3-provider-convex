@@ -17,14 +17,21 @@
  * mutation and query requests. It uses a session-based caching mechanism
  * (`__or3_super_admin_grant_done`) to avoid redundant deployment grants.
  *
+ * Workspace settings are different: they live in the private `host_settings`
+ * table and are always accessed with the deployment admin key as a trusted
+ * host-server identity. That keeps ordinary workspace users (including
+ * workspace owners) out of deployment-admin membership while the OR3 host
+ * route remains the business authorization boundary.
+ *
  * Constraints:
  * - Requires either `CLERK_SECRET_KEY` or `CONVEX_SELF_HOSTED_ADMIN_KEY` for auth.
- * - All mutations require an authenticated principal Kind of `super_admin`.
+ * - Access and admin-user mutations require an authenticated principal Kind of
+ *   `super_admin`; settings uses the admin key plus the `or3_server` marker.
  */
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
 import { createHmac } from 'crypto';
-import { convexApi as api } from '../../../utils/convex-api';
+import { convexApi as api, convexInternalApi as internalApi } from '../../../utils/convex-api';
 import type { GenericId as Id } from 'convex/values';
 import type {
     WorkspaceAccessStore,
@@ -304,30 +311,83 @@ export function createConvexWorkspaceAccessStore(
 }
 
 /**
+ * Builds the trusted host-server identity used for private host settings.
+ *
+ * Host settings are server-mediated: the OR3 host route checks the business
+ * authorization (`can()`), then storage primitives run with the deployment
+ * admin key. Ordinary workspace users never need deployment-admin membership.
+ */
+function buildHostSettingsServerIdentity() {
+    const issuer = 'https://or3.ai/auth/server';
+    return {
+        subject: 'or3-host-settings',
+        issuer,
+        tokenIdentifier: `${issuer}|or3-host-settings`,
+        or3_server: true,
+    };
+}
+
+/**
+ * Resolves the admin-key client used for the private host-settings table.
+ *
+ * Constraints:
+ * - Fails closed without `sync.convexAdminKey`; clients must never be able to
+ *   reach host enforcement state with their own token.
+ */
+function getConvexHostSettingsClient(event: H3Event) {
+    const config = useRuntimeConfig(event);
+    const adminKey = config.sync.convexAdminKey?.trim();
+    if (!adminKey) {
+        throw createError({
+            statusCode: 503,
+            statusMessage:
+                'Convex admin key is required for private workspace host settings',
+        });
+    }
+    return getConvexAdminGatewayClient(
+        event,
+        adminKey,
+        buildHostSettingsServerIdentity()
+    );
+}
+
+/**
  * Creates a WorkspaceSettingsStore implemented for Convex.
+ *
+ * All access goes through the private `host_settings` table using a trusted
+ * server identity, so a workspace editor's sync writes to the old `kv` table
+ * can never change enforcement state, and ordinary plugin users do not need
+ * deployment-admin membership.
  */
 export function createConvexWorkspaceSettingsStore(
     event: H3Event
 ): WorkspaceSettingsStore {
     return {
         async get(workspaceId, key) {
-            const client = await getConvexClientWithAuth(event);
-            return await client.query(api.admin.getWorkspaceSetting, {
+            const client = getConvexHostSettingsClient(event);
+            return await client.query(internalApi.hostSettings.getHostSetting, {
+                workspace_id: validateWorkspaceId(workspaceId),
+                key,
+            });
+        },
+        async getLegacy(workspaceId, key) {
+            const client = getConvexHostSettingsClient(event);
+            return await client.query(internalApi.hostSettings.getLegacyWorkspaceSetting, {
                 workspace_id: validateWorkspaceId(workspaceId),
                 key,
             });
         },
         async set(workspaceId, key, value) {
-            const client = await getConvexClientWithAuth(event);
-            await client.mutation(api.admin.setWorkspaceSetting, {
+            const client = getConvexHostSettingsClient(event);
+            await client.mutation(internalApi.hostSettings.setHostSetting, {
                 workspace_id: validateWorkspaceId(workspaceId),
                 key,
                 value,
             });
         },
         async compareAndSet(workspaceId, key, expectedValue, value) {
-            const client = await getConvexClientWithAuth(event);
-            return await client.mutation(api.admin.compareAndSetWorkspaceSetting, {
+            const client = getConvexHostSettingsClient(event);
+            return await client.mutation(internalApi.hostSettings.compareAndSetHostSetting, {
                 workspace_id: validateWorkspaceId(workspaceId),
                 key,
                 expected_value: expectedValue,

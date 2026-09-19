@@ -25,6 +25,15 @@ export default defineConfig({
                         'tests/fixtures/convex-table-metadata.ts'
                     );
                 }
+                if (
+                    source === '../shared/cloud/admin-identity' &&
+                    importer?.includes('/templates/convex/')
+                ) {
+                    return path.resolve(
+                        __dirname,
+                        '../or3-chat/shared/cloud/admin-identity.ts'
+                    );
+                }
             },
         },
     ],

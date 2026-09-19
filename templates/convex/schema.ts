@@ -405,6 +405,24 @@ export default defineSchema({
         .index('by_workspace_id', ['workspace_id', 'id']),
 
     /**
+     * Host settings - private, workspace-scoped host-enforcement state.
+     *
+     * This table is the trusted home for plugin enablement, consent reviews,
+     * access policy, setup revisions, AI spend reservations and similar
+     * authority. It is deliberately absent from sync push/pull, snapshots and
+     * `change_log`: only host-server identities may read or write it, and the
+     * OR3 host route remains the business authorization boundary.
+     *
+     * Never add this table to the sync table maps or syncAuthoring.
+     */
+    host_settings: defineTable({
+        workspace_id: v.id('workspaces'),
+        key: v.string(),
+        value: v.string(),
+        updated_at: v.number(),
+    }).index('by_workspace_key', ['workspace_id', 'key']),
+
+    /**
      * Notifications - user notification center entries
      */
     notifications: defineTable({

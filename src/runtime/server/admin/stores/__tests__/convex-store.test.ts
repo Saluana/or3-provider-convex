@@ -45,6 +45,12 @@ vi.mock('convex/server', () => ({
             softDeleteWorkspace: 'admin.softDeleteWorkspace',
             upsertWorkspaceMember: 'admin.upsertWorkspaceMember',
         },
+        hostSettings: {
+            compareAndSetHostSetting: 'hostSettings.compareAndSetHostSetting',
+            getHostSetting: 'hostSettings.getHostSetting',
+            getLegacyWorkspaceSetting: 'hostSettings.getLegacyWorkspaceSetting',
+            setHostSetting: 'hostSettings.setHostSetting',
+        },
     },
 }));
 
@@ -115,7 +121,7 @@ describe('createConvexWorkspaceAccessStore', () => {
         expect(resolveProviderToken).not.toHaveBeenCalled();
     });
 
-    it('uses the server-side compare-and-set mutation for setup revisions', async () => {
+    it('uses the private host-settings compare-and-set without admin membership', async () => {
         useRuntimeConfig.mockReturnValue({
             auth: { provider: 'clerk' },
             sync: { convexAdminKey: 'admin-key', convexUrl: 'https://example.convex.cloud' },
@@ -124,16 +130,60 @@ describe('createConvexWorkspaceAccessStore', () => {
         getConvexAdminGatewayClient.mockReturnValue({ mutation });
 
         const { createConvexWorkspaceSettingsStore } = await import('../convex-store');
-        const event = {
-            context: {
-                admin: { principal: { kind: 'super_admin', username: 'root' } },
-            },
-        } as any;
+        // A normal workspace editor: no admin principal, no provider token.
+        const event = { context: {} } as any;
         const store = createConvexWorkspaceSettingsStore(event);
         await expect(store.compareAndSet!('workspaces:123', 'setup', null, 'next')).resolves.toBe(true);
+        expect(getConvexAdminGatewayClient).toHaveBeenCalledTimes(1);
+        expect(resolveProviderToken).not.toHaveBeenCalled();
         expect(mutation).toHaveBeenCalledWith(
-            'admin.compareAndSetWorkspaceSetting',
+            'hostSettings.compareAndSetHostSetting',
             expect.objectContaining({ expected_value: null, value: 'next' })
         );
+        const identity = getConvexAdminGatewayClient.mock.calls[0]?.[2];
+        expect(identity).toMatchObject({ or3_server: true });
+    });
+
+    it('reads and writes private host settings and never touches the kv namespace', async () => {
+        useRuntimeConfig.mockReturnValue({
+            auth: { provider: 'clerk' },
+            sync: { convexAdminKey: 'admin-key', convexUrl: 'https://example.convex.cloud' },
+        });
+        const query = vi.fn().mockResolvedValue('stored');
+        const mutation = vi.fn().mockResolvedValue(undefined);
+        getConvexAdminGatewayClient.mockReturnValue({ query, mutation });
+
+        const { createConvexWorkspaceSettingsStore } = await import('../convex-store');
+        const store = createConvexWorkspaceSettingsStore({ context: {} } as any);
+
+        await expect(store.get('workspaces:123', 'plugins.enabled')).resolves.toBe('stored');
+        expect(query).toHaveBeenCalledWith(
+            'hostSettings.getHostSetting',
+            expect.objectContaining({ key: 'plugins.enabled' })
+        );
+        await store.set('workspaces:123', 'plugins.enabled', '[]');
+        expect(mutation).toHaveBeenCalledWith(
+            'hostSettings.setHostSetting',
+            expect.objectContaining({ key: 'plugins.enabled', value: '[]' })
+        );
+        await expect(store.getLegacy!('workspaces:123', 'plugins.enabled')).resolves.toBe('stored');
+        expect(query).toHaveBeenCalledWith(
+            'hostSettings.getLegacyWorkspaceSetting',
+            expect.objectContaining({ key: 'plugins.enabled' })
+        );
+    });
+
+    it('fails closed when no admin key is configured for private host settings', async () => {
+        useRuntimeConfig.mockReturnValue({
+            auth: { provider: 'clerk' },
+            sync: { convexAdminKey: '', convexUrl: 'https://example.convex.cloud' },
+        });
+
+        const { createConvexWorkspaceSettingsStore } = await import('../convex-store');
+        const store = createConvexWorkspaceSettingsStore({ context: {} } as any);
+        await expect(store.get('workspaces:123', 'plugins.enabled')).rejects.toMatchObject({
+            statusCode: 503,
+        });
+        expect(getConvexAdminGatewayClient).not.toHaveBeenCalled();
     });
 });

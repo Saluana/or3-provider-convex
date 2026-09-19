@@ -107,11 +107,13 @@ admin-authenticated mutations. Collection is bounded, requires the explicit
 `snapshot-v1` capability, and deletes only old revisions acknowledged by every
 registered device; fresh devices bootstrap from canonical snapshots.
 
-Server-authored notification, storage, and workspace-setting writes mint a
-fresh UUID `op_id` (never a `server:*` prefix), allocate `server_version`, and
-append `change_log`. Pull and watch skip historical non-UUID `op_id`s without
-failing the request. Pull responses include `oldestRetainedVersion` and
-`requiresSnapshot`. Direct subscribe advances the watch cursor after each page.
+Server-authored notification and storage writes mint a fresh UUID `op_id`
+(never a `server:*` prefix), allocate `server_version`, and append
+`change_log`. Host enforcement settings do not: they live in the private
+`host_settings` table and never enter sync, snapshots, or `change_log`. Pull
+and watch skip historical non-UUID `op_id`s without failing the request. Pull
+responses include `oldestRetainedVersion` and `requiresSnapshot`. Direct
+subscribe advances the watch cursor after each page.
 
 The provider exposes the shared materialized snapshot contract in both direct
 and gateway modes. The first page records one Convex server-version
@@ -139,7 +141,8 @@ The `init` command installs the Convex backend into `convex/`:
 - `snapshot.ts` — snapshot cursor/winner helpers shared with the contract fixtures
 - `storage.ts` — upload intents, `file_meta` commits, blob and deleted-file GC
 - `backgroundJobs.ts`, `rateLimits.ts`, `notifications.ts`, `webhooks.ts`, `connect.ts` — internal auxiliary persistence
-- `admin.ts` — admin queries/mutations with audit logging
+- `hostSettings.ts` — private, workspace-scoped host enforcement settings (plugin enablement, consent, access policy, setup revisions, AI spend ledger) with atomic compare-and-set
+- `admin.ts` — admin queries/mutations with audit logging (workspace settings bridge on private storage)
 - `crons.ts` — daily rate-limit cleanup cron
 - `syncHistoryGcPolicy.ts` — fail-closed retention gate (snapshot-v1)
 - `_generated/` — placeholder type stubs refreshed by `convex dev --once`; gitignore the generated files
@@ -213,6 +216,58 @@ their declarations.
 | `src/runtime/app/sync/convex-sync-provider.ts` | Client-side sync provider (direct mode) |
 | `src/runtime/app/storage/convex-storage-provider.ts` | Client-side storage provider (SSR-endpoint based) |
 
-### Atomic workspace settings
+### Private host settings
 
-The workspace settings store implements `compareAndSet(workspaceId, key, expectedValue, nextValue)` atomically. A `null` expected value means the key must be absent; a conflict returns `false` without overwriting it. The host uses this for concurrent plugin setup saves and persistent AI spend reservations. Deploy the updated Convex functions alongside the Convex adapter when using that provider.
+Security-sensitive workspace settings do not use the client-syncable `kv`
+table. They live in `host_settings`, a workspace-scoped private table that is
+excluded from sync push/pull, snapshots, and `change_log`. `sync.push` also
+rejects reserved key families (`plugins.*`, `admin.guest_access.enabled`, and
+`plugin:<id>:setup-values*`) so a workspace editor cannot even plant a copy in
+`kv` for later code or migration to trust.
+
+The workspace settings store implements
+`compareAndSet(workspaceId, key, expectedValue, nextValue)` atomically. A `null`
+expected value means the key must be absent; a conflict returns `false` without
+overwriting it. The host uses this for concurrent plugin setup saves and
+persistent AI spend reservations.
+
+Access model:
+
+- The `hostSettings.*` functions are Convex-internal and accept only a trusted
+  host-server identity (Convex admin key plus the `or3_server` marker), not
+  ordinary client tokens. The OR3 host route stays the business authorization
+  boundary, and workspace owners/editors never need deployment-admin
+  membership to use plugins.
+- The adapter fails closed when `CONVEX_SELF_HOSTED_ADMIN_KEY` is missing.
+- `admin.getWorkspaceSetting`/`setWorkspaceSetting`/`compareAndSetWorkspaceSetting`
+  are kept for the deployment-admin bridge and now read/write the same private
+  table.
+
+Legacy migration: `getLegacyWorkspaceSetting` lets the host inspect old `kv`
+values, and the host policy decides what may be copied. User setup values and
+the AI spend ledger (byte-for-byte, so an active window cannot reset) migrate;
+plugin enablement, consent reviews, access policy, migration state, and guest
+access are **not** copied — they must be re-established through trusted host
+paths, with fresh approval where required.
+
+Upgrading an existing deployment: run `bunx or3-provider-convex init --update`.
+It adds the new `hostSettings.ts`, but it never overwrites existing template
+files — it reports them as conflicts. You **must** merge all of the following
+from the provider templates before deploying, or the upgrade is incomplete:
+
+1. `schema.ts` — the `host_settings` table definition.
+2. `sync.ts` — the reserved-key guard that blocks editor sync writes to
+   `plugins.*`, `admin.guest_access.enabled`, and the `plugin:<id>:setup-values*`
+   namespace. Without this merge, reserved KV writes stay enabled.
+3. `admin.ts` — the deployment-admin settings bridge on private storage.
+   Without this merge, admin settings still read/write the old client-writable
+   `kv` table.
+4. `workspaces.ts` — the `host_settings` cleanup in `deleteWorkspaceData`.
+   Without this merge, hard-deleting a workspace retains its plugin
+   configuration, consent reviews, and budget records.
+
+Do not rely on `init --update` to apply these. Review each reported conflict
+against the bundled template and merge it deliberately (or scaffold fresh with
+`--force`). Then run `bunx convex dev --once` (or deploy) before using the new
+server adapter. The adapter calls the new functions and must not be deployed
+ahead of them.

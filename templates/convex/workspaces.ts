@@ -269,6 +269,7 @@ async function deleteWorkspaceData(ctx: MutationCtx, workspaceId: Id<'workspaces
     await deleteByIndexBatched('projects', 'by_workspace_id');
     await deleteByIndexBatched('posts', 'by_workspace_id');
     await deleteByIndexBatched('kv', 'by_workspace_name');
+    await deleteByIndexBatched('host_settings', 'by_workspace_key');
     await deleteByIndexBatched('file_meta', 'by_workspace_hash');
     await deleteByIndexBatched('notifications', 'by_workspace');
     await deleteByIndexBatched('sync_snapshot_sessions', 'by_workspace');

@@ -24,7 +24,7 @@ import { mutation, query, type MutationCtx, type QueryCtx } from './_generated/s
 import { v } from 'convex/values';
 import type { Id } from './_generated/dataModel';
 import { ADMIN_IDENTITY_ISSUER } from '../shared/cloud/admin-identity';
-import { applyServerAuthoredOp } from './syncAuthoring';
+import { readHostSettingValue, writeHostSettingValue } from './hostSettings';
 
 // ============================================================
 // CONSTANTS
@@ -997,7 +997,10 @@ export const removeWorkspaceMember = mutation({
  * `admin.getWorkspaceSetting` (query)
  *
  * Purpose:
- * Retrieves a workspace-scoped KV setting.
+ * Retrieves a workspace-scoped private host setting for deployment admins.
+ *
+ * @deprecated Runtime callers use `hostSettings.getHostSetting`, which is
+ * server-mediated and does not require deployment-admin membership.
  */
 export const getWorkspaceSetting = query({
     args: {
@@ -1008,15 +1011,7 @@ export const getWorkspaceSetting = query({
         // Verify caller is an admin
         await requireAdmin(ctx);
 
-        const entry = await ctx.db
-            .query('kv')
-            .withIndex('by_workspace_name', (q) =>
-                q.eq('workspace_id', args.workspace_id).eq('name', args.key)
-            )
-            .first();
-
-        if (!entry || entry.deleted) return null;
-        return entry.value ?? null;
+        return await readHostSettingValue(ctx, args.workspace_id, args.key);
     },
 });
 
@@ -1024,7 +1019,10 @@ export const getWorkspaceSetting = query({
  * `admin.setWorkspaceSetting` (mutation)
  *
  * Purpose:
- * Writes a workspace-scoped KV setting and clears deletion flags.
+ * Writes a workspace-scoped private host setting for deployment admins.
+ *
+ * @deprecated Runtime callers use `hostSettings.setHostSetting`, which is
+ * server-mediated and does not require deployment-admin membership.
  */
 export const setWorkspaceSetting = mutation({
     args: {
@@ -1036,17 +1034,7 @@ export const setWorkspaceSetting = mutation({
         // Verify caller is an admin
         await requireAdmin(ctx);
 
-        await applyServerAuthoredOp(ctx, args.workspace_id, {
-            table: 'kv',
-            operation: 'put',
-            pk: `${args.workspace_id}:${args.key}`,
-            payload: {
-                id: `${args.workspace_id}:${args.key}`,
-                name: args.key,
-                value: args.value,
-                deleted: false,
-            },
-        });
+        await writeHostSettingValue(ctx, args.workspace_id, args.key, args.value);
     },
 });
 
@@ -1054,6 +1042,8 @@ export const setWorkspaceSetting = mutation({
  * Atomically write a workspace setting only when its current value equals the
  * caller's expected value. Convex mutations are serializable, so the read and
  * conditional write cannot be interleaved by another instance.
+ *
+ * @deprecated Runtime callers use `hostSettings.compareAndSetHostSetting`.
  */
 export const compareAndSetWorkspaceSetting = mutation({
     args: {
@@ -1065,26 +1055,14 @@ export const compareAndSetWorkspaceSetting = mutation({
     handler: async (ctx, args) => {
         await requireAdmin(ctx);
 
-        const current = await ctx.db
-            .query('kv')
-            .withIndex('by_workspace_name', (q) =>
-                q.eq('workspace_id', args.workspace_id).eq('name', args.key)
-            )
-            .first();
-        const currentValue = !current || current.deleted ? null : current.value ?? null;
+        const currentValue = await readHostSettingValue(
+            ctx,
+            args.workspace_id,
+            args.key
+        );
         if (currentValue !== args.expected_value) return false;
 
-        await applyServerAuthoredOp(ctx, args.workspace_id, {
-            table: 'kv',
-            operation: 'put',
-            pk: `${args.workspace_id}:${args.key}`,
-            payload: {
-                id: `${args.workspace_id}:${args.key}`,
-                name: args.key,
-                value: args.value,
-                deleted: false,
-            },
-        });
+        await writeHostSettingValue(ctx, args.workspace_id, args.key, args.value);
         return true;
     },
 });
