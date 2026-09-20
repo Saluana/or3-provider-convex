@@ -271,3 +271,13 @@ against the bundled template and merge it deliberately (or scaffold fresh with
 `--force`). Then run `bunx convex dev --once` (or deploy) before using the new
 server adapter. The adapter calls the new functions and must not be deployed
 ahead of them.
+
+
+### Testing local changes in OR3 Chat
+
+With this repository beside `or3-chat`, run `bun install` here once, then
+`bun run dev:ssr` from Chat. Chat's dev wrapper rebuilds the local provider and
+prints its selected path; restart it after provider edits. Missing repositories
+or failed builds fall back to installed packages with a warning.
+`OR3_LOCAL_PROVIDERS=false` disables local selection. Production builds use the
+installed package, so local development does not publish these changes.
