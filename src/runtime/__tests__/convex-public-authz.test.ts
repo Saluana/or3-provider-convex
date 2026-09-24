@@ -927,7 +927,7 @@ describe('Convex authorization boundary', () => {
         expect(sync).toContain('isChangeVisibleToUser(');
         expect(sync).toContain('export const gcTombstones = internalMutation({');
         expect(sync).toContain('export const gcChangeLog = internalMutation({');
-        expect(backgroundJobs.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(17);
+        expect(backgroundJobs.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(19);
         expect(backgroundJobs).not.toContain("args.user_id !== '*'");
         expect(notifications.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
         expect(rateLimits.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);

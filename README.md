@@ -153,6 +153,10 @@ The `init` command installs the Convex backend into `convex/`:
 - **Storage** — The client storage provider calls `/api/storage/*` SSR endpoints that proxy Convex upload URL generation, commit, and signed URLs. Uploads are reserved via upload intents; download URLs require live canonical `file_meta` with a storage ID (soft-deleted/pending rows return no URL); quota and GC read only canonical `file_meta` + message/post `file_hashes` pages.
 - **Generic files** — The host admits them only with its explicit `allowAnyFileType` setting and applies the canonical attachment/octet-stream download policy. Gateway clients advertise the typed file-kind `v1` capability; older readers and writers receive an explicit HTTP 426 update boundary before generic metadata or bytes cross the gateway. Convex signed URLs do not support response-header overrides, so deployments needing provider-enforced `Content-Disposition`/MIME headers should use filesystem or S3 storage.
 - **Internal persistence** (background jobs, notifications, webhooks, rate limits, connect) is invoked only by admin-authenticated server adapters; the underlying Convex functions are internal-only.
+- **Mixed-runtime tools** — Internal atomic claim/settle mutations assign each
+  browser-only call to one tab while Convex keeps the server job parked.
+  Settling the result releases the lease and resumes the same model turn.
+  Parked handoffs have separate global and per-user admission caps.
 
 ## Development
 

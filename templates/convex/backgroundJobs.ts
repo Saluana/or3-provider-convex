@@ -194,18 +194,31 @@ export const create = internalMutation({
                 completed_at: Date.now(),
             });
         }
-        if (recoverable.length >= args.max_concurrent_jobs) {
+        const runnable = recoverable.filter(
+            (job) => !job.execution?.clientToolCall
+        );
+        const parked = recoverable.filter(
+            (job) => Boolean(job.execution?.clientToolCall)
+        );
+        if (runnable.length >= args.max_concurrent_jobs) {
             throw new Error(
                 `Max concurrent background jobs reached (${args.max_concurrent_jobs})`
             );
         }
-        const activeForUser = recoverable.filter(
+        const activeForUser = runnable.filter(
             (job) => job.user_id === args.user_id
         ).length;
         if (activeForUser >= args.max_concurrent_jobs_per_user) {
             throw new Error(
                 `Max concurrent background jobs per user reached (${args.max_concurrent_jobs_per_user})`
             );
+        }
+        if (
+            parked.length >= args.max_concurrent_jobs ||
+            parked.filter((job) => job.user_id === args.user_id).length >=
+                args.max_concurrent_jobs_per_user
+        ) {
+            throw new Error('Maximum pending browser tool handoffs reached');
         }
 
         const now = Date.now();
@@ -581,6 +594,7 @@ export const claim = internalMutation({
             !job ||
             job.status !== 'streaming' ||
             job.execution === undefined ||
+            job.execution.clientToolCall !== undefined ||
             (job.history_phase ?? 'ready') !== 'ready' ||
             (job.lease_owner !== undefined &&
                 (job.lease_expires_at ?? 0) > now)
@@ -614,6 +628,7 @@ export const claimNext = internalMutation({
         const job = candidates.find(
             (candidate) =>
                 candidate.execution !== undefined &&
+                candidate.execution.clientToolCall === undefined &&
                 (candidate.history_phase ?? 'ready') === 'ready' &&
                 (candidate.lease_owner === undefined ||
                     (candidate.lease_expires_at ?? 0) <= now)
@@ -677,6 +692,93 @@ export const updateExecution = internalMutation({
         await ctx.db.patch(job._id, {
             execution: args.execution,
             last_activity_at: Date.now()
+        });
+        return true;
+    },
+});
+
+/** Claim a browser-only tool call so competing tabs cannot execute it twice. */
+export const claimClientTool = internalMutation({
+    args: {
+        job_id: v.id('background_jobs'),
+        user_id: v.string(),
+        call_id: v.string(),
+        claim_token: v.string(),
+        claim_expires_at: v.number(),
+    },
+    handler: async (ctx, args) => {
+        const now = Date.now();
+        const job = await ctx.db.get(args.job_id);
+        const execution = job?.execution as any;
+        const pending = execution?.clientToolCall;
+        if (
+            !job ||
+            job.user_id !== args.user_id ||
+            job.status !== 'streaming' ||
+            !pending ||
+            pending.callId !== args.call_id ||
+            (pending.claimToken && (pending.claimExpiresAt ?? 0) > now)
+        ) return null;
+        const nextExecution = {
+            ...execution,
+            clientToolCall: {
+                ...pending,
+                claimToken: args.claim_token,
+                claimExpiresAt: args.claim_expires_at,
+            },
+        };
+        await ctx.db.patch(job._id, {
+            execution: nextExecution,
+            last_activity_at: now,
+        });
+        return {
+            id: job._id,
+            userId: job.user_id,
+            threadId: job.thread_id,
+            messageId: job.message_id,
+            model: job.model,
+            status: job.status,
+            content: job.content,
+            reasoning: job.reasoning ?? '',
+            chunksReceived: job.chunks_received,
+            startedAt: job.started_at,
+            lastActivityAt: now,
+            tool_calls: job.tool_calls,
+            execution: nextExecution,
+            attempts: job.attempts ?? 0,
+        };
+    },
+});
+
+/** Accept a claimed browser result and release the parked server lease. */
+export const settleClientTool = internalMutation({
+    args: {
+        job_id: v.id('background_jobs'),
+        user_id: v.string(),
+        call_id: v.string(),
+        claim_token: v.string(),
+        execution: v.any(),
+        tool_calls: v.any(),
+    },
+    handler: async (ctx, args) => {
+        const now = Date.now();
+        const job = await ctx.db.get(args.job_id);
+        const pending = (job?.execution as any)?.clientToolCall;
+        if (
+            !job ||
+            job.user_id !== args.user_id ||
+            job.status !== 'streaming' ||
+            !pending ||
+            pending.callId !== args.call_id ||
+            pending.claimToken !== args.claim_token ||
+            (pending.claimExpiresAt ?? 0) <= now
+        ) return false;
+        await ctx.db.patch(job._id, {
+            execution: args.execution,
+            tool_calls: args.tool_calls,
+            lease_owner: undefined,
+            lease_expires_at: undefined,
+            last_activity_at: now,
         });
         return true;
     },
@@ -831,7 +933,7 @@ export const cleanup = internalMutation({
  * `backgroundJobs.getActiveCount` (internal query)
  *
  * Purpose:
- * Returns the number of currently streaming jobs.
+ * Returns the number of worker-active jobs; browser handoffs have no worker lease.
  */
 export const getActiveCount = internalQuery({
     args: {},
@@ -841,7 +943,7 @@ export const getActiveCount = internalQuery({
             .withIndex('by_status', (q) => q.eq('status', 'streaming'))
             .collect();
 
-        return jobs.length;
+        return jobs.filter((job) => !job.execution?.clientToolCall).length;
     },
 });
 

@@ -312,6 +312,49 @@ export const convexJobProvider: BackgroundJobProvider = {
         );
     },
 
+    async claimClientToolCall(
+        jobId,
+        userId,
+        callId,
+        claimToken,
+        claimExpiresAt
+    ) {
+        const client = getClient();
+        const job = await client.mutation(
+            internalApi.backgroundJobs.claimClientTool,
+            {
+                job_id: jobId as Id<'background_jobs'>,
+                user_id: userId,
+                call_id: callId,
+                claim_token: claimToken,
+                claim_expires_at: claimExpiresAt,
+            }
+        );
+        return job ? toBackgroundJob(job) : null;
+    },
+
+    async settleClientToolCall(
+        jobId,
+        userId,
+        callId,
+        claimToken,
+        execution,
+        toolCalls
+    ) {
+        const client = getClient();
+        return await client.mutation(
+            internalApi.backgroundJobs.settleClientTool,
+            {
+                job_id: jobId as Id<'background_jobs'>,
+                user_id: userId,
+                call_id: callId,
+                claim_token: claimToken,
+                execution,
+                tool_calls: toolCalls ?? [],
+            }
+        );
+    },
+
     async getPendingHistoryJobs(limit) {
         const client = getClient();
         const jobs = await client.query(

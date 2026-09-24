@@ -20,8 +20,10 @@ vi.mock('../../../utils/convex-api', () => ({
             checkAborted: 'backgroundJobs.checkAborted',
             claim: 'backgroundJobs.claim',
             claimNext: 'backgroundJobs.claimNext',
+            claimClientTool: 'backgroundJobs.claimClientTool',
             renewLease: 'backgroundJobs.renewLease',
             updateExecution: 'backgroundJobs.updateExecution',
+            settleClientTool: 'backgroundJobs.settleClientTool',
             cleanup: 'backgroundJobs.cleanup',
             getActiveCount: 'backgroundJobs.getActiveCount',
             requestAdmissionCancel: 'backgroundJobs.requestAdmissionCancel',
@@ -184,5 +186,52 @@ describe('convex background job provider', () => {
                 leaseOwner: 'worker-old',
             })
         ).rejects.toMatchObject({ name: 'BackgroundJobLeaseLostError' });
+    });
+
+    it('claims and settles browser tool calls through atomic mutations', async () => {
+        mutation
+            .mockResolvedValueOnce({
+                id: 'job-1',
+                userId: 'user-1',
+                threadId: 'thread-1',
+                messageId: 'message-1',
+                model: 'test-model',
+                status: 'streaming',
+                content: '',
+                chunksReceived: 0,
+                startedAt: 1,
+                execution: { clientToolCall: { callId: 'call-1' } },
+            })
+            .mockResolvedValueOnce(true);
+
+        await expect(
+            convexJobProvider.claimClientToolCall?.(
+                'job-1',
+                'user-1',
+                'call-1',
+                'token-1',
+                40
+            )
+        ).resolves.toMatchObject({ id: 'job-1' });
+        await expect(
+            convexJobProvider.settleClientToolCall?.(
+                'job-1',
+                'user-1',
+                'call-1',
+                'token-1',
+                { version: 1, body: {}, workspaceId: 'ws-1', referer: '', apiKeyCiphertext: '' },
+                [{ id: 'call-1', name: 'client_tool', status: 'complete' }]
+            )
+        ).resolves.toBe(true);
+        expect(mutation).toHaveBeenNthCalledWith(
+            1,
+            'backgroundJobs.claimClientTool',
+            expect.objectContaining({ call_id: 'call-1', claim_token: 'token-1' })
+        );
+        expect(mutation).toHaveBeenNthCalledWith(
+            2,
+            'backgroundJobs.settleClientTool',
+            expect.objectContaining({ call_id: 'call-1', claim_token: 'token-1' })
+        );
     });
 });
