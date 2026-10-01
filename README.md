@@ -230,10 +230,12 @@ rejects reserved key families (`plugins.*`, `admin.guest_access.enabled`, and
 `kv` for later code or migration to trust.
 
 The workspace settings store implements
-`compareAndSet(workspaceId, key, expectedValue, nextValue)` atomically. A `null`
+`compareAndSet(workspaceId, key, expectedValue, nextValue)` atomically. Bulk plugin rollout requires this operation for workspace enablement and reviewed permissions so a concurrent workspace choice is not overwritten. A `null`
 expected value means the key must be absent; a conflict returns `false` without
 overwriting it. The host uses this for concurrent plugin setup saves and
-persistent AI spend reservations.
+persistent AI spend reservations. A slow plugin write may outlive the HTTP
+response: the host reports pending after eight seconds and keeps the plugin
+lock until the atomic mutation settles.
 
 Access model:
 
