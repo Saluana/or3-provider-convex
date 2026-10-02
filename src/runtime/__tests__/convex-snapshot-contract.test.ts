@@ -1,9 +1,31 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { getFunctionName } from "convex/server";
 import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { verifySyncContract } from "~~/shared/testing/contracts/sync";
 import { compareSyncRevision } from "~~/shared/sync/revision";
 import { ChangeStampSchema } from "~~/shared/sync/schemas";
+import { readRequestUsage } from "~~/shared/chat/compaction";
+import templateSchema from "../../../templates/convex/schema";
+import { convexJobProvider } from "../server/background-jobs/convex-provider";
+import { ConvexSyncGatewayAdapter } from "../server/sync/convex-sync-gateway-adapter";
+import { reconcileBackgroundJobHistory } from "~~/server/utils/background-jobs/history";
+
+const localTransport = vi.hoisted(() => ({
+  query: vi.fn(), mutation: vi.fn(), adapter: undefined as any,
+}));
+vi.mock("../server/utils/convex-client", () => ({ getConvexClient: () => localTransport }));
+vi.mock("~~/server/utils/background-jobs/store", () => ({
+  getJobConfig: () => ({ maxConcurrentJobs: 20, maxConcurrentJobsPerUser: 5 }),
+}));
+vi.mock("~~/server/sync/gateway/registry", () => ({ getSyncGatewayAdapter: () => localTransport.adapter }));
+vi.mock("~~/server/auth/token-broker/resolve", () => ({ resolveProviderToken: async () => "fixture-token" }));
+vi.mock("~~/server/auth/session", () => ({ resolveSessionContext: async () => ({ authenticated: false }) }));
+vi.mock("~~/server/utils/webhooks/runtime", () => ({ emitWebhookSystemHook: async () => undefined }));
+vi.mock("../server/utils/convex-gateway", () => ({
+  getConvexGatewayClient: () => localTransport, getConvexAdminGatewayClient: () => localTransport,
+  buildGatewayAdminIdentity: () => ({}),
+}));
 
 const syncFunctions = await import(
   /* @vite-ignore */ new URL(
@@ -17,9 +39,14 @@ const notificationFunctions = await import(
     import.meta.url,
   ).href
 );
+const backgroundJobFunctions = await import(
+  /* @vite-ignore */ new URL("../../../templates/convex/backgroundJobs.ts", import.meta.url).href
+);
 
 type RegisteredFunction = {
   _handler: (ctx: any, args: any) => Promise<any>;
+  exportArgs: () => string;
+  isInternal?: boolean;
 };
 
 type Row = Record<string, any> & { _id: string };
@@ -90,6 +117,10 @@ class MemoryQuery {
 
   async first(): Promise<Row | null> {
     return this.materialize()[0] ?? null;
+  }
+
+  async collect(): Promise<Row[]> {
+    return this.materialize();
   }
 
   async take(count: number): Promise<Row[]> {
@@ -267,6 +298,314 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
   };
   return { ctx, tables, takeCounts };
 }
+
+// Failure modes: transport allowlists, template storage/projections, and finalizer
+// field picking can each lose usage. Recovery must discard an uncheckpointed
+// measurement; invalid optional metadata cannot fail text or weaken ownership.
+// This executes production handlers with the existing in-memory DB fixture; it
+// does not emulate Convex's deployed transaction/validator execution engine.
+function measuredUsage(prompt_tokens = 400, iteration = 2) {
+  return {
+    prompt_tokens, completion_tokens: 12, model: "test-model",
+    request_id: `request-${iteration}`, iteration, measured_at: 123,
+    prefix_message_count: 4, prefix_hash: `prefix-${iteration}`,
+    configuration_hash: "configuration", input_estimate_tokens: prompt_tokens - 10,
+  };
+}
+
+async function createUsageJob(fixture: ReturnType<typeof createFixture>) {
+  const created = await (backgroundJobFunctions.create as RegisteredFunction)._handler(fixture.ctx, {
+    user_id: "user-1", thread_id: "thread-a", message_id: "message-1", model: "test-model",
+    generation_id: "generation-1", sync_provider_id: "convex", history_phase: "ready",
+    execution: { version: 1, workspaceId: "ws-1", body: {}, contentBase: "base", reasoningBase: "base reason" },
+    max_concurrent_jobs: 20, max_concurrent_jobs_per_user: 5,
+  });
+  return created.jobId as string;
+}
+
+function finalizationInput(usage: unknown = measuredUsage()) {
+  return {
+    workspace_id: "ws-1", actor_user_id: "user-1", generation_id: "generation-1",
+    message_id: "message-1", admission_clock: 1, fingerprint: "terminal-fingerprint",
+    device_id: "background:generation-1", op_id: uuidOp("finalize-usage"),
+    snapshot: { status: "complete", content: "final text", reasoning: "final reasoning", usage,
+      toolCalls: [{ name: "lookup", status: "complete" }], completedAt: 2000 },
+  };
+}
+
+describe("Convex background request usage persistence", () => {
+  it.each(["complete", "error", "aborted"] as const)("reconciles %s provider usage through the immutable host and actual gateway/finalizer/second-client pull", async (status) => {
+    const fixture = createFixture("editor");
+    fixture.tables.messages[0]!.data = { generation_id: "generation-1", custom: "keep", compaction: { marker: "keep" } };
+    const route = async (reference: any, args: any) => {
+      const [namespace, name] = getFunctionName(reference).split(":");
+      const module = namespace === "backgroundJobs" ? backgroundJobFunctions : syncFunctions;
+      // Model the JSON transport boundary, preserving no shared object identity.
+      const result = await (module[name!] as RegisteredFunction)._handler(fixture.ctx, JSON.parse(JSON.stringify(args)));
+      return result === undefined ? undefined : JSON.parse(JSON.stringify(result));
+    };
+    localTransport.query.mockImplementation(route);
+    localTransport.mutation.mockImplementation(route);
+    const adapter = new ConvexSyncGatewayAdapter();
+    localTransport.adapter = adapter;
+    const admission = {
+      version: 1 as const, kind: "new-turn" as const, admissionId: "admission-1", generationId: "generation-1",
+      workspaceId: "ws-1", threadId: "thread-a", messageId: "message-1",
+      thread: { id: "thread-a", clock: 1 },
+      assistantMessage: { id: "message-1", thread_id: "thread-a", role: "assistant", clock: 1,
+        data: { generation_id: "generation-1" } },
+      userMessage: { id: "user-message", thread_id: "thread-a", role: "user", clock: 1 },
+    };
+    const jobId = await convexJobProvider.createJob({
+      userId: "user-1", threadId: "thread-a", messageId: "message-1", model: "test-model",
+      generationId: "generation-1", syncProviderId: "convex", historyPhase: "ready",
+      execution: { version: 1, body: {}, workspaceId: "ws-1", referer: "", apiKeyCiphertext: "fixture-only", history: admission },
+    });
+    for (const usage of [measuredUsage(150, 1), measuredUsage(), measuredUsage()]) {
+      await convexJobProvider.updateJob(jobId, { usage });
+    }
+    expect((await convexJobProvider.getJob(jobId, "user-1"))?.usage).toEqual(measuredUsage());
+    await convexJobProvider.saveTerminalSnapshot!(jobId, {
+      status, content: "final text", reasoning: "reason", usage: measuredUsage(), completedAt: 2000,
+    });
+    const pending = (await convexJobProvider.getPendingHistoryJobs!(10))[0]!;
+    expect(await reconcileBackgroundJobHistory(convexJobProvider, pending)).toBe("committed");
+    const job = (await convexJobProvider.getJob(jobId, "user-1"))!;
+    expect(job).toMatchObject({ usage: measuredUsage(), historyPhase: "committed" });
+    expect(await reconcileBackgroundJobHistory(convexJobProvider, job)).toBe("unchanged");
+    fixture.tables.auth_accounts.push({ _id: "account-2", provider: "clerk", provider_user_id: "subject-2", user_id: "user-2" });
+    fixture.tables.workspace_members.push({ _id: "member-2", workspace_id: "ws-1", user_id: "user-2", role: "viewer" });
+    fixture.ctx.auth.getUserIdentity = async () => ({ subject: "subject-2", issuer: "https://clerk.example.test" });
+    const pulled = await adapter.pull({ context: {}, node: { req: { headers: {} } } } as any,
+      { scope: { workspaceId: "ws-1" }, cursor: 5, limit: 10 });
+    expect(pulled.changes[0]?.payload).toMatchObject({ data: {
+      usage: measuredUsage(), content: "final text", custom: "keep", compaction: { marker: "keep" }, generation_id: "generation-1",
+    } });
+    expect(fixture.tables.change_log).toHaveLength(1);
+    expect(await convexJobProvider.getPendingHistoryJobs!(10)).toEqual([]);
+    fixture.tables.workspace_members = fixture.tables.workspace_members.filter((row) => row.user_id !== "user-2");
+    await expect(adapter.pull({ context: {}, node: { req: { headers: {} } } } as any,
+      { scope: { workspaceId: "ws-1" }, cursor: 5, limit: 10 })).rejects.toThrow("Forbidden");
+  });
+
+  it("registers optional measurement arguments and a legacy-compatible structured stored field", () => {
+    for (const name of ["update", "saveTerminalSnapshot"]) {
+      const fn = backgroundJobFunctions[name] as RegisteredFunction;
+      expect(fn.isInternal).toBe(true);
+      // The input is deliberately permissive so malformed usage can be ignored.
+      expect(JSON.parse(fn.exportArgs()).value.usage).toEqual({ fieldType: { type: "any" }, optional: true });
+    }
+    const field = (templateSchema.tables.background_jobs as any).export().documentType.value.usage;
+    expect(field?.optional).toBe(true);
+    expect(field?.fieldType.type).toBe("object");
+    expect(Object.keys(field?.fieldType.value ?? {}).sort()).toEqual(Object.keys(measuredUsage()).sort());
+    for (const [key, value] of Object.entries(measuredUsage())) {
+      expect(field.fieldType.value[key]).toEqual({ fieldType: { type: typeof value === "number" ? "number" : "string" }, optional: false });
+    }
+  });
+
+  it("matches the host normalizer for valid, missing, malformed and extra-field measurements", async () => {
+    const helper = await import(/* @vite-ignore */ new URL("../../../templates/convex/requestUsage.ts", import.meta.url).href);
+    for (const value of [undefined, null, {}, [], measuredUsage(), { ...measuredUsage(), extra: "discard" },
+      ...["prompt_tokens", "completion_tokens", "iteration", "measured_at", "prefix_message_count", "input_estimate_tokens"]
+        .flatMap((key) => [-1, NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1, "4", undefined]
+          .map((invalid) => ({ ...measuredUsage(), [key]: invalid }))),
+      ...["model", "request_id", "prefix_hash", "configuration_hash"]
+        .flatMap((key) => ["", 4, undefined].map((invalid) => ({ ...measuredUsage(), [key]: invalid }))),
+      { ...measuredUsage(), prompt_tokens: 0, completion_tokens: 0 },
+    ]) expect(helper.readRequestUsage(value)).toEqual(readRequestUsage(value));
+  });
+
+  it.each(["complete", "error", "aborted"])("retains request 400 rather than 150 + 400 through %s and reconnect reads", async (status) => {
+    const fixture = createFixture("editor");
+    const jobId = await createUsageJob(fixture);
+    for (const usage of [measuredUsage(150, 1), measuredUsage(), measuredUsage()]) {
+      await (backgroundJobFunctions.update as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, usage });
+    }
+    expect(fixture.tables.background_jobs![0]!.usage).toEqual(measuredUsage());
+    await (backgroundJobFunctions.saveTerminalSnapshot as RegisteredFunction)._handler(fixture.ctx, {
+      job_id: jobId, status, content: "final", reasoning: "reason", usage: measuredUsage(), completed_at: 2000,
+      error: status === "error" ? "upstream failure" : undefined,
+    });
+    // Serialize the fixture's durable rows before a fresh production read.
+    fixture.tables.background_jobs = JSON.parse(JSON.stringify(fixture.tables.background_jobs));
+    const job = await (backgroundJobFunctions.get as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, user_id: "user-1" });
+    expect(job).toMatchObject({ status, usage: measuredUsage(), reasoning: "reason" });
+    expect(job.generation_id ?? job.generationId).toBe("generation-1");
+    const pending = await (backgroundJobFunctions.listPendingHistory as RegisteredFunction)._handler(fixture.ctx, { limit: 10 });
+    expect(pending[0].usage).toEqual(measuredUsage());
+    expect(await (backgroundJobFunctions.get as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, user_id: "other-user" })).toBeNull();
+    expect(await (backgroundJobFunctions.update as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, usage: measuredUsage(150, 1) })).toBe(false);
+    expect(fixture.tables.background_jobs![0]!.usage).toEqual(measuredUsage());
+  });
+
+  it("ignores missing/malformed usage, preserves existing measurements, and never manufactures zero", async () => {
+    const fixture = createFixture("editor");
+    const jobId = await createUsageJob(fixture);
+    for (const usage of [undefined, { prompt_tokens: 0 }, { ...measuredUsage(), prompt_tokens: -1 }]) {
+      expect(await (backgroundJobFunctions.update as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, usage, content_chunk: "ok" })).toBe(true);
+    }
+    expect(fixture.tables.background_jobs![0]!.usage).toBeUndefined();
+    await (backgroundJobFunctions.update as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, usage: measuredUsage() });
+    await (backgroundJobFunctions.saveTerminalSnapshot as RegisteredFunction)._handler(fixture.ctx, {
+      job_id: jobId, status: "complete", content: "valid", reasoning: "", usage: { prompt_tokens: -1 }, completed_at: 2000,
+    });
+    expect(fixture.tables.background_jobs![0]!).toMatchObject({ content: "valid", usage: measuredUsage() });
+  });
+
+  it.each(["claim", "claimNext"])("%s restores checkpoint usage and fences stale workers", async (claimName) => {
+    const fixture = createFixture("editor");
+    const jobId = await createUsageJob(fixture);
+    const claim = (backgroundJobFunctions[claimName] as RegisteredFunction)._handler;
+    const first = await claim(fixture.ctx, { job_id: jobId, lease_owner: "old", lease_ms: 60_000 });
+    expect(first.attempts).toBe(1);
+    const checkpoint = { ...fixture.tables.background_jobs![0]!.execution, normalizedToolState: { requestUsage: measuredUsage(150, 1) } };
+    expect(await (backgroundJobFunctions.updateExecution as RegisteredFunction)._handler(fixture.ctx,
+      { job_id: jobId, lease_owner: "old", execution: checkpoint })).toBe(true);
+    await (backgroundJobFunctions.update as RegisteredFunction)._handler(fixture.ctx,
+      { job_id: jobId, lease_owner: "old", content_chunk: "discard", usage: measuredUsage() });
+    fixture.tables.background_jobs![0]!.lease_expires_at = 0;
+    const recovered = await claim(fixture.ctx, { job_id: jobId, lease_owner: "new", lease_ms: 60_000 });
+    expect(recovered).toMatchObject({ attempts: 2, content: "base", reasoning: "base reason", usage: measuredUsage(150, 1) });
+    expect(fixture.tables.background_jobs![0]!.usage).toEqual(measuredUsage(150, 1));
+    expect(await (backgroundJobFunctions.update as RegisteredFunction)._handler(fixture.ctx,
+      { job_id: jobId, lease_owner: "old", usage: measuredUsage() })).toBe(false);
+    expect(await (backgroundJobFunctions.saveTerminalSnapshot as RegisteredFunction)._handler(fixture.ctx,
+      { job_id: jobId, lease_owner: "old", status: "complete", content: "stale", reasoning: "", usage: measuredUsage(), completed_at: 2000 })).toBe(false);
+    // A later attempt without a measured checkpoint must remove obsolete usage.
+    fixture.tables.background_jobs![0]!.execution.normalizedToolState = {};
+    fixture.tables.background_jobs![0]!.lease_expires_at = 0;
+    expect((await claim(fixture.ctx, { job_id: jobId, lease_owner: "third", lease_ms: 60_000 })).usage).toBeUndefined();
+    expect(fixture.tables.background_jobs![0]!.usage).toBeUndefined();
+  });
+
+  it.each(["abort", "fail"])("%s preserves an already measured iteration", async (name) => {
+    const fixture = createFixture("editor");
+    const jobId = await createUsageJob(fixture);
+    await (backgroundJobFunctions.update as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, usage: measuredUsage() });
+    await (backgroundJobFunctions[name] as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, user_id: "user-1", error: "upstream" });
+    expect((await (backgroundJobFunctions.get as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, user_id: "user-1" })).usage).toEqual(measuredUsage());
+  });
+
+  it.each(["update", "saveTerminalSnapshot", "updateExecution"])("%s rejects unowned, superseded and expired lease writes", async (name) => {
+    const fixture = createFixture("editor");
+    const jobId = await createUsageJob(fixture);
+    await (backgroundJobFunctions.claim as RegisteredFunction)._handler(fixture.ctx,
+      { job_id: jobId, lease_owner: "owner", lease_ms: 60_000 });
+    const write = (backgroundJobFunctions[name] as RegisteredFunction)._handler;
+    const input = { job_id: jobId, usage: measuredUsage(), content_chunk: "stale", execution: { changed: true },
+      status: "complete", content: "stale", reasoning: "", completed_at: 2000 };
+    for (const lease_owner of [undefined, "other"]) {
+      const before = JSON.stringify(fixture.tables.background_jobs);
+      expect(await write(fixture.ctx, { ...input, lease_owner })).toBe(false);
+      expect(JSON.stringify(fixture.tables.background_jobs)).toBe(before);
+    }
+    fixture.tables.background_jobs![0]!.lease_expires_at = 0;
+    const before = JSON.stringify(fixture.tables.background_jobs);
+    expect(await write(fixture.ctx, { ...input, lease_owner: "owner" })).toBe(false);
+    expect(JSON.stringify(fixture.tables.background_jobs)).toBe(before);
+  });
+
+  it.each(["update", "saveTerminalSnapshot", "complete", "fail"])("%s rejects an old worker after a client-tool result releases its lease", async (name) => {
+    const fixture = createFixture("editor");
+    const jobId = await createUsageJob(fixture);
+    await (backgroundJobFunctions.claim as RegisteredFunction)._handler(fixture.ctx,
+      { job_id: jobId, lease_owner: "old", lease_ms: 60_000 });
+    const execution = fixture.tables.background_jobs![0]!.execution;
+    await (backgroundJobFunctions.updateExecution as RegisteredFunction)._handler(fixture.ctx, {
+      job_id: jobId, lease_owner: "old", execution: { ...execution, clientToolCall: { callId: "call-1" } },
+    });
+    await (backgroundJobFunctions.claimClientTool as RegisteredFunction)._handler(fixture.ctx, {
+      job_id: jobId, user_id: "user-1", call_id: "call-1", claim_token: "claim", claim_expires_at: Date.now() + 60_000,
+    });
+    expect(await (backgroundJobFunctions.settleClientTool as RegisteredFunction)._handler(fixture.ctx, {
+      job_id: jobId, user_id: "user-1", call_id: "call-1", claim_token: "claim", execution, tool_calls: [],
+    })).toBe(true);
+    expect(fixture.tables.background_jobs![0]!.lease_owner).toBeUndefined();
+    const before = JSON.stringify(fixture.tables.background_jobs);
+    expect(await (backgroundJobFunctions[name] as RegisteredFunction)._handler(fixture.ctx, {
+      job_id: jobId, lease_owner: "old", content_chunk: "stale", usage: measuredUsage(),
+      status: "complete", content: "stale", reasoning: "", completed_at: 2000, error: "stale",
+    })).toBe(false);
+    expect(JSON.stringify(fixture.tables.background_jobs)).toBe(before);
+  });
+
+  it("still permits legitimate unleased workflow progress and completion", async () => {
+    const fixture = createFixture("editor");
+    const { jobId } = await (backgroundJobFunctions.create as RegisteredFunction)._handler(fixture.ctx, {
+      user_id: "user-1", thread_id: "thread-a", message_id: "workflow-1", model: "workflow", kind: "workflow",
+      max_concurrent_jobs: 20, max_concurrent_jobs_per_user: 5,
+    });
+    expect(await (backgroundJobFunctions.update as RegisteredFunction)._handler(fixture.ctx,
+      { job_id: jobId, content_chunk: "workflow output" })).toBe(true);
+    expect(await (backgroundJobFunctions.complete as RegisteredFunction)._handler(fixture.ctx,
+      { job_id: jobId, content: "workflow output" })).toBe(true);
+    expect(fixture.tables.background_jobs![0]!).toMatchObject({ status: "complete", content: "workflow output" });
+  });
+
+  it("preserves usage in authorized client-tool claims without exposing it to another user", async () => {
+    const fixture = createFixture("editor");
+    const jobId = await createUsageJob(fixture);
+    await (backgroundJobFunctions.update as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, usage: measuredUsage() });
+    fixture.tables.background_jobs![0]!.execution.clientToolCall = { callId: "call-1" };
+    const claim = (backgroundJobFunctions.claimClientTool as RegisteredFunction)._handler;
+    const input = { job_id: jobId, call_id: "call-1", claim_token: "claim-1", claim_expires_at: Date.now() + 60_000 };
+    expect(await claim(fixture.ctx, { ...input, user_id: "other" })).toBeNull();
+    expect(await claim(fixture.ctx, { ...input, user_id: "user-1" })).toMatchObject({ usage: measuredUsage() });
+  });
+
+  it("keeps a never-measured terminal job and canonical message unmeasured", async () => {
+    const fixture = createFixture("editor");
+    const jobId = await createUsageJob(fixture);
+    await (backgroundJobFunctions.saveTerminalSnapshot as RegisteredFunction)._handler(fixture.ctx, {
+      job_id: jobId, status: "complete", content: "valid", reasoning: "", usage: { prompt_tokens: -1 }, completed_at: 2000,
+    });
+    expect((await (backgroundJobFunctions.get as RegisteredFunction)._handler(fixture.ctx, { job_id: jobId, user_id: "user-1" })).usage).toBeUndefined();
+    fixture.tables.messages[0]!.data = { generation_id: "generation-1", custom: "keep" };
+    const input = finalizationInput({ prompt_tokens: -1 });
+    expect(await (syncFunctions.finalizeChatGeneration as RegisteredFunction)._handler(fixture.ctx, input)).toMatchObject({ status: "committed" });
+    expect(fixture.tables.messages[0]!.data.usage).toBeUndefined();
+    expect(fixture.tables.messages[0]!.data.content).toBe("final text");
+  });
+
+  it.each(["complete", "error", "aborted"])("finalizes %s usage into canonical data and authorized pull without losing metadata", async (status) => {
+    const fixture = createFixture("editor");
+    fixture.tables.messages[0]!.data = { generation_id: "generation-1", compaction: { marker: "keep" }, custom: "keep", usage: measuredUsage(150, 1) };
+    const input = finalizationInput();
+    input.snapshot.status = status;
+    const finalize = (syncFunctions.finalizeChatGeneration as RegisteredFunction)._handler;
+    expect(await finalize(fixture.ctx, input)).toMatchObject({ status: "committed", replayed: false });
+    expect(fixture.tables.messages[0]!.data).toMatchObject({ usage: measuredUsage(), compaction: { marker: "keep" }, custom: "keep", generation_id: "generation-1", content: "final text" });
+    const pulled = await (syncFunctions.pull as RegisteredFunction)._handler(fixture.ctx, { workspace_id: "ws-1", cursor: 5, limit: 10 });
+    expect(pulled.changes[0].payload.data.usage).toEqual(measuredUsage());
+    expect(await finalize(fixture.ctx, input)).toMatchObject({ status: "committed", replayed: true });
+    expect(fixture.tables.change_log).toHaveLength(1);
+    await expect(finalize(fixture.ctx, { ...input, fingerprint: "conflicting" })).rejects.toThrow("Conflicting");
+  });
+
+  it.each([undefined, { prompt_tokens: -1 }])("does not let absent or malformed terminal usage erase canonical metadata", async (usage) => {
+    const fixture = createFixture("editor");
+    fixture.tables.messages[0]!.data = { generation_id: "generation-1", usage: measuredUsage(150, 1), custom: "keep" };
+    const input = finalizationInput(); input.snapshot.usage = usage;
+    expect(await (syncFunctions.finalizeChatGeneration as RegisteredFunction)._handler(fixture.ctx, input)).toMatchObject({ status: "committed" });
+    expect(fixture.tables.messages[0]!.data).toMatchObject({ usage: measuredUsage(150, 1), custom: "keep", content: "final text" });
+  });
+
+  it.each(["generation", "clock", "deleted", "workspace", "actor", "viewer"])("preserves the %s finalization fence", async (fence) => {
+    const fixture = createFixture(fence === "viewer" ? "viewer" : "editor");
+    fixture.tables.messages[0]!.data = { generation_id: fence === "generation" ? "newer" : "generation-1", usage: measuredUsage(150, 1) };
+    if (fence === "clock") fixture.tables.messages[0]!.clock = 2;
+    if (fence === "deleted") fixture.tables.messages[0]!.deleted = true;
+    const input = finalizationInput();
+    if (fence === "workspace") input.workspace_id = "other-workspace";
+    if (fence === "actor") input.actor_user_id = "other-user";
+    const result = (syncFunctions.finalizeChatGeneration as RegisteredFunction)._handler(fixture.ctx, input);
+    if (["workspace", "actor", "viewer"].includes(fence)) await expect(result).rejects.toThrow("Forbidden");
+    else expect(await result).toMatchObject({ status: "superseded" });
+    expect(fixture.tables.messages[0]!.data.usage).toEqual(measuredUsage(150, 1));
+    expect(fixture.tables.change_log).toHaveLength(0);
+  });
+});
 
 describe("Convex materialized snapshot contract", () => {
   it("executes the shared bootstrap and revision contract", async () => {

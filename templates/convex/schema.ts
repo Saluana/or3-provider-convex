@@ -20,6 +20,7 @@
  */
 import { defineSchema, defineTable } from 'convex/server';
 import { v } from 'convex/values';
+import { requestUsageValidator } from './requestUsage';
 
 export default defineSchema({
     // ============================================================
@@ -550,6 +551,7 @@ export default defineSchema({
         ),
         content: v.string(), // Accumulated content
         reasoning: v.optional(v.string()), // Accumulated model reasoning
+        usage: v.optional(requestUsageValidator), // Last measured provider request
         generation_id: v.optional(v.string()), // Stable generation identity
         history_phase: v.optional(v.string()), // Canonical history phase
         sync_provider_id: v.optional(v.string()), // Canonical sync provider

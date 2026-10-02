@@ -3,6 +3,7 @@ import type { FunctionArgs } from 'convex/server';
 import type { api, internal } from '../../../templates/convex/_generated/api';
 import type { Doc, Id } from '../../../templates/convex/_generated/dataModel';
 import type { MutationCtx, QueryCtx } from '../../../templates/convex/_generated/server';
+import type { RequestUsage } from '~~/shared/chat/compaction';
 
 it('derives template contexts, documents and handler arguments from the schema', () => {
     expectTypeOf<MutationCtx>().not.toBeAny();
@@ -11,6 +12,10 @@ it('derives template contexts, documents and handler arguments from the schema',
     expectTypeOf<FunctionArgs<typeof api.workspaces.setActive>>().toEqualTypeOf<{
         workspace_id: Id<'workspaces'>;
     }>();
+});
+
+it('keeps stored request usage optional and aligned with the host measurement contract', () => {
+    expectTypeOf<Doc<'background_jobs'>['usage']>().toEqualTypeOf<RequestUsage | undefined>();
 });
 
 it('types private host settings as internal functions on a dedicated table', () => {

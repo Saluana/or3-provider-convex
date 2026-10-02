@@ -38,6 +38,7 @@ import {
     type SnapshotRevision,
 } from './snapshot';
 import { isSyncUuid } from './syncAuthoring';
+import { readRequestUsage } from './requestUsage';
 
 const nowSec = (): number => Math.floor(Date.now() / 1000);
 const MIN_SYNC_RETENTION_SECONDS = 60 * 60;
@@ -1665,6 +1666,7 @@ export const finalizeChatGeneration = internalMutation({
             content: string;
             reasoning: string;
             toolCalls?: unknown[];
+            usage?: unknown;
             error?: string;
             completedAt: number;
         };
@@ -1686,6 +1688,7 @@ export const finalizeChatGeneration = internalMutation({
         const terminalState = snapshot.status === 'complete'
             ? 'complete'
             : snapshot.status === 'aborted' ? 'aborted' : 'failed';
+        const usage = readRequestUsage(snapshot.usage);
         const payload = {
             ...currentWithoutError,
             ...(snapshot.error ? { error: snapshot.error } : {}),
@@ -1696,6 +1699,7 @@ export const finalizeChatGeneration = internalMutation({
             op_id: args.op_id,
             data: {
                 ...data,
+                ...(usage ? { usage } : {}),
                 content: snapshot.content,
                 reasoning_text: snapshot.reasoning || null,
                 tool_calls: snapshot.toolCalls ?? null,

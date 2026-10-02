@@ -947,7 +947,9 @@ describe('Convex authorization boundary', () => {
         expect(payload.files['workspaces.ts']).toContain('listInvitesInternal = internalQuery({');
         expect(payload.files['sync.ts']).toContain('gcTombstones = internalMutation({');
         expect(payload.files['backgroundJobs.ts']).not.toContain("args.user_id !== '*'");
-        expect(payload.files['backgroundJobs.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(17);
+        expect(payload.files['backgroundJobs.ts']).toBe(readFileSync(
+            new URL('../../../templates/convex/backgroundJobs.ts', import.meta.url), 'utf8'
+        ));
         expect(payload.files['notifications.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
         expect(payload.files['rateLimits.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
         expect(payload.files['webhooks.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(20);
