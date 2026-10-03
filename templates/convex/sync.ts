@@ -39,6 +39,7 @@ import {
 } from './snapshot';
 import { isSyncUuid } from './syncAuthoring';
 import { readRequestUsage } from './requestUsage';
+import { parseChatSeek, encodeChatSeek } from './historySeek';
 
 const nowSec = (): number => Math.floor(Date.now() / 1000);
 const MIN_SYNC_RETENTION_SECONDS = 60 * 60;
@@ -1479,6 +1480,28 @@ export const readChatHistory = internalQuery({
         }
         if (!validId(request.thread_id) || !Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 100
             || request.cursor && new TextEncoder().encode(request.cursor).length > 2048) throw new Error('Invalid bounded history page');
+        const seek = parseChatSeek(request.cursor, request.thread_id);
+        if (seek) {
+            const direction = seek.backward ? 'desc' as const : 'asc' as const;
+            const base = (q: any) => q.eq('workspace_id', args.workspace_id).eq('thread_id', request.thread_id);
+            const parts = seek.key ? [0, 1, 2] : [3];
+            const rows: Array<Record<string, unknown> & { index: number; order_key: string; id: string }> = [];
+            for (const part of parts) {
+                const remaining = request.limit - rows.length; if (!remaining) break;
+                const batch = await ctx.db.query('messages').withIndex('by_history_order', (q: any) => {
+                    let range = base(q); const key = seek.key;
+                    if (!key) return range;
+                    const comparison = seek.backward ? 'lt' : 'gt';
+                    if (part === 0) return range.eq('index', key[0]).eq('order_key', key[1])[comparison]('id', key[2]);
+                    if (part === 1) return range.eq('index', key[0])[comparison]('order_key', key[1]);
+                    return range[comparison]('index', key[0]);
+                }).order(direction).take(remaining);
+                rows.push(...batch);
+            }
+            const last = rows.at(-1);
+            return { status: 'ok', revision, messages: rows.map(wire), next_cursor: rows.length === request.limit && last
+                ? encodeChatSeek({ ...seek, key: [last.index, last.order_key, last.id] }) : undefined };
+        }
         const page = await ctx.db.query('messages').withIndex('by_history_order', (q) =>
             q.eq('workspace_id', args.workspace_id).eq('thread_id', request.thread_id))
             .paginate({ numItems: request.limit, cursor: request.cursor ?? null });
