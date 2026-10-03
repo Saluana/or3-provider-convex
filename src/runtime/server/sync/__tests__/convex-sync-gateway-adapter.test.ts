@@ -541,6 +541,13 @@ describe('ConvexSyncGatewayAdapter', () => {
         expect(queryMock).toHaveBeenCalledTimes(2);
     });
 
+    it('returns an explicit update boundary for canonical workspace admission rejection', async () => {
+        queryMock.mockRejectedValue(new Error('[Convex] OR3_WORKSPACE_ITEM_UPDATE_REQUIRED: Update OR3 Chat'));
+        const adapter = new ConvexSyncGatewayAdapter();
+        await expect(adapter.pull(makeEvent(), { scope: { workspaceId: 'ws-1' }, cursor: 0, limit: 25, tables: ['posts'] })).rejects.toMatchObject({ statusCode: 426 });
+        expect(queryMock).toHaveBeenCalledTimes(1);
+    });
+
     it('maps exhausted transient transport failures to 503', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
         queryMock.mockRejectedValue(createTransientTransportError());

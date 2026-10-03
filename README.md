@@ -287,3 +287,27 @@ prints its selected path; restart it after provider edits. Missing repositories
 or failed builds fall back to installed packages with a warning.
 `OR3_LOCAL_PROVIDERS=false` disables local selection. Production builds use the
 installed package, so local development does not publish these changes.
+
+## Workspace Files and Trash admission
+
+Updated direct and gateway transports send workspace_item_capability v1.
+Deploy the matching sync.ts and workspaceItemCapability.ts templates before
+using the updated runtime; older deployed argument validators reject the new
+field. Use the documented init --update flow, review conflicts, and merge the
+updated admission code into existing scaffold files before deployment. The
+template pack must be rebuilt alongside the provider runtime. Do not use a
+force reset of an existing backend as an upgrade shortcut.
+
+The canonical mutation checks incoming and stored posts/projects before
+applying catalog, logical Trash, or file-membership writes. Snapshot, pull and
+watchChanges also reject readers that omit v1 when returning these semantics.
+Gateway rejection becomes HTTP 426 with OR3_WORKSPACE_ITEM_UPDATE_REQUIRED;
+direct clients receive the explicit Convex update error.
+
+The source host exposes Files when an authorized session selects an adapter advertising workspace-item v1. Qualification against an official local Convex backend covers authenticated direct JWT calls and the Basic Auth gateway separately: schema/serialization, legacy admission, replay, catalog/Trash reference retention, native storage, viewer denial and revocation. The gateway was also exercised with filesystem storage. This is source qualification, not package publication or a live Clerk OAuth sign-in.
+
+Deploy the updated schema and storage.ts alongside the sync templates. file_meta.storage_id is an opaque provider-owned string, permitting filesystem/S3 identifiers. Native Convex storage operations require matching storage_provider_id ownership; viewers may read but cannot reserve, upload, commit, cancel, delete or run GC. Runtime/template publication remains a separate step.
+
+## Coordinated storage deletion
+
+Deploy the updated schema, storage.ts, sync.ts, storageDeletion.ts and workspace cleanup together. Native deletion/GC writes a private storage_deletion_claims barrier in the same mutation as physical deletion; sync metadata/reference creation honors it. Verified upload commits alone release a hash claim. Stale native storage IDs are rejected even after re-upload, including legacy metadata with a missing or empty storage provider ID. Claims persist until verified re-upload or workspace purge, independently of sync history retention. The runtime probes storage.deletionCapability and refuses cleanup against older scaffolds. The host additionally requires a matching storage/sync deletion-coordination declaration. Filesystem storage remains fail closed because it cannot join the canonical Convex transaction.

@@ -269,6 +269,23 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
 }
 
 describe("Convex materialized snapshot contract", () => {
+  it.each([
+    { table: 'posts', canonical: { post_type: 'doc', meta: { 'or3.workspace-item': { version: 1, trashed_at: 1 } } }, omitted: { post_type: 'doc', meta: {} } },
+    { table: 'posts', canonical: { post_type: 'or3:file', file_hashes: '["shared-hash"]' }, omitted: { post_type: 'doc' } },
+    { table: 'projects', canonical: { name: 'Project', data: [{ kind: 'file', id: 'catalog' }] }, omitted: { name: 'Project', data: [] } },
+  ])('rejects canonical workspace-item omission in $table before mutation', async ({ table, canonical, omitted }) => {
+    const fixture = createFixture('editor');
+    fixture.tables[table] = [{ _id: 'item-row', workspace_id: 'ws-1', id: 'workspace-item', deleted: false,
+      clock: 1, hlc: '1:0:dev', op_id: uuidOp('canonical'), server_version: 1, ...canonical }];
+    const before = JSON.stringify(fixture.tables[table]);
+    const push = (syncFunctions.push as RegisteredFunction)._handler;
+    await expect(push(fixture.ctx, { workspace_id: 'ws-1', ops: [{ op_id: uuidOp('old-writer'),
+      table_name: table, pk: 'workspace-item', operation: 'put', payload: { id: 'workspace-item', ...omitted },
+      clock: 2, hlc: '2:0:dev', device_id: 'dev' }] })).rejects.toThrow('OR3_WORKSPACE_ITEM_UPDATE_REQUIRED');
+    expect(JSON.stringify(fixture.tables[table])).toBe(before);
+    expect(fixture.tables.change_log).toHaveLength(0);
+  });
+
   it("executes the shared bootstrap and revision contract", async () => {
     const fixture = createFixture();
     const snapshot = (syncFunctions.snapshot as RegisteredFunction)._handler;

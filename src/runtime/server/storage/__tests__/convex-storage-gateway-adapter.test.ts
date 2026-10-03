@@ -18,6 +18,7 @@ vi.mock('convex/server', () => ({
             getFileUrl: 'storage.getFileUrl',
             commitUpload: 'storage.commitUpload',
             deleteObject: 'storage.deleteObject',
+            deletionCapability: 'storage.deletionCapability',
             gcDeletedFiles: 'storage.gcDeletedFiles',
         },
     },
@@ -70,8 +71,15 @@ describe('ConvexStorageGatewayAdapter', () => {
         getConvexAdminGatewayClientMock.mockClear();
         runtimeConfig.sync.convexAdminKey = '';
         resolvePresignExpiresAtMock.mockReset().mockReturnValue(111_111);
-        queryMock.mockReset();
+        queryMock.mockReset().mockResolvedValue({ version: 1 });
         mutationMock.mockReset();
+    });
+
+    it('does not delete against a legacy backend without its deletion barrier protocol', async () => {
+        const adapter = new ConvexStorageGatewayAdapter();
+        queryMock.mockRejectedValue(new Error('Function not found'));
+        await expect(adapter.deleteObject(makeEvent(), { workspaceId: 'ws-1', hash: 'sha256:abc' })).rejects.toMatchObject({ statusCode: 503 });
+        expect(mutationMock).not.toHaveBeenCalled();
     });
 
     it('requires token and returns 401 when missing', async () => {

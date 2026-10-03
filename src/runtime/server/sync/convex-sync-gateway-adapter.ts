@@ -364,6 +364,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         snapshotBootstrap: 'snapshot-v1',
         historyRetention: 'snapshot-v1',
         backgroundGenerationHistory: 'v1',
+        workspaceItems: 'v1',
     } as const;
 
     async admitChatGeneration(
@@ -442,6 +443,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
             const result = await withConvexTransportRetry('sync.pull', () =>
                 client.query(api.sync.pull, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    workspace_item_capability: input.workspaceItemCapability,
                     cursor: input.cursor,
                     limit: input.limit,
                     tables: input.tables,
@@ -475,6 +477,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
             return await withConvexTransportRetry('sync.snapshot', () =>
                 client.mutation(api.sync.snapshot, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    workspace_item_capability: input.workspaceItemCapability,
                     page_size: input.pageSize,
                     page_token: input.pageToken,
                     tables: input.tables,
@@ -512,6 +515,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
             const result = await withConvexTransportRetry('sync.push', () =>
                 client.mutation(api.sync.push, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    workspace_item_capability: input.workspaceItemCapability,
                     ops: input.ops.map((op) => ({
                         op_id: op.stamp.opId,
                         table_name: op.tableName,

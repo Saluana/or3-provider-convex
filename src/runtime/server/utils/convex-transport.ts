@@ -140,6 +140,10 @@ export function throwAsConvexServiceUnavailable(
     error: unknown,
     statusMessage: string
 ): never {
+    if ([...walkErrorChain(error)].some(node => typeof node.message === 'string' && node.message.includes('OR3_WORKSPACE_ITEM_UPDATE_REQUIRED'))) {
+        throw createError({ statusCode: 426, statusMessage: 'Update OR3 Chat to use workspace Files and Trash',
+            data: { code: 'OR3_WORKSPACE_ITEM_UPDATE_REQUIRED', requiredCapability: 'v1' } });
+    }
     if (isLikelyH3Error(error)) {
         throw error;
     }

@@ -211,6 +211,7 @@ describe('createConvexSyncProvider', () => {
         });
 
         expect(mutationMock).toHaveBeenCalledWith('sync.snapshot', {
+            workspace_item_capability: 'v1',
             workspace_id: 'ws-1',
             page_size: 25,
             page_token: 'opaque-current',
@@ -231,6 +232,7 @@ describe('createConvexSyncProvider', () => {
 
         await provider.pull({ scope: { workspaceId: 'ws-1' }, cursor: 0, limit: 25, tables: ['messages'] });
         expect(queryMock).toHaveBeenCalledWith('sync.pull', {
+            workspace_item_capability: 'v1',
             workspace_id: 'ws-1',
             cursor: 0,
             limit: 25,
@@ -260,6 +262,7 @@ describe('createConvexSyncProvider', () => {
         });
 
         expect(mutationMock).toHaveBeenCalledWith('sync.push', expect.objectContaining({
+            workspace_item_capability: 'v1',
             workspace_id: 'ws-1',
             ops: [
                 expect.objectContaining({
