@@ -288,8 +288,10 @@ or failed builds fall back to installed packages with a warning.
 `OR3_LOCAL_PROVIDERS=false` disables local selection. Production builds use the
 installed package, so local development does not publish these changes.
 
-### Canonical compaction history reader (private source)
+### Canonical compaction history reader (unreleased)
 
 `canonicalChatHistory: 'v1'` calls the internal `sync.readChatHistory` service with the trusted execution actor and workspace. The service rechecks active membership, reads materialized rows, and pages the workspace/thread/canonical-order index. `chat_history_revisions` advances in applied chat writes so ancestor search continuation survives current-thread result writes and invalidates on source edits. The scaffold adds compacted/root/summary/provenance fields without rewriting legacy rows. No retained change log supplies history content.
 
-`bunx vitest run --config vitest.canonical-history.config.ts` runs the scaffold owner against committed current host history contracts. It exercises materialized forward/backward keysets, bounds, foreign IDs, forged actors and revoked membership through the actual internal handler. Its existing storage fixture does not emulate deployed Convex validator/transaction isolation. Source types, module build and generated pack have separate evidence; deployed authorization/transactions, second-client reconciliation and released pins remain rollout gates. No package has been published.
+`bunx vitest run --config vitest.canonical-history.config.ts` runs the scaffold owner against committed current host history contracts. Its 54 cases pass locally and exercise materialized forward/backward keysets, bounds, foreign IDs, forged actors and revoked membership through the actual internal handler. Its existing storage fixture does not emulate deployed Convex validator/transaction isolation. Source types, module build and generated pack have separate evidence; deployed authorization/transactions, second-client reconciliation and released pins remain rollout gates. No package has been published.
+
+The canonical-history qualification lane defaults to a sibling `../or3-chat` checkout. For an isolated host worktree, set `OR3_CANONICAL_HOST_ROOT=/absolute/path/to/or3-chat` before the command. Its contract-byte checks fail closed on uncommitted changes; this does not replace the pinned host fixture or certify deployed/released provider behavior.

@@ -4,7 +4,8 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import config from './vitest.config';
 
-const host = path.resolve(import.meta.dirname, '../../manual-context-compaction');
+const host = path.resolve(import.meta.dirname,
+    process.env.OR3_CANONICAL_HOST_ROOT || '../or3-chat');
 const files = ['shared/chat/history-reader', 'shared/chat/background-history', 'shared/chat/compaction'];
 for (const file of files) {
     if (!execFileSync('git', ['show', `HEAD:${file}.ts`], { cwd: host }).equals(readFileSync(path.join(host, `${file}.ts`))))
