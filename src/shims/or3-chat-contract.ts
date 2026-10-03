@@ -23,6 +23,10 @@ export type BackgroundJobProvider<T = any, U = any, V = any, W = any, X = any> =
 export const BackgroundJobProvider: any = undefined;
 export type BeginConnectEnvironmentRevocationInput<T = any, U = any, V = any, W = any, X = any> = any;
 export const BeginConnectEnvironmentRevocationInput: any = undefined;
+export type CanonicalChatQuery<T = any, U = any, V = any, W = any, X = any> = any;
+export const CanonicalChatQuery: any = undefined;
+export type CanonicalChatReadResult<T = any, U = any, V = any, W = any, X = any> = any;
+export const CanonicalChatReadResult: any = undefined;
 export type CanonicalGenerationSnapshot<T = any, U = any, V = any, W = any, X = any> = any;
 export const CanonicalGenerationSnapshot: any = undefined;
 export type CanonicalHistoryActor<T = any, U = any, V = any, W = any, X = any> = any;
@@ -197,6 +201,8 @@ export type useAuthTokenBroker<T = any, U = any, V = any, W = any, X = any> = an
 export const useAuthTokenBroker: any = undefined;
 export type useSessionContext<T = any, U = any, V = any, W = any, X = any> = any;
 export const useSessionContext: any = undefined;
+export type validateCanonicalChatQuery<T = any, U = any, V = any, W = any, X = any> = any;
+export const validateCanonicalChatQuery: any = undefined;
 export type WebhookDeliveryLog<T = any, U = any, V = any, W = any, X = any> = any;
 export const WebhookDeliveryLog: any = undefined;
 export type WebhookHealth<T = any, U = any, V = any, W = any, X = any> = any;

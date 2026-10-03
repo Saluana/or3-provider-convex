@@ -287,3 +287,7 @@ prints its selected path; restart it after provider edits. Missing repositories
 or failed builds fall back to installed packages with a warning.
 `OR3_LOCAL_PROVIDERS=false` disables local selection. Production builds use the
 installed package, so local development does not publish these changes.
+
+### Canonical compaction history reader (private source, unqualified)
+
+`canonicalChatHistory: 'v1'` calls the internal `sync.readChatHistory` service with the trusted execution actor and workspace. The service rechecks active membership, reads materialized rows, and pages the workspace/thread/canonical-order index. `chat_history_revisions` advances in applied chat writes so ancestor search continuation survives current-thread result writes and invalidates on source edits. The scaffold adds compacted/root/summary/provenance fields without rewriting legacy rows. No retained change log supplies history content. This source/scaffold patch still requires generated-model refresh, conformance, provider build and second-client qualification; it has not been published or selected through new package pins.

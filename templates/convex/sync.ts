@@ -23,7 +23,7 @@
  * - Schema enforcement beyond lightweight validation in `validatePayload`
  */
 import { v } from 'convex/values';
-import { mutation, query, internalMutation, type MutationCtx, type QueryCtx } from './_generated/server';
+import { mutation, query, internalMutation, internalQuery, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
 import { getPkField } from './tableMetadata';
 import { requireActiveWorkspace, requireWorkspaceRole } from './authz';
@@ -1012,6 +1012,15 @@ async function applyOpToTable(
         }
     }
 
+    if (applied && (op.table_name === 'threads' || op.table_name === 'messages')) {
+        const threadIds = op.table_name === 'threads' ? [op.pk] : [existing?.thread_id, payload?.thread_id];
+        for (const threadId of new Set(threadIds)) if (typeof threadId === 'string') {
+            const revision = await ctx.db.query('chat_history_revisions').withIndex('by_workspace_thread', (q) =>
+                q.eq('workspace_id', workspaceId).eq('thread_id', threadId)).first();
+            if (revision) await ctx.db.patch(revision._id, { value: revision.value + 1 });
+            else await ctx.db.insert('chat_history_revisions', { workspace_id: workspaceId, thread_id: threadId, value: 1 });
+        }
+    }
     return { wasExisting, applied };
 }
 
@@ -1433,6 +1442,49 @@ async function requireCanonicalGenerationActor(
         throw new Error('Forbidden background history actor');
     }
 }
+
+/** Internal service read: current membership, materialized rows, one snapshot. */
+export const readChatHistory = internalQuery({
+    args: { workspace_id: v.id('workspaces'), actor_user_id: v.id('users'), query: v.union(
+        v.object({ kind: v.literal('thread'), thread_id: v.string() }),
+        v.object({ kind: v.literal('messages'), message_ids: v.array(v.string()) }),
+        v.object({ kind: v.literal('thread_page'), thread_id: v.string(), limit: v.number(), cursor: v.optional(v.string()) }),
+    ) },
+    handler: async (ctx, args) => {
+        await requireActiveWorkspace(ctx, args.workspace_id);
+        const membership = await ctx.db.query('workspace_members').withIndex('by_workspace_user', (q) =>
+            q.eq('workspace_id', args.workspace_id).eq('user_id', args.actor_user_id)).first();
+        if (!membership || !SYNC_READ_ROLES.has(membership.role)) throw new Error('Forbidden canonical history actor');
+        const counter = await ctx.db.query('server_version_counter').withIndex('by_workspace', (q) => q.eq('workspace_id', args.workspace_id)).first();
+        const revision = String(counter?.value ?? 0);
+        const request = args.query;
+        const validId = (id: string) => id.length > 0 && new TextEncoder().encode(id).length <= 200;
+        const wire = (row: Record<string, unknown>) => {
+            const { _id, _creationTime, workspace_id, server_version, ...record } = row;
+            return record;
+        };
+        if (request.kind === 'thread') {
+            if (!validId(request.thread_id)) throw new Error('Invalid canonical thread ID');
+            const row = await ctx.db.query('threads').withIndex('by_workspace_id', (q) =>
+                q.eq('workspace_id', args.workspace_id).eq('id', request.thread_id)).first();
+            const threadRevision = await ctx.db.query('chat_history_revisions').withIndex('by_workspace_thread', (q) =>
+                q.eq('workspace_id', args.workspace_id).eq('thread_id', request.thread_id)).first();
+            return { status: 'ok', revision: String(threadRevision?.value ?? 0), thread: row ? wire(row) : undefined };
+        }
+        if (request.kind === 'messages') {
+            if (request.message_ids.length > 100 || request.message_ids.some((id) => !validId(id))) throw new Error('Invalid bounded message query');
+            const rows = await Promise.all(request.message_ids.map((id) => ctx.db.query('messages').withIndex('by_workspace_id', (q) =>
+                q.eq('workspace_id', args.workspace_id).eq('id', id)).first()));
+            return { status: 'ok', revision, messages: rows.filter((row) => row !== null).map((row) => wire(row!)) };
+        }
+        if (!validId(request.thread_id) || !Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 100
+            || request.cursor && new TextEncoder().encode(request.cursor).length > 2048) throw new Error('Invalid bounded history page');
+        const page = await ctx.db.query('messages').withIndex('by_history_order', (q) =>
+            q.eq('workspace_id', args.workspace_id).eq('thread_id', request.thread_id))
+            .paginate({ numItems: request.limit, cursor: request.cursor ?? null });
+        return { status: 'ok', revision, messages: page.page.map(wire), next_cursor: page.isDone ? undefined : page.continueCursor };
+    },
+});
 
 async function generationReceipt(
     ctx: MutationCtx,
