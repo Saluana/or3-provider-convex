@@ -73,12 +73,14 @@ const INDEX_FIELDS: Record<string, string[]> = {
     "server_version",
   ],
   by_workspace_version: ["workspace_id", "server_version"],
+  by_history_order: ["workspace_id", "thread_id", "index", "order_key", "id"],
+  by_workspace_thread: ["workspace_id", "thread_id"],
   by_op_id: ["op_id"],
 };
 
 class MemoryQuery {
   private conditions: Array<{
-    op: "eq" | "gt" | "lte";
+    op: "eq" | "gt" | "lt" | "lte";
     field: string;
     value: unknown;
   }> = [];
@@ -99,6 +101,10 @@ class MemoryQuery {
       },
       gt: (field: string, value: unknown) => {
         this.conditions.push({ op: "gt", field, value });
+        return chain;
+      },
+      lt: (field: string, value: unknown) => {
+        this.conditions.push({ op: "lt", field, value });
         return chain;
       },
       lte: (field: string, value: unknown) => {
@@ -134,6 +140,7 @@ class MemoryQuery {
       this.conditions.every(({ op, field, value }) => {
         if (op === "eq") return row[field] === value;
         if (op === "gt") return row[field] > (value as any);
+        if (op === "lt") return row[field] < (value as any);
         return row[field] <= (value as any);
       }),
     );
@@ -604,6 +611,38 @@ describe("Convex background request usage persistence", () => {
     else expect(await result).toMatchObject({ status: "superseded" });
     expect(fixture.tables.messages[0]!.data.usage).toEqual(measuredUsage(150, 1));
     expect(fixture.tables.change_log).toHaveLength(0);
+  });
+});
+
+describe("Convex canonical history scaffold contract", () => {
+  // This owner executes generated handler policy with the existing storage
+  // fixture. Deployed validators/transaction isolation remain separate gates.
+  it("uses current membership and workspace-bound keysets without retained logs", async () => {
+    const fixture = createFixture();
+    const read = (syncFunctions.readChatHistory as RegisteredFunction)._handler;
+    const { encodeChatSeek } = await import('../../../templates/convex/historySeek');
+    fixture.tables.chat_history_revisions = [{ _id: 'revision', workspace_id: 'ws-1', thread_id: 'thread-1', value: 9 }];
+    fixture.tables.messages = Array.from({ length: 140 }, (_, index) => ({ _id: `stored-${index}`, workspace_id: 'ws-1',
+      id: `message-${String(index).padStart(3, '0')}`, thread_id: 'thread-1', index: Math.floor(index / 2),
+      order_key: index % 2 ? 'ordered' : '', clock: 1, deleted: false, data: { content: `evidence ${index}` } }));
+    fixture.tables.messages.push({ _id: 'foreign', workspace_id: 'ws-other', id: 'foreign-evidence', thread_id: 'thread-1', index: 0, order_key: '', data: { content: 'private' } });
+    const args = { workspace_id: 'ws-1', actor_user_id: 'user-1' };
+    const first = await read(fixture.ctx, { ...args, query: { kind: 'thread_page', thread_id: 'thread-1', limit: 100,
+      cursor: encodeChatSeek({ thread_id: 'thread-1', backward: false }) } });
+    const second = await read(fixture.ctx, { ...args, query: { kind: 'thread_page', thread_id: 'thread-1', limit: 100, cursor: first.next_cursor } });
+    expect([...first.messages, ...second.messages].map((row: Row) => row.id)).toEqual(fixture.tables.messages.slice(0, 140).map((row) => row.id));
+    const previous = await read(fixture.ctx, { ...args, query: { kind: 'thread_page', thread_id: 'thread-1', limit: 2,
+      cursor: encodeChatSeek({ thread_id: 'thread-1', backward: true, key: [1, '', 'message-002'] }) } });
+    expect(previous.messages.map((row: Row) => row.id)).toEqual(['message-001', 'message-000']);
+    const foreign = await read(fixture.ctx, { ...args, query: { kind: 'messages', message_ids: ['foreign-evidence', 'unknown'] } });
+    expect(foreign.messages).toEqual([]);
+    const revision = await read(fixture.ctx, { ...args, query: { kind: 'thread', thread_id: 'thread-1' } });
+    expect(revision.revision).toBe('9');
+    await expect(read(fixture.ctx, { ...args, query: { kind: 'thread_page', thread_id: 'thread-1', limit: 101 } })).rejects.toThrow('bounded');
+    await expect(read(fixture.ctx, { ...args, actor_user_id: 'forged', query: { kind: 'messages', message_ids: ['message-000'] } })).rejects.toThrow('Forbidden');
+    fixture.tables.workspace_members = [];
+    await expect(read(fixture.ctx, { ...args, query: { kind: 'messages', message_ids: ['message-000'] } })).rejects.toThrow('Forbidden');
+    expect(fixture.takeCounts.every((count) => count <= 100)).toBe(true);
   });
 });
 
