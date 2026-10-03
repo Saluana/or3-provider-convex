@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getFunctionName } from "convex/server";
 import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
@@ -10,6 +10,11 @@ import templateSchema from "../../../templates/convex/schema";
 import { convexJobProvider } from "../server/background-jobs/convex-provider";
 import { ConvexSyncGatewayAdapter } from "../server/sync/convex-sync-gateway-adapter";
 import { reconcileBackgroundJobHistory } from "~~/server/utils/background-jobs/history";
+import { registerSyncGatewayAdapter, getActiveSyncGatewayAdapter } from "~~/server/sync/gateway/registry";
+import { registerAuthWorkspaceStore } from "~~/server/auth/store/registry";
+import type { AuthWorkspaceStore } from "~~/server/auth/store/types";
+import { canonicalHistoryContext } from "~~/server/utils/chat/canonical-history-context";
+import { createHistoryRetrievalService } from "~~/shared/chat/history-retrieval";
 
 const localTransport = vi.hoisted(() => ({
   query: vi.fn(), mutation: vi.fn(), adapter: undefined as any,
@@ -18,7 +23,6 @@ vi.mock("../server/utils/convex-client", () => ({ getConvexClient: () => localTr
 vi.mock("~~/server/utils/background-jobs/store", () => ({
   getJobConfig: () => ({ maxConcurrentJobs: 20, maxConcurrentJobsPerUser: 5 }),
 }));
-vi.mock("~~/server/sync/gateway/registry", () => ({ getSyncGatewayAdapter: () => localTransport.adapter }));
 vi.mock("~~/server/auth/token-broker/resolve", () => ({ resolveProviderToken: async () => "fixture-token" }));
 vi.mock("~~/server/auth/session", () => ({ resolveSessionContext: async () => ({ authenticated: false }) }));
 vi.mock("~~/server/utils/webhooks/runtime", () => ({ emitWebhookSystemHook: async () => undefined }));
@@ -50,6 +54,13 @@ type RegisteredFunction = {
 };
 
 type Row = Record<string, any> & { _id: string };
+type FixtureTables = Record<string, Row[]> & Record<
+  "auth_accounts" | "workspaces" | "workspace_members" | "server_version_counter" |
+  "device_cursors" | "messages" | "projects" | "threads" | "tombstones" |
+  "upload_intents" | "sync_record_versions" | "sync_snapshot_sessions" |
+  "change_log" | "file_meta" | "kv" | "notifications" | "posts", Row[]>;
+
+afterEach(() => vi.unstubAllGlobals());
 
 function uuidOp(label: string): string {
   let hex = "";
@@ -158,7 +169,7 @@ class MemoryQuery {
 }
 
 function createFixture(role: "viewer" | "editor" = "viewer") {
-  const tables: Record<string, Row[]> = {
+  const tables: FixtureTables = {
     auth_accounts: [
       {
         _id: "account-1",
@@ -355,6 +366,7 @@ describe("Convex background request usage persistence", () => {
     localTransport.mutation.mockImplementation(route);
     const adapter = new ConvexSyncGatewayAdapter();
     localTransport.adapter = adapter;
+    registerSyncGatewayAdapter({ id: 'convex', create: () => adapter });
     const admission = {
       version: 1 as const, kind: "new-turn" as const, admissionId: "admission-1", generationId: "generation-1",
       workspaceId: "ws-1", threadId: "thread-a", messageId: "message-1",
@@ -615,6 +627,56 @@ describe("Convex background request usage persistence", () => {
 });
 
 describe("Convex canonical history scaffold contract", () => {
+  it("uses the selected built gateway and host scope service across partial delivery, missing capability and membership revocation", async () => {
+    const fixture = createFixture('editor');
+    const read = (syncFunctions.readChatHistory as RegisteredFunction)._handler;
+    localTransport.query.mockImplementation(async (reference, args) => {
+      expect(getFunctionName(reference)).toBe('sync:readChatHistory');
+      const result = await read(fixture.ctx, JSON.parse(JSON.stringify(args)));
+      return JSON.parse(JSON.stringify(result));
+    });
+    const parent = { ...fixture.tables.threads[0], _id: 'root-doc', id: 'root', clock: 1 };
+    const child = { ...fixture.tables.threads[0]!, parent_thread_id: 'root', root_thread_id: 'root',
+      branch_mode: 'compacted', anchor_message_id: 'root-message', summary_message_id: 'history-summary', fork_reason: 'compaction' };
+    fixture.tables.threads = [parent, child];
+    const original = { ...fixture.tables.messages[0]!, id: 'root-message', thread_id: 'root', role: 'user', index: 0,
+      pending: false, data: { content: 'Authorized original decision' } };
+    const summary = { ...original, _id: 'summary-doc', id: 'history-summary', thread_id: 'thread-a', role: 'system',
+      data: { kind: 'compaction', content: 'Saved usable summary', compaction: { version: 1, compaction_id: 'operation',
+        source_thread_id: 'root', anchor_message_id: 'root-message', anchor_index: 0, generated_at: 1, model: 'test-model',
+        message_count: 1, prior_message_count: 0, summary_markdown: 'Saved usable summary', landmarks: [],
+        history_scope: { version: 1, segments: [{ thread_id: 'root', messages: [{ message_id: 'root-message', clock: 1 }] }] } } } };
+    fixture.tables.messages = [original];
+    fixture.tables.chat_history_revisions = [];
+    const adapter = new ConvexSyncGatewayAdapter(); registerSyncGatewayAdapter({ id: 'convex', create: () => adapter });
+    const configuration = vi.fn(() => ({ public: { sync: { provider: 'not-installed' } } }));
+    vi.stubGlobal('useRuntimeConfig', configuration);
+    expect(getActiveSyncGatewayAdapter()).toBeNull();
+    configuration.mockReturnValue({ public: { sync: { provider: 'convex' } } });
+    expect(getActiveSyncGatewayAdapter()).toBe(adapter);
+    registerAuthWorkspaceStore({ id: 'convex', create: () => ({ listUserWorkspaces: async (subject: string) =>
+      fixture.tables.workspace_members.filter((row) => row.user_id === subject).map((row) => ({ id: row.workspace_id, name: 'Workspace', role: row.role })) }) as unknown as AuthWorkspaceStore });
+    const context = () => canonicalHistoryContext({ subject: 'user-1', workspaceId: 'ws-1', threadId: 'thread-a',
+      syncProviderId: 'convex', signal: new AbortController().signal });
+    const service = createHistoryRetrievalService();
+    expect(await service.inspect(context())).toMatchObject({ status: 'scope_incomplete' });
+    fixture.tables.messages.push(summary);
+    expect(await service.inspect(context())).toEqual({ status: 'ok' });
+    expect(await service.getMessage(context(), { message_id: 'root-message' })).toMatchObject({ status: 'ok',
+      message: { text: 'Authorized original decision', reference_only: true, index: 0 } });
+    expect(await service.getMessage(context(), { message_id: 'sibling-private' })).toMatchObject({ status: 'out_of_scope' });
+    const reads = localTransport.query.mock.calls.length;
+    expect(() => canonicalHistoryContext({ ...context(), syncProviderId: 'not-installed' })).toThrow('unavailable');
+    registerSyncGatewayAdapter({ id: 'legacy-host', create: () => ({ capabilities: {} }) as any });
+    expect(() => canonicalHistoryContext({ ...context(), syncProviderId: 'legacy-host' })).toThrow('unavailable');
+    expect(localTransport.query.mock.calls.length).toBe(reads);
+    fixture.tables.workspace_members = [];
+    expect(await service.getMessage(context(), { message_id: 'root-message' })).toMatchObject({ status: 'scope_incomplete' });
+    expect(localTransport.query.mock.calls.length).toBe(reads);
+    fixture.tables.workspace_members = [{ _id: 'member', workspace_id: 'ws-1', user_id: 'user-1', role: 'editor' }];
+    fixture.tables.messages = [original];
+    expect(await service.getMessage(context(), { message_id: 'root-message' })).toMatchObject({ status: 'scope_incomplete' });
+  });
   // This owner executes generated handler policy with the existing storage
   // fixture. Deployed validators/transaction isolation remain separate gates.
   it("uses current membership and workspace-bound keysets without retained logs", async () => {
@@ -662,7 +724,7 @@ describe("Convex materialized snapshot contract", () => {
         fixture.tables.server_version_counter[0]!.value = highWatermark;
         for (const item of items) {
           if (item.kind === "row") {
-            fixture.tables[item.tableName].push({
+            (fixture.tables[item.tableName] ??= []).push({
               _id: `${item.tableName}-${item.pk}`,
               workspace_id: "ws-1",
               ...(item.payload as Record<string, unknown>),
