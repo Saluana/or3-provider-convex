@@ -80,6 +80,7 @@ export const convexApiContractNames = [
 ] as const;
 
 export const convexInternalApiContractNames = [
+    'sync:readChatHistory',
     'backgroundJobs:abort',
     'backgroundJobs:checkAborted',
     'backgroundJobs:claim',

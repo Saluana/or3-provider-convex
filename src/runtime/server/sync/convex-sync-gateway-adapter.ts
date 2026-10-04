@@ -55,6 +55,7 @@ import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { canRunSyncHistoryGc } from '../../utils/sync-history-gc-policy';
 import { getConvexClient } from '../utils/convex-client';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
+import { validateCanonicalChatQuery, type CanonicalChatQuery, type CanonicalChatReadResult } from '~~/shared/chat/history-reader';
 
 type ConvexPullChange = {
     serverVersion: number;
@@ -364,8 +365,17 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         snapshotBootstrap: 'snapshot-v1',
         historyRetention: 'snapshot-v1',
         backgroundGenerationHistory: 'v1',
+        canonicalChatHistory: 'v1',
         workspaceItems: 'v1',
     } as const;
+
+    async readChatHistory(actor: CanonicalHistoryActor, query: CanonicalChatQuery, signal?: AbortSignal): Promise<CanonicalChatReadResult> {
+        validateCanonicalChatQuery(query); signal?.throwIfAborted();
+        const result = await getConvexClient().query(internalApi.sync.readChatHistory, {
+            workspace_id: toWorkspaceId(actor.workspaceId), actor_user_id: actor.userId as Id<'users'>, query,
+        }) as CanonicalChatReadResult;
+        signal?.throwIfAborted(); return result;
+    }
 
     async admitChatGeneration(
         actor: CanonicalHistoryActor,

@@ -22,6 +22,7 @@
 
 import { v } from 'convex/values';
 import { internalMutation, internalQuery } from './_generated/server';
+import { readRequestUsage } from './requestUsage';
 
 // ============================================================
 // CONSTANTS
@@ -44,6 +45,7 @@ function claimJobRecord(
     const execution = (job.execution ?? {}) as {
         contentBase?: unknown;
         reasoningBase?: unknown;
+        normalizedToolState?: { requestUsage?: unknown };
     };
     const contentBase =
         typeof execution.contentBase === 'string' ? execution.contentBase : '';
@@ -52,6 +54,10 @@ function claimJobRecord(
             ? execution.reasoningBase
             : '';
     const attempts = ((job.attempts as number | undefined) ?? 0) + 1;
+    // A retry replays the checkpoint, not the discarded partial attempt.
+    const usage = readRequestUsage(attempts > 1
+        ? execution.normalizedToolState?.requestUsage
+        : job.usage);
     const patch: Record<string, unknown> = {
         lease_owner: leaseOwner,
         lease_expires_at: leaseExpiresAt,
@@ -62,6 +68,7 @@ function claimJobRecord(
                   content: contentBase,
                   reasoning: reasoningBase,
                   chunks_received: 0,
+                  usage,
               }
             : {}),
     };
@@ -74,6 +81,7 @@ function claimJobRecord(
         kind: job.kind,
         status: job.status,
         content: attempts > 1 ? contentBase : job.content,
+        usage,
         reasoning:
             attempts > 1
                 ? reasoningBase
@@ -359,6 +367,11 @@ export const get = internalQuery({
             kind: job.kind,
             status: job.status,
             content: job.content,
+            reasoning: job.reasoning ?? '',
+            usage: readRequestUsage(job.usage),
+            generation_id: job.generation_id,
+            history_phase: job.history_phase,
+            sync_provider_id: job.sync_provider_id,
             chunksReceived: job.chunks_received,
             startedAt: job.started_at,
             lastActivityAt: job.last_activity_at ?? job.started_at,
@@ -388,6 +401,7 @@ export const update = internalMutation({
         job_id: v.id('background_jobs'),
         content_chunk: v.optional(v.string()),
         reasoning_chunk: v.optional(v.string()),
+        usage: v.optional(v.any()),
         chunks_received: v.optional(v.number()),
         tool_calls: v.optional(v.any()),
         workflow_state: v.optional(v.any()),
@@ -397,7 +411,7 @@ export const update = internalMutation({
         const job = await ctx.db.get(args.job_id);
         if (!job || job.status !== 'streaming') return false;
         if (
-            job.lease_owner !== undefined &&
+            (job.lease_owner !== undefined || args.lease_owner !== undefined) &&
             (job.lease_owner !== args.lease_owner ||
                 (job.lease_expires_at ?? 0) <= Date.now())
         ) {
@@ -414,6 +428,8 @@ export const update = internalMutation({
         if (args.reasoning_chunk !== undefined) {
             patch.reasoning = (job.reasoning ?? '') + args.reasoning_chunk;
         }
+        const usage = readRequestUsage(args.usage);
+        if (usage) patch.usage = usage;
         if (args.chunks_received !== undefined) {
             patch.chunks_received = args.chunks_received;
         }
@@ -449,7 +465,7 @@ export const complete = internalMutation({
         const job = await ctx.db.get(args.job_id);
         if (!job || job.status !== 'streaming') return false;
         if (
-            job.lease_owner !== undefined &&
+            (job.lease_owner !== undefined || args.lease_owner !== undefined) &&
             (job.lease_owner !== args.lease_owner ||
                 (job.lease_expires_at ?? 0) <= Date.now())
         ) {
@@ -489,7 +505,7 @@ export const fail = internalMutation({
         const job = await ctx.db.get(args.job_id);
         if (!job || job.status !== 'streaming') return false;
         if (
-            job.lease_owner !== undefined &&
+            (job.lease_owner !== undefined || args.lease_owner !== undefined) &&
             (job.lease_owner !== args.lease_owner ||
                 (job.lease_expires_at ?? 0) <= Date.now())
         ) {
@@ -527,13 +543,14 @@ export const saveTerminalSnapshot = internalMutation({
         tool_calls: v.optional(v.any()),
         error: v.optional(v.string()),
         completed_at: v.number(),
+        usage: v.optional(v.any()),
         lease_owner: v.optional(v.string()),
     },
     handler: async (ctx, args) => {
         const job = await ctx.db.get(args.job_id);
         if (!job || job.status !== 'streaming') return false;
         if (
-            job.lease_owner !== undefined &&
+            (job.lease_owner !== undefined || args.lease_owner !== undefined) &&
             (job.lease_owner !== args.lease_owner ||
                 (job.lease_expires_at ?? 0) <= Date.now())
         ) {
@@ -552,6 +569,8 @@ export const saveTerminalSnapshot = internalMutation({
         if (args.tool_calls !== undefined) {
             patch.tool_calls = args.tool_calls;
         }
+        const usage = readRequestUsage(args.usage);
+        if (usage) patch.usage = usage;
         await ctx.db.patch(args.job_id, patch);
         return true;
     },
@@ -740,6 +759,7 @@ export const claimClientTool = internalMutation({
             status: job.status,
             content: job.content,
             reasoning: job.reasoning ?? '',
+            usage: readRequestUsage(job.usage),
             chunksReceived: job.chunks_received,
             startedAt: job.started_at,
             lastActivityAt: now,
@@ -977,6 +997,7 @@ export const listPendingHistory = internalQuery({
                 status: job.status,
                 content: job.content,
                 reasoning: job.reasoning ?? '',
+                usage: readRequestUsage(job.usage),
                 generation_id: job.generation_id,
                 history_phase: job.history_phase,
                 sync_provider_id: job.sync_provider_id,

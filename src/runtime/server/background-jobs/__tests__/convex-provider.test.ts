@@ -29,6 +29,7 @@ vi.mock('../../../utils/convex-api', () => ({
             requestAdmissionCancel: 'backgroundJobs.requestAdmissionCancel',
             saveTerminalSnapshot: 'backgroundJobs.saveTerminalSnapshot',
             setHistoryPhase: 'backgroundJobs.setHistoryPhase',
+            listPendingHistory: 'backgroundJobs.listPendingHistory',
         },
     },
 }));
@@ -46,6 +47,46 @@ describe('convex background job provider', () => {
     beforeEach(() => {
         query.mockReset();
         mutation.mockReset();
+    });
+
+    it('serializes the last request usage and restores it through every job projection', async () => {
+        const usage = {
+            prompt_tokens: 400, completion_tokens: 12, model: 'test-model',
+            request_id: 'request-2', iteration: 2, measured_at: 123,
+            prefix_message_count: 4, prefix_hash: 'prefix-2',
+            configuration_hash: 'configuration', input_estimate_tokens: 390,
+        };
+        mutation.mockResolvedValue(true);
+        await convexJobProvider.updateJob('job-1', { usage, leaseOwner: 'worker-1' });
+        expect(mutation).toHaveBeenLastCalledWith('backgroundJobs.update',
+            expect.objectContaining({ usage, lease_owner: 'worker-1' }));
+        await convexJobProvider.saveTerminalSnapshot!('job-1', {
+            status: 'complete', content: 'answer', reasoning: 'reason', usage, completedAt: 200,
+        }, 'worker-1');
+        expect(mutation).toHaveBeenLastCalledWith('backgroundJobs.saveTerminalSnapshot',
+            expect.objectContaining({ usage, lease_owner: 'worker-1' }));
+        const row = {
+            id: 'job-1', userId: 'user-1', threadId: 'thread-1', messageId: 'message-1',
+            model: 'test-model', status: 'streaming', content: 'answer', reasoning: 'reason',
+            chunksReceived: 2, startedAt: 1, usage,
+        };
+        query.mockResolvedValue(row);
+        expect((await convexJobProvider.getJob('job-1', 'user-1'))?.usage).toEqual(usage);
+        mutation.mockResolvedValue(row);
+        expect((await convexJobProvider.claimJob!('job-1', 'worker-2', 10, 40))?.usage).toEqual(usage);
+        expect((await convexJobProvider.claimNextJob!('worker-2', 10, 40))?.usage).toEqual(usage);
+        query.mockResolvedValue([row]);
+        expect((await convexJobProvider.getPendingHistoryJobs!(10))[0]?.usage).toEqual(usage);
+    });
+
+    it('ignores malformed usage without preventing valid progress or inventing measurements', async () => {
+        mutation.mockResolvedValue(true);
+        await convexJobProvider.updateJob('job-1', {
+            contentChunk: 'valid text', usage: { prompt_tokens: -1 } as any,
+        });
+        expect(mutation.mock.calls[0]?.[1]).not.toHaveProperty('usage');
+        query.mockResolvedValue({ id: 'legacy', usage: { prompt_tokens: 0 } });
+        expect((await convexJobProvider.getJob('legacy', 'user-1'))?.usage).toBeUndefined();
     });
 
     it('performs admission through one atomic create mutation', async () => {

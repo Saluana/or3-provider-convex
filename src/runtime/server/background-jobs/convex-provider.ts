@@ -29,6 +29,7 @@ import { convexInternalApi as internalApi } from '../../utils/convex-api';
 import type { GenericId as Id } from 'convex/values';
 import { getConvexClient } from '../utils/convex-client';
 import { CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
+import { readRequestUsage } from '~~/shared/chat/compaction';
 
 /**
  * Purpose:
@@ -49,9 +50,10 @@ function toBackgroundJob(job: any): BackgroundJob {
         status: job.status,
         content: job.content,
         reasoning: typeof job.reasoning === 'string' ? job.reasoning : '',
-        generationId: job.generation_id ?? undefined,
-        historyPhase: job.history_phase ?? undefined,
-        syncProviderId: job.sync_provider_id ?? undefined,
+        usage: readRequestUsage(job.usage),
+        generationId: job.generation_id ?? job.generationId ?? undefined,
+        historyPhase: job.history_phase ?? job.historyPhase ?? undefined,
+        syncProviderId: job.sync_provider_id ?? job.syncProviderId ?? undefined,
         chunksReceived: job.chunksReceived,
         startedAt: job.startedAt,
         lastActivityAt: job.lastActivityAt ?? job.startedAt,
@@ -138,6 +140,7 @@ export const convexJobProvider: BackgroundJobProvider = {
 
     async updateJob(jobId: string, update: JobUpdate): Promise<void> {
         const client = getClient();
+        const usage = readRequestUsage(update.usage);
         const updatePayload: Record<string, unknown> = {
             job_id: jobId as Id<'background_jobs'>,
             ...(update.contentChunk !== undefined
@@ -150,6 +153,7 @@ export const convexJobProvider: BackgroundJobProvider = {
                 ? { chunks_received: update.chunksReceived }
                 : {}),
             lease_owner: update.leaseOwner,
+            ...(usage ? { usage } : {}),
         };
 
         const extendedUpdatePayload: Record<string, unknown> = {
@@ -199,6 +203,7 @@ export const convexJobProvider: BackgroundJobProvider = {
         leaseOwner?: string
     ): Promise<boolean> {
         const client = getClient();
+        const usage = readRequestUsage(snapshot.usage);
         return (
             (await client.mutation(
                 internalApi.backgroundJobs.saveTerminalSnapshot,
@@ -210,6 +215,7 @@ export const convexJobProvider: BackgroundJobProvider = {
                     tool_calls: snapshot.toolCalls,
                     error: snapshot.error,
                     completed_at: snapshot.completedAt,
+                    ...(usage ? { usage } : {}),
                     lease_owner: leaseOwner,
                 }
             )) === true

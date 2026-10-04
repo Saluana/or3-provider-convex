@@ -10,6 +10,10 @@ export default defineConfig({
     resolve: {
         alias: [
             {
+                find: '~~/shared/chat/compaction',
+                replacement: path.resolve(__dirname, 'templates/convex/requestUsage.ts'),
+            },
+            {
                 find: '~~/server/utils/background-jobs/store',
                 replacement: path.resolve(__dirname, 'src/shims/imports.ts'),
             },

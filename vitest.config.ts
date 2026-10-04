@@ -1,6 +1,9 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
 
+const hostRoot = path.resolve(__dirname,
+    process.env.OR3_CANONICAL_HOST_ROOT || '../or3-chat');
+
 export default defineConfig({
     plugins: [
         {
@@ -30,8 +33,8 @@ export default defineConfig({
                     importer?.includes('/templates/convex/')
                 ) {
                     return path.resolve(
-                        __dirname,
-                        '../or3-chat/shared/cloud/admin-identity.ts'
+                        hostRoot,
+                        'shared/cloud/admin-identity.ts'
                     );
                 }
             },
@@ -39,9 +42,9 @@ export default defineConfig({
     ],
     resolve: {
         alias: {
-            '~~/': path.resolve(__dirname, '../or3-chat') + '/',
-            '~~': path.resolve(__dirname, '../or3-chat'),
-            '#imports': path.resolve(__dirname, '../or3-chat/tests/stubs/nuxt-imports.ts'),
+            '~~/': hostRoot + '/',
+            '~~': hostRoot,
+            '#imports': path.join(hostRoot, 'tests/stubs/nuxt-imports.ts'),
         },
     },
     test: {

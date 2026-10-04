@@ -25,7 +25,7 @@ import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './wor
  * - Schema enforcement beyond lightweight validation in `validatePayload`
  */
 import { v } from 'convex/values';
-import { mutation, query, internalMutation, type MutationCtx, type QueryCtx } from './_generated/server';
+import { mutation, query, internalMutation, internalQuery, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
 import { getPkField } from './tableMetadata';
 import { requireActiveWorkspace, requireWorkspaceRole } from './authz';
@@ -40,6 +40,8 @@ import {
     type SnapshotRevision,
 } from './snapshot';
 import { isSyncUuid } from './syncAuthoring';
+import { readRequestUsage } from './requestUsage';
+import { parseChatSeek, encodeChatSeek } from './historySeek';
 
 const nowSec = (): number => Math.floor(Date.now() / 1000);
 const MIN_SYNC_RETENTION_SECONDS = 60 * 60;
@@ -1015,6 +1017,15 @@ async function applyOpToTable(
         }
     }
 
+    if (applied && (op.table_name === 'threads' || op.table_name === 'messages')) {
+        const threadIds = op.table_name === 'threads' ? [op.pk] : [existing?.thread_id, payload?.thread_id];
+        for (const threadId of new Set(threadIds)) if (typeof threadId === 'string') {
+            const revision = await ctx.db.query('chat_history_revisions').withIndex('by_workspace_thread', (q) =>
+                q.eq('workspace_id', workspaceId).eq('thread_id', threadId)).first();
+            if (revision) await ctx.db.patch(revision._id, { value: revision.value + 1 });
+            else await ctx.db.insert('chat_history_revisions', { workspace_id: workspaceId, thread_id: threadId, value: 1 });
+        }
+    }
     return { wasExisting, applied };
 }
 
@@ -1448,6 +1459,71 @@ async function requireCanonicalGenerationActor(
     }
 }
 
+/** Internal service read: current membership, materialized rows, one snapshot. */
+export const readChatHistory = internalQuery({
+    args: { workspace_id: v.id('workspaces'), actor_user_id: v.id('users'), query: v.union(
+        v.object({ kind: v.literal('thread'), thread_id: v.string() }),
+        v.object({ kind: v.literal('messages'), message_ids: v.array(v.string()) }),
+        v.object({ kind: v.literal('thread_page'), thread_id: v.string(), limit: v.number(), cursor: v.optional(v.string()) }),
+    ) },
+    handler: async (ctx, args) => {
+        await requireActiveWorkspace(ctx, args.workspace_id);
+        const membership = await ctx.db.query('workspace_members').withIndex('by_workspace_user', (q) =>
+            q.eq('workspace_id', args.workspace_id).eq('user_id', args.actor_user_id)).first();
+        if (!membership || !SYNC_READ_ROLES.has(membership.role)) throw new Error('Forbidden canonical history actor');
+        const counter = await ctx.db.query('server_version_counter').withIndex('by_workspace', (q) => q.eq('workspace_id', args.workspace_id)).first();
+        const revision = String(counter?.value ?? 0);
+        const request = args.query;
+        const validId = (id: string) => id.length > 0 && new TextEncoder().encode(id).length <= 200;
+        const wire = (row: Record<string, unknown>) => {
+            const { _id, _creationTime, workspace_id, server_version, ...record } = row;
+            return record;
+        };
+        if (request.kind === 'thread') {
+            if (!validId(request.thread_id)) throw new Error('Invalid canonical thread ID');
+            const row = await ctx.db.query('threads').withIndex('by_workspace_id', (q) =>
+                q.eq('workspace_id', args.workspace_id).eq('id', request.thread_id)).first();
+            const threadRevision = await ctx.db.query('chat_history_revisions').withIndex('by_workspace_thread', (q) =>
+                q.eq('workspace_id', args.workspace_id).eq('thread_id', request.thread_id)).first();
+            return { status: 'ok', revision: String(threadRevision?.value ?? 0), thread: row ? wire(row) : undefined };
+        }
+        if (request.kind === 'messages') {
+            if (request.message_ids.length > 100 || request.message_ids.some((id) => !validId(id))) throw new Error('Invalid bounded message query');
+            const rows = await Promise.all(request.message_ids.map((id) => ctx.db.query('messages').withIndex('by_workspace_id', (q) =>
+                q.eq('workspace_id', args.workspace_id).eq('id', id)).first()));
+            return { status: 'ok', revision, messages: rows.filter((row) => row !== null).map((row) => wire(row!)) };
+        }
+        if (!validId(request.thread_id) || !Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 100
+            || request.cursor && new TextEncoder().encode(request.cursor).length > 2048) throw new Error('Invalid bounded history page');
+        const seek = parseChatSeek(request.cursor, request.thread_id);
+        if (seek) {
+            const direction = seek.backward ? 'desc' as const : 'asc' as const;
+            const base = (q: any) => q.eq('workspace_id', args.workspace_id).eq('thread_id', request.thread_id);
+            const parts = seek.key ? [0, 1, 2] : [3];
+            const rows: Array<Record<string, unknown> & { index: number; order_key: string; id: string }> = [];
+            for (const part of parts) {
+                const remaining = request.limit - rows.length; if (!remaining) break;
+                const batch = await ctx.db.query('messages').withIndex('by_history_order', (q: any) => {
+                    let range = base(q); const key = seek.key;
+                    if (!key) return range;
+                    const comparison = seek.backward ? 'lt' : 'gt';
+                    if (part === 0) return range.eq('index', key[0]).eq('order_key', key[1])[comparison]('id', key[2]);
+                    if (part === 1) return range.eq('index', key[0])[comparison]('order_key', key[1]);
+                    return range[comparison]('index', key[0]);
+                }).order(direction).take(remaining);
+                rows.push(...batch);
+            }
+            const last = rows.at(-1);
+            return { status: 'ok', revision, messages: rows.map(wire), next_cursor: rows.length === request.limit && last
+                ? encodeChatSeek({ ...seek, key: [last.index, last.order_key, last.id] }) : undefined };
+        }
+        const page = await ctx.db.query('messages').withIndex('by_history_order', (q) =>
+            q.eq('workspace_id', args.workspace_id).eq('thread_id', request.thread_id))
+            .paginate({ numItems: request.limit, cursor: request.cursor ?? null });
+        return { status: 'ok', revision, messages: page.page.map(wire), next_cursor: page.isDone ? undefined : page.continueCursor };
+    },
+});
+
 async function generationReceipt(
     ctx: MutationCtx,
     workspaceId: Id<'workspaces'>,
@@ -1680,6 +1756,7 @@ export const finalizeChatGeneration = internalMutation({
             content: string;
             reasoning: string;
             toolCalls?: unknown[];
+            usage?: unknown;
             error?: string;
             completedAt: number;
         };
@@ -1701,6 +1778,7 @@ export const finalizeChatGeneration = internalMutation({
         const terminalState = snapshot.status === 'complete'
             ? 'complete'
             : snapshot.status === 'aborted' ? 'aborted' : 'failed';
+        const usage = readRequestUsage(snapshot.usage);
         const payload = {
             ...currentWithoutError,
             ...(snapshot.error ? { error: snapshot.error } : {}),
@@ -1711,6 +1789,7 @@ export const finalizeChatGeneration = internalMutation({
             op_id: args.op_id,
             data: {
                 ...data,
+                ...(usage ? { usage } : {}),
                 content: snapshot.content,
                 reasoning_text: snapshot.reasoning || null,
                 tool_calls: snapshot.toolCalls ?? null,

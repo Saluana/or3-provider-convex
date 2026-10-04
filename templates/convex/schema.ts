@@ -20,6 +20,7 @@
  */
 import { defineSchema, defineTable } from 'convex/server';
 import { v } from 'convex/values';
+import { requestUsageValidator } from './requestUsage';
 
 export default defineSchema({
     // ============================================================
@@ -235,6 +236,10 @@ export default defineSchema({
     /**
      * Threads - chat conversations
      */
+    chat_history_revisions: defineTable({
+        workspace_id: v.id('workspaces'), thread_id: v.string(), value: v.number(),
+    }).index('by_workspace_thread', ['workspace_id', 'thread_id']),
+
     threads: defineTable({
         workspace_id: v.id('workspaces'),
         id: v.string(), // Dexie ID (client-generated)
@@ -252,7 +257,10 @@ export default defineSchema({
         clock: v.number(),
         anchor_message_id: v.optional(v.nullable(v.string())),
         anchor_index: v.optional(v.nullable(v.number())),
-        branch_mode: v.optional(v.nullable(v.union(v.literal('reference'), v.literal('copy')))),
+        branch_mode: v.optional(v.nullable(v.union(v.literal('reference'), v.literal('copy'), v.literal('compacted')))),
+        root_thread_id: v.optional(v.nullable(v.string())),
+        summary_message_id: v.optional(v.nullable(v.string())),
+        fork_reason: v.optional(v.nullable(v.union(v.literal('manual'), v.literal('retry'), v.literal('compaction')))),
         forked: v.boolean(),
         hlc: v.optional(v.string()),
         op_id: v.optional(v.string()),
@@ -287,6 +295,7 @@ export default defineSchema({
         server_version: v.optional(v.number()),
     })
         .index('by_thread', ['workspace_id', 'thread_id', 'index', 'order_key'])
+        .index('by_history_order', ['workspace_id', 'thread_id', 'index', 'order_key', 'id'])
         .index('by_workspace_id', ['workspace_id', 'id']),
 
     /**
@@ -556,6 +565,7 @@ export default defineSchema({
         ),
         content: v.string(), // Accumulated content
         reasoning: v.optional(v.string()), // Accumulated model reasoning
+        usage: v.optional(requestUsageValidator), // Last measured provider request
         generation_id: v.optional(v.string()), // Stable generation identity
         history_phase: v.optional(v.string()), // Canonical history phase
         sync_provider_id: v.optional(v.string()), // Canonical sync provider

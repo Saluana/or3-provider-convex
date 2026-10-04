@@ -266,6 +266,7 @@ async function deleteWorkspaceData(ctx: MutationCtx, workspaceId: Id<'workspaces
 
     await deleteByIndexBatched('threads', 'by_workspace_id');
     await deleteByIndexBatched('messages', 'by_workspace_id');
+    await deleteByIndexBatched('chat_history_revisions', 'by_workspace_thread');
     await deleteByIndexBatched('projects', 'by_workspace_id');
     await deleteByIndexBatched('posts', 'by_workspace_id');
     await deleteByIndexBatched('kv', 'by_workspace_name');

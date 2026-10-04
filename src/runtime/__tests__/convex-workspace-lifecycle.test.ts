@@ -141,6 +141,12 @@ function makeFixture(options: {
                     else row[key] = next;
                 }
             },
+            delete: async (id: string) => {
+                for (const rows of Object.values(tables)) {
+                    const index = rows.findIndex(row => row._id === id);
+                    if (index !== -1) rows.splice(index, 1);
+                }
+            },
         },
     } as any;
 
@@ -148,6 +154,19 @@ function makeFixture(options: {
 }
 
 describe('Convex workspace lifecycle authorization', () => {
+    it('deletes canonical history revisions only for the removed workspace', async () => {
+        const fixture = makeFixture({ includeActiveWorkspace: true });
+        fixture.tables.chat_history_revisions = [
+            { _id: 'removed-history', workspace_id: 'ws-deleted', thread_id: 'original', value: 3 },
+            { _id: 'retained-history', workspace_id: 'ws-active', thread_id: 'other', value: 7 },
+        ];
+        await expect(handler(workspaceFunctions.remove)(fixture.ctx, { workspace_id: 'ws-deleted' }))
+            .resolves.toEqual({ id: 'ws-deleted' });
+        expect(fixture.tables.chat_history_revisions).toEqual([
+            { _id: 'retained-history', workspace_id: 'ws-active', thread_id: 'other', value: 7 },
+        ]);
+        expect(fixture.tables.workspaces.map(row => row._id)).toEqual(['ws-active']);
+    });
     it('lists active member workspaces but hides soft-deleted ones', async () => {
         const active = makeFixture({ deleted: false });
         await expect(handler(workspaceFunctions.listMyWorkspaces)(active.ctx, {}))
