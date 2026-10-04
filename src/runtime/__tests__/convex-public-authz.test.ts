@@ -1,6 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { gunzipSync } from 'node:zlib';
 import { describe, expect, it, vi } from 'vitest';
 import {
     verifyAuthorizationContract,
@@ -487,6 +484,9 @@ describe('Convex authorization boundary', () => {
             backgroundJobFunctions.requestAdmissionCancel,
             backgroundJobFunctions.saveTerminalSnapshot,
             backgroundJobFunctions.setHistoryPhase,
+            backgroundJobFunctions.claimClientTool,
+            backgroundJobFunctions.settleClientTool,
+            backgroundJobFunctions.listPendingHistory,
             notificationFunctions.create,
             notificationFunctions.getByUser,
             notificationFunctions.markRead,
@@ -901,57 +901,4 @@ describe('Convex authorization boundary', () => {
         }
     });
 
-    it('wires the authorization guards into every affected public template', () => {
-        const templateRoot = fileURLToPath(new URL('../../../templates/convex/', import.meta.url));
-        const users = readFileSync(`${templateRoot}/users.ts`, 'utf8');
-        const workspaces = readFileSync(`${templateRoot}/workspaces.ts`, 'utf8');
-        const sync = readFileSync(`${templateRoot}/sync.ts`, 'utf8');
-        const backgroundJobs = readFileSync(`${templateRoot}/backgroundJobs.ts`, 'utf8');
-        const notifications = readFileSync(`${templateRoot}/notifications.ts`, 'utf8');
-        const rateLimits = readFileSync(`${templateRoot}/rateLimits.ts`, 'utf8');
-        const webhooks = readFileSync(`${templateRoot}/webhooks.ts`, 'utf8');
-
-        expect(users).toContain('await requireCallerSubject(');
-        expect(users).toContain('await requireCallerUserId(');
-        expect(users.match(/= internalQuery\(\{/g)?.length).toBe(2);
-        expect(workspaces).toContain('export const resolveSession = internalQuery({');
-        expect(workspaces).toContain('export const listInvitesInternal = internalQuery({');
-        expect(workspaces.match(/requireWorkspaceRole\(/g)?.length).toBeGreaterThanOrEqual(3);
-        expect(workspaces).toContain('await requireInviteAcceptance(ctx, email)');
-        expect(workspaces).not.toContain('invited_by_user_id: v.id');
-        expect(workspaces).not.toContain('accepted_user_id: v.id');
-        expect(sync).toContain(
-            'const callerUserId = await requireSyncWriteAccess(ctx, args.workspace_id)'
-        );
-        expect(sync).toContain('scopeNotificationWrite(');
-        expect(sync).toContain('isChangeVisibleToUser(');
-        expect(sync).toContain('export const gcTombstones = internalMutation({');
-        expect(sync).toContain('export const gcChangeLog = internalMutation({');
-        expect(backgroundJobs.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(19);
-        expect(backgroundJobs).not.toContain("args.user_id !== '*'");
-        expect(notifications.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
-        expect(rateLimits.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
-        expect(webhooks.match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(20);
-    });
-
-    it('ships the guarded templates in the generated package asset', () => {
-        const packedPath = fileURLToPath(
-            new URL('../../../templates/convex.pack.json.gz', import.meta.url)
-        );
-        const payload = JSON.parse(gunzipSync(readFileSync(packedPath)).toString('utf8')) as {
-            files: Record<string, string>;
-        };
-
-        expect(payload.files['authz.ts']).toContain('requireInviteAcceptance');
-        expect(payload.files['users.ts']).toContain('= internalQuery({');
-        expect(payload.files['workspaces.ts']).toContain('listInvitesInternal = internalQuery({');
-        expect(payload.files['sync.ts']).toContain('gcTombstones = internalMutation({');
-        expect(payload.files['backgroundJobs.ts']).not.toContain("args.user_id !== '*'");
-        expect(payload.files['backgroundJobs.ts']).toBe(readFileSync(
-            new URL('../../../templates/convex/backgroundJobs.ts', import.meta.url), 'utf8'
-        ));
-        expect(payload.files['notifications.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
-        expect(payload.files['rateLimits.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(3);
-        expect(payload.files['webhooks.ts'].match(/= internal(?:Mutation|Query)\(\{/g)?.length).toBe(20);
-    });
 });

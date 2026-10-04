@@ -24,6 +24,7 @@
 import { v } from 'convex/values';
 import { mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id } from './_generated/dataModel';
+import { claimStorageDeletion, releaseStorageDeletion } from './storageDeletion';
 import { applyServerAuthoredOp } from './syncAuthoring';
 import { requireActiveWorkspace } from './authz';
 
@@ -71,7 +72,8 @@ function parseSerializedHashes(value: string | null | undefined): string[] | nul
 
 async function loadCanonicalReferencedHashes(
     ctx: MutationCtx,
-    workspaceId: Id<'workspaces'>
+    workspaceId: Id<'workspaces'>,
+    access: 'read' | 'write' = 'read'
 ): Promise<Set<string> | null> {
     const messages = await ctx.db
         .query('messages')
@@ -118,7 +120,8 @@ const nowSec = (): number => Math.floor(Date.now() / 1000);
  */
 async function verifyWorkspaceMembership(
     ctx: MutationCtx | QueryCtx,
-    workspaceId: Id<'workspaces'>
+    workspaceId: Id<'workspaces'>,
+    access: 'read' | 'write' = 'read'
 ): Promise<Id<'users'>> {
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) {
@@ -145,7 +148,7 @@ async function verifyWorkspaceMembership(
         )
         .first();
 
-    if (!membership) {
+    if (!membership || (access === 'write' && !['owner', 'editor'].includes(membership.role))) {
         throw new Error('Forbidden: Not a workspace member');
     }
 
@@ -170,7 +173,7 @@ export const generateUploadUrl = mutation({
         workspace_quota_bytes: v.optional(v.number()),
     },
     handler: async (ctx, args) => {
-        const userId = await verifyWorkspaceMembership(ctx, args.workspace_id);
+        const userId = await verifyWorkspaceMembership(ctx, args.workspace_id, 'write');
 
         // Enforce file size limit
         if (!Number.isSafeInteger(args.size_bytes) || args.size_bytes < 0) {
@@ -231,7 +234,7 @@ export const generateUploadUrl = mutation({
 export const cancelUploadIntent = mutation({
     args: { workspace_id: v.id('workspaces'), intent_id: v.id('upload_intents') },
     handler: async (ctx, args) => {
-        const userId = await verifyWorkspaceMembership(ctx, args.workspace_id);
+        const userId = await verifyWorkspaceMembership(ctx, args.workspace_id, 'write');
         const intent = await ctx.db.get(args.intent_id);
         if (!intent || intent.workspace_id !== args.workspace_id || intent.user_id !== userId) {
             throw new Error('Upload intent not found');
@@ -268,7 +271,7 @@ export const commitUpload = mutation({
         page_count: v.optional(v.number()),
     },
     handler: async (ctx, args) => {
-        const userId = await verifyWorkspaceMembership(ctx, args.workspace_id);
+        const userId = await verifyWorkspaceMembership(ctx, args.workspace_id, 'write');
         const intent = await ctx.db.get(args.intent_id);
         const hash = normalizeHash(args.hash);
         const mimeType = normalizeMime(args.mime_type);
@@ -289,6 +292,7 @@ export const commitUpload = mutation({
             throw new Error('Uploaded object digest does not match intent');
         }
 
+        await releaseStorageDeletion(ctx, args.workspace_id, args.hash);
         const existing = await ctx.db
             .query('file_meta')
             .withIndex('by_workspace_hash', (q: any) =>
@@ -413,9 +417,9 @@ export const getFileUrl = query({
                 .first();
         }
 
-        if (!file || file.deleted || !file.storage_id) return null;
+        if (!file || file.deleted || !file.storage_id || (file.storage_provider_id && file.storage_provider_id !== 'convex')) return null;
 
-        const url = await ctx.storage.getUrl(file.storage_id);
+        const url = await ctx.storage.getUrl(file.storage_id as Id<'_storage'>);
         // Handle case where storage object was deleted but metadata remains
         if (!url) {
             return null;
@@ -436,7 +440,7 @@ export const deleteObject = mutation({
         storage_id: v.optional(v.id('_storage')),
     },
     handler: async (ctx, args) => {
-        await verifyWorkspaceMembership(ctx, args.workspace_id);
+        await verifyWorkspaceMembership(ctx, args.workspace_id, 'write');
         const file = await ctx.db
             .query('file_meta')
             .withIndex('by_workspace_hash', (q: any) =>
@@ -445,6 +449,7 @@ export const deleteObject = mutation({
             .first();
 
         if (!file) return { deleted: false };
+        if (file.storage_provider_id && file.storage_provider_id !== 'convex') throw new Error('File belongs to another storage provider');
         if (args.storage_id !== undefined && file.storage_id !== args.storage_id) {
             throw new Error('storage_id does not match workspace file metadata');
         }
@@ -457,8 +462,10 @@ export const deleteObject = mutation({
             throw new Error('Cannot delete a referenced file');
         }
 
+        if (!file.deleted) throw new Error('Cannot delete retained live metadata');
+        await claimStorageDeletion(ctx, args.workspace_id, file.hash);
         if (file.storage_id) {
-            await ctx.storage.delete(file.storage_id);
+            await ctx.storage.delete(file.storage_id as Id<'_storage'>);
         }
         await applyServerAuthoredOp(ctx, args.workspace_id, {
             table: 'file_meta',
@@ -499,7 +506,7 @@ export const gcDeletedFiles = mutation({
         limit: v.optional(v.number()),
     },
     handler: async (ctx, args) => {
-        await verifyWorkspaceMembership(ctx, args.workspace_id);
+        await verifyWorkspaceMembership(ctx, args.workspace_id, 'write');
 
         if (!Number.isSafeInteger(args.retention_seconds) || args.retention_seconds < 0) {
             throw new Error('Invalid retention window');
@@ -529,18 +536,29 @@ export const gcDeletedFiles = mutation({
         for (const file of candidates) {
             if (deletedCount >= limit) break;
             if (!file.deleted_at || file.deleted_at > cutoff) continue;
+            if (file.storage_provider_id && file.storage_provider_id !== 'convex') continue;
             // A bounded scan that cannot prove absence fails closed. This may
             // defer collection in a very large workspace, but cannot delete a
             // live blob or allocate an unbounded result set.
             if (referencedHashes.has(normalizeHash(file.hash))) continue;
 
+            await claimStorageDeletion(ctx, args.workspace_id, file.hash);
             if (file.storage_id) {
-                await ctx.storage.delete(file.storage_id);
+                await ctx.storage.delete(file.storage_id as Id<'_storage'>);
             }
             await ctx.db.delete(file._id);
             deletedCount += 1;
         }
 
         return { deletedCount, scannedCount: candidates.length };
+    },
+});
+
+/** Present only when deletion mutations and sync writers share the claim protocol. */
+export const deletionCapability = query({
+    args: { workspace_id: v.id('workspaces') },
+    handler: async (ctx, args) => {
+        await verifyWorkspaceMembership(ctx, args.workspace_id, 'read');
+        return { version: 1 as const };
     },
 });

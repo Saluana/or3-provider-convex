@@ -57,6 +57,7 @@ export const convexApiContractNames = [
     'admin:upsertWorkspaceMember',
     'storage:commitUpload',
     'storage:deleteObject',
+    'storage:deletionCapability',
     'storage:gcDeletedFiles',
     'storage:generateUploadUrl',
     'storage:getFileUrl',

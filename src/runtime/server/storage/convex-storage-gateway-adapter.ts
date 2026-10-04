@@ -107,6 +107,7 @@ async function getStorageGatewayClient(event: H3Event) {
  */
 export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
     id = 'convex';
+    deletionCoordination = { version: 1 as const, syncProviderId: 'convex' };
 
     async presignUpload(event: H3Event, input: PresignUploadRequest): Promise<PresignUploadResponse> {
         const client = await getStorageGatewayClient(event);
@@ -174,8 +175,17 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
         });
     }
 
+    private async requireDeletionProtocol(client: Awaited<ReturnType<typeof getStorageGatewayClient>>, workspaceId: string) {
+        try {
+            const capability = await client.query(api.storage.deletionCapability, { workspace_id: toWorkspaceId(workspaceId) });
+            if (capability?.version !== 1) throw new Error('Unsupported deletion protocol');
+        } catch {
+            throw createError({ statusCode: 503, statusMessage: 'Convex backend deletion coordination is unavailable. Update the provider scaffold.' });
+        }
+    }
     async deleteObject(event: H3Event, input: DeleteObjectRequest): Promise<void> {
         const client = await getStorageGatewayClient(event);
+        await this.requireDeletionProtocol(client, input.workspaceId);
         await client.mutation(api.storage.deleteObject, {
             workspace_id: toWorkspaceId(input.workspaceId),
             hash: input.hash,
@@ -192,6 +202,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
             throw createError({ statusCode: 400, statusMessage: 'Invalid gc payload' });
         }
         const gcInput = parsed.data;
+        await this.requireDeletionProtocol(client, gcInput.workspace_id);
         const result = await client.mutation(api.storage.gcDeletedFiles, {
             workspace_id: toWorkspaceId(gcInput.workspace_id),
             retention_seconds: gcInput.retention_seconds,

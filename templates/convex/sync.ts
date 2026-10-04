@@ -1,3 +1,5 @@
+import { assertStorageNotDeleted } from './storageDeletion';
+import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './workspaceItemCapability';
 /**
  * @module convex/sync
  *
@@ -938,6 +940,7 @@ async function applyOpToTable(
             );
             // LWW with deterministic HLC tie-break on equal clocks.
             if (shouldApply) {
+                await assertStorageNotDeleted(ctx, workspaceId, table, { ...existing, ...(payload ?? {}) });
                 console.debug('[sync] apply put', {
                     table: op.table_name,
                     pk: op.pk,
@@ -989,6 +992,7 @@ async function applyOpToTable(
                 return { wasExisting, applied };
             }
             // New record
+            await assertStorageNotDeleted(ctx, workspaceId, table, { ...(payload ?? {}), [pkField]: op.pk });
             const insertPayload: Record<string, unknown> = {
                 ...(payload ?? {}),
             };
@@ -1187,6 +1191,7 @@ async function pullRetentionForWorkspace(
 export const push = mutation({
     args: {
         workspace_id: v.id('workspaces'),
+        workspace_item_capability: v.optional(v.literal('v1')),
         ops: v.array(
             v.object({
                 op_id: v.string(),
@@ -1212,6 +1217,16 @@ export const push = mutation({
 
         // Verify workspace membership
         const callerUserId = await requireSyncWriteAccess(ctx, args.workspace_id);
+        if (args.workspace_item_capability !== 'v1') {
+            for (const op of args.ops) {
+                if (op.table_name !== 'posts' && op.table_name !== 'projects') continue;
+                const canonical = await ctx.db.query(op.table_name).withIndex('by_workspace_id', q =>
+                    q.eq('workspace_id', args.workspace_id).eq('id', op.pk)).first();
+                if (hasWorkspaceItemSemantics(op.table_name, op.payload) || hasWorkspaceItemSemantics(op.table_name, canonical)) {
+                    requireWorkspaceItemCapability(args.workspace_item_capability);
+                }
+            }
+        }
 
         type Result = {
             opId: string;
@@ -1961,6 +1976,7 @@ export const updateDeviceCursor = mutation({
 export const snapshot = mutation({
     args: {
         workspace_id: v.id('workspaces'),
+        workspace_item_capability: v.optional(v.literal('v1')),
         page_size: v.number(),
         page_token: v.optional(v.string()),
         tables: v.optional(v.array(v.string())),
@@ -2141,6 +2157,7 @@ export const snapshot = mutation({
               })
             : null;
 
+        if (items.some(item => item.kind === 'row' && hasWorkspaceItemSemantics(item.tableName, item.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
         return {
             workspaceId: String(args.workspace_id),
             snapshotId,
@@ -2420,6 +2437,7 @@ export const queryCanonicalStorage = query({
 export const pull = query({
     args: {
         workspace_id: v.id('workspaces'),
+        workspace_item_capability: v.optional(v.literal('v1')),
         cursor: v.number(),
         limit: v.number(),
         tables: v.optional(v.array(v.string())),
@@ -2486,6 +2504,7 @@ export const pull = query({
             hasMore,
         });
 
+        if (changes.some(change => hasWorkspaceItemSemantics(change.table_name, change.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
         return {
             changes: changes.map(toWireChange),
             nextCursor,
@@ -2508,6 +2527,7 @@ export const pull = query({
 export const watchChanges = query({
     args: {
         workspace_id: v.id('workspaces'),
+        workspace_item_capability: v.optional(v.literal('v1')),
         cursor: v.optional(v.number()),
         limit: v.optional(v.number()),
     },
@@ -2549,6 +2569,7 @@ export const watchChanges = query({
             latestVersion,
         });
 
+        if (visibleChanges.some(change => hasWorkspaceItemSemantics(change.table_name, change.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
         return {
             changes: visibleChanges.map(toWireChange),
             latestVersion,

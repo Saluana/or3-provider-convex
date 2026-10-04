@@ -356,7 +356,7 @@ export default defineSchema({
         height: v.optional(v.number()),
         page_count: v.optional(v.number()),
         ref_count: v.number(), // Compatibility cache only; never imported as authority
-        storage_id: v.optional(v.id('_storage')), // Convex storage reference
+        storage_id: v.optional(v.string()), // Opaque ID owned by storage_provider_id (sync and storage providers may differ)
         storage_provider_id: v.optional(v.string()),
         deleted: v.boolean(),
         deleted_at: v.optional(v.number()),
@@ -371,6 +371,12 @@ export default defineSchema({
         .index('by_workspace_deleted', ['workspace_id', 'deleted']),
 
     /** Persisted, expiring, one-time upload intents and quota reservations. */
+    // Permanent barrier per physically collected content hash. A verified
+    // re-upload releases it; history GC must never expire this safety state.
+    storage_deletion_claims: defineTable({
+        workspace_id: v.id('workspaces'), hash: v.string(), deleted_at: v.number(),
+    }).index('by_workspace_hash', ['workspace_id', 'hash']),
+
     upload_intents: defineTable({
         workspace_id: v.id('workspaces'),
         user_id: v.id('users'),

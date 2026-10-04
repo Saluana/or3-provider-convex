@@ -98,6 +98,7 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
                     api.sync.watchChanges,
                     {
                         workspace_id: scope.workspaceId as Id<'workspaces'>,
+                        workspace_item_capability: 'v1',
                         cursor: currentCursor,
                         limit,
                     },
@@ -173,6 +174,7 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         async pull(request: PullRequest): Promise<PullResponse> {
             const result = await client.query(api.sync.pull, {
                 workspace_id: request.scope.workspaceId as Id<'workspaces'>,
+                workspace_item_capability: 'v1',
                 cursor: request.cursor,
                 limit: request.limit,
                 tables: request.tables,
@@ -198,6 +200,7 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         async snapshot(request: SnapshotRequest): Promise<SnapshotResponse> {
             const result = await client.mutation(api.sync.snapshot, {
                 workspace_id: request.scope.workspaceId as Id<'workspaces'>,
+                workspace_item_capability: 'v1',
                 page_size: request.pageSize,
                 page_token: request.pageToken,
                 tables: request.tables,
@@ -215,6 +218,7 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         async push(batch: PushBatch): Promise<PushResult> {
             const result = await client.mutation(api.sync.push, {
                 workspace_id: batch.scope.workspaceId as Id<'workspaces'>,
+                workspace_item_capability: 'v1',
                 ops: batch.ops.map((op: PendingOp) => ({
                     op_id: op.stamp.opId,
                     table_name: op.tableName,

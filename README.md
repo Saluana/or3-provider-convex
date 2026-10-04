@@ -290,8 +290,32 @@ installed package, so local development does not publish these changes.
 
 ### Canonical compaction history reader (unreleased)
 
-`canonicalChatHistory: 'v1'` calls the internal `sync.readChatHistory` service with the trusted execution actor and workspace. The service rechecks active membership, reads materialized rows, and pages the workspace/thread/canonical-order index. `chat_history_revisions` advances in applied chat writes so ancestor search continuation survives current-thread result writes and invalidates on source edits. The scaffold adds compacted/root/summary/provenance fields without rewriting legacy rows. No retained change log supplies history content.
+`canonicalChatHistory: 'v1'` calls the internal `sync.readChatHistory` service with the trusted execution actor and workspace. The service rechecks active membership, reads materialized rows, and pages the workspace/thread/canonical-order index. `chat_history_revisions` advances in applied chat writes so ancestor search continuation survives current-thread result writes and invalidates on source edits. The scaffold adds compacted/root/summary/provenance fields without rewriting legacy rows. No retained change log supplies history content. Workspace deletion also removes its canonical history revisions.
 
-`bunx vitest run --config vitest.canonical-history.config.ts` runs the scaffold owner against committed current host history contracts. Its 54 cases pass locally and exercise materialized forward/backward keysets, bounds, foreign IDs, forged actors and revoked membership through the actual internal handler. Its existing storage fixture does not emulate deployed Convex validator/transaction isolation. Source types, module build and generated pack have separate evidence; deployed authorization/transactions, second-client reconciliation and released pins remain rollout gates. No package has been published.
+`bunx vitest run --config vitest.canonical-history.config.ts` runs the scaffold owner against committed current host history contracts. Its 54 cases pass locally and exercise materialized forward/backward keysets, bounds, foreign IDs, forged actors and revoked membership through the actual internal handler. Its existing storage fixture does not emulate deployed Convex validator/transaction isolation. Source types, module build and generated pack have separate evidence; deployed authorization/transactions, second-client reconciliation and released pins remain rollout gates. This compaction capability is not yet included in a published package.
 
 The canonical-history qualification lane defaults to a sibling `../or3-chat` checkout. For an isolated host worktree, set `OR3_CANONICAL_HOST_ROOT=/absolute/path/to/or3-chat` before the command. Its contract-byte checks fail closed on uncommitted changes; this does not replace the pinned host fixture or certify deployed/released provider behavior.
+
+## Workspace Files and Trash admission
+
+Updated direct and gateway transports send workspace_item_capability v1.
+Deploy the matching sync.ts and workspaceItemCapability.ts templates before
+using the updated runtime; older deployed argument validators reject the new
+field. Use the documented init --update flow, review conflicts, and merge the
+updated admission code into existing scaffold files before deployment. The
+template pack must be rebuilt alongside the provider runtime. Do not use a
+force reset of an existing backend as an upgrade shortcut.
+
+The canonical mutation checks incoming and stored posts/projects before
+applying catalog, logical Trash, or file-membership writes. Snapshot, pull and
+watchChanges also reject readers that omit v1 when returning these semantics.
+Gateway rejection becomes HTTP 426 with OR3_WORKSPACE_ITEM_UPDATE_REQUIRED;
+direct clients receive the explicit Convex update error.
+
+The source host exposes Files when an authorized session selects an adapter advertising workspace-item v1. Qualification against an official local Convex backend covers authenticated direct JWT calls and the Basic Auth gateway separately: schema/serialization, legacy admission, replay, catalog/Trash reference retention, native storage, viewer denial and revocation. The gateway was also exercised with filesystem storage. This is source qualification, not package publication or a live Clerk OAuth sign-in.
+
+Deploy the updated schema and storage.ts alongside the sync templates. file_meta.storage_id is an opaque provider-owned string, permitting filesystem/S3 identifiers. Native Convex storage operations require matching storage_provider_id ownership; viewers may read but cannot reserve, upload, commit, cancel, delete or run GC. Runtime/template publication remains a separate step.
+
+## Coordinated storage deletion
+
+Deploy the updated schema, storage.ts, sync.ts, storageDeletion.ts and workspace cleanup together. Native deletion/GC writes a private storage_deletion_claims barrier in the same mutation as physical deletion; sync metadata/reference creation honors it. Verified upload commits alone release a hash claim. Stale native storage IDs are rejected even after re-upload, including legacy metadata with a missing or empty storage provider ID. Claims persist until verified re-upload or workspace purge, independently of sync history retention. The runtime probes storage.deletionCapability and refuses cleanup against older scaffolds. The host additionally requires a matching storage/sync deletion-coordination declaration. Filesystem storage remains fail closed because it cannot join the canonical Convex transaction.

@@ -3,8 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../../../templates/convex/_generated/server', () => ({
   mutation: (definition: any) => ({ ...definition, _handler: definition.handler }),
   query: (definition: any) => ({ ...definition, _handler: definition.handler }),
+  internalMutation: (definition: any) => ({ ...definition, _handler: definition.handler }),
 }));
 
+import * as syncFunctions from '../../../templates/convex/sync';
 import * as storageFunctions from '../../../templates/convex/storage';
 import { verifyStorageReferenceContract } from '~~/shared/testing/contracts/storage';
 
@@ -18,6 +20,7 @@ function fixture() {
     workspace_members: [{ _id: 'member-1', workspace_id: 'ws-1', user_id: 'user-1', role: 'editor' }],
     file_meta: [],
     upload_intents: [],
+    storage_deletion_claims: [],
     messages: [],
     posts: [],
     change_log: [],
@@ -31,7 +34,7 @@ function fixture() {
     auth: { getUserIdentity: async () => ({ issuer: 'https://clerk.test', subject: 'subject-1' }) },
     storage: {
       generateUploadUrl: async () => 'https://upload.test',
-      delete: async (id: string) => { deletedObjects.push(id); },
+      delete: async (id: string) => { deletedObjects.push(id); objects.delete(id); },
       getUrl: async (id: string) => objects.has(id) ? `https://download.test/${id}` : null,
     },
     db: {
@@ -166,6 +169,45 @@ describe('Convex persisted upload intents', () => {
         return f.deletedObjects.map((id) => id.replace('blob-', ''));
       },
     });
+  });
+
+  it.each(['convex', ''])('keeps deletion claims and rejects stale native IDs after re-upload with provider %j', async (storageProviderId) => {
+    const f = fixture();
+    const hash = 'sha256:' + HASH;
+    f.tables.file_meta.push({ _id: 'removed-original', workspace_id: 'ws-1', hash, name: 'Original', kind: 'file',
+      mime_type: 'text/plain', size_bytes: 1, ref_count: 0, clock: 1, deleted: true, storage_provider_id: storageProviderId, storage_id: 'old-blob' });
+    f.objects.set('old-blob', { size: 1, sha256: hashBase64, contentType: 'text/plain' });
+    await handler(storageFunctions.deleteObject)(f.ctx, { workspace_id: 'ws-1', hash });
+    expect(f.tables.storage_deletion_claims).toContainEqual(expect.objectContaining({ hash: HASH, workspace_id: 'ws-1' }));
+    const push = handler(syncFunctions.push);
+    const operation = (table_name: string, pk: string, payload: any) => ({ op_id: crypto.randomUUID(), table_name, pk, payload,
+      operation: 'put', clock: 2_000_000_000, hlc: '2000000000:0:stale', device_id: 'stale-device' });
+    const reference = () => operation('posts', 'stale-document', { id: 'stale-document', post_type: 'doc', title: 'Stale reference',
+      content: '{}', file_hashes: JSON.stringify([hash]), deleted: false });
+    const metadata = () => operation('file_meta', hash, { hash, name: 'Stale original', mime_type: 'text/plain', kind: 'file', size_bytes: 1,
+      storage_id: 'old-blob', storage_provider_id: storageProviderId, deleted: false });
+    for (const op of [reference(), metadata()]) {
+      const receipt = await push(f.ctx, { workspace_id: 'ws-1', workspace_item_capability: 'v1', ops: [op] });
+      expect(receipt.results[0]).toMatchObject({ success: false });
+      expect(f.tables.posts).toHaveLength(0);
+      expect(f.tables.file_meta).toHaveLength(0);
+    }
+    const { intentId } = await handler(storageFunctions.generateUploadUrl)(f.ctx, { workspace_id: 'ws-1', hash,
+      mime_type: 'text/plain', size_bytes: 1, workspace_quota_bytes: 100 });
+    f.objects.set('new-blob', { size: 1, sha256: hashBase64, contentType: 'text/plain' });
+    await handler(storageFunctions.commitUpload)(f.ctx, { workspace_id: 'ws-1', hash, intent_id: intentId,
+      storage_id: 'new-blob', storage_provider_id: storageProviderId, name: 'Original', mime_type: 'text/plain', size_bytes: 1, kind: 'file' });
+    expect(f.tables.storage_deletion_claims).toHaveLength(0);
+    expect((await push(f.ctx, { workspace_id: 'ws-1', workspace_item_capability: 'v1', ops: [reference()] })).results[0]).toMatchObject({ success: true });
+    expect((await push(f.ctx, { workspace_id: 'ws-1', workspace_item_capability: 'v1', ops: [metadata()] })).results[0]).toMatchObject({ success: false });
+    expect(f.tables.file_meta[0].storage_id).toBe('new-blob');
+  });
+
+  it('refuses deletion of live metadata even when it has no reference edges', async () => {
+    const f = fixture();
+    f.tables.file_meta.push({ _id: 'live-original', workspace_id: 'ws-1', hash: HASH, deleted: false, storage_id: 'live-blob' });
+    await expect(handler(storageFunctions.deleteObject)(f.ctx, { workspace_id: 'ws-1', hash: HASH })).rejects.toThrow(/retained|live/i);
+    expect(f.deletedObjects).toEqual([]);
   });
 
   it('deletes an unreferenced object idempotently and removes its metadata', async () => {
