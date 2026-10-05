@@ -627,6 +627,24 @@ describe("Convex background request usage persistence", () => {
 });
 
 describe("Convex canonical history scaffold contract", () => {
+  // The deployed scaffold owns legacy membership resolution; transport tests alone
+  // cannot detect guessing an owner or admitting another workspace's association.
+  it('resolves legacy project ownership and refuses ambiguous associations', async () => {
+    const fixture = createFixture('editor');
+    const read = (syncFunctions.readChatHistory as RegisteredFunction)._handler;
+    const id = fixture.tables.threads[0].id;
+    const args = {workspace_id:'ws-1',actor_user_id:'user-1',query:{kind:'thread',thread_id:id}};
+    fixture.tables.projects = [{_id:'foreign',workspace_id:'ws-other',id:'foreign',data:[{kind:'chat',id}]}];
+    expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'resolved',thread:{project_id:null}});
+    fixture.tables.projects.push({_id:'one',workspace_id:'ws-1',id:'one',data:[id]});
+    expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'resolved',thread:{project_id:'one'}});
+    fixture.tables.projects.push({_id:'two',workspace_id:'ws-1',id:'two',data:JSON.stringify([{id}])});
+    expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'conflict'});
+    fixture.tables.threads[0].project_id = 'chosen';
+    expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'resolved',thread:{project_id:'chosen'}});
+    fixture.tables.workspace_members = [];
+    await expect(read(fixture.ctx,args)).rejects.toThrow('Forbidden');
+  });
   it("uses the selected built gateway and host scope service across partial delivery, missing capability and membership revocation", async () => {
     const fixture = createFixture('editor');
     const read = (syncFunctions.readChatHistory as RegisteredFunction)._handler;
