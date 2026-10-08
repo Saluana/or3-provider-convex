@@ -1,6 +1,6 @@
 {
     "name": "or3-provider-convex",
-    "version": "0.0.12",
+    "version": "0.0.13",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/Saluana/or3-provider-convex.git"
@@ -35,18 +35,22 @@
     "files": [
         "dist",
         "templates/convex.pack.json.gz",
-        "scripts/init.mjs"
+        "templates/convex.contract.json",
+        "templates/convex.previous.json",
+        "scripts/init.mjs",
+        "scripts/backend.mjs"
     ],
     "bin": {
         "or3-provider-convex": "./scripts/init.mjs"
     },
     "scripts": {
-        "prepack": "bun run build && bun run build:templates",
-        "build": "nuxt-module-build build",
+        "prepack": "bun run build",
+        "build": "bun run build:templates && nuxt-module-build build",
         "build:templates": "node ./scripts/build-template-pack.mjs",
         "type-check": "tsc --noEmit",
         "type-check:standalone": "tsc -p tsconfig.release.json --noEmit",
         "test:release": "vitest run --config vitest.release.config.ts",
+        "test:backend-lifecycle": "bun scripts/test/backend-lifecycle.mjs",
         "init": "node ./scripts/init.mjs",
         "test": "vitest run"
     },

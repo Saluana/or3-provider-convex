@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { convexBackendContract } from '../../../backend-contract';
 
 const registerAuthWorkspaceStoreMock = vi.hoisted(() => vi.fn());
 const registerSyncGatewayAdapterMock = vi.hoisted(() => vi.fn());
@@ -51,6 +52,7 @@ vi.mock('#imports', () => ({
 }));
 
 describe('convex register plugin', () => {
+    afterEach(() => vi.unstubAllGlobals());
     beforeEach(() => {
         vi.resetModules();
         registerAuthWorkspaceStoreMock.mockReset();
@@ -67,6 +69,7 @@ describe('convex register plugin', () => {
 
         process.env.NODE_ENV = 'test';
         delete process.env.OR3_CONVEX_ALLOW_INSECURE_HTTP;
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: 'success', value: convexBackendContract }))));
 
         useRuntimeConfigMock.mockReturnValue({
             auth: { enabled: true, provider: 'clerk' },
@@ -77,7 +80,7 @@ describe('convex register plugin', () => {
     });
 
     it('registers providers when convex config is valid', async () => {
-        await import('../register');
+        await (await import('../register')).default;
 
         expect(registerSyncGatewayAdapterMock).toHaveBeenCalledTimes(1);
         expect(registerStorageGatewayAdapterMock).toHaveBeenCalledTimes(1);
@@ -91,7 +94,7 @@ describe('convex register plugin', () => {
             public: { sync: { convexUrl: '' } },
         });
 
-        await expect(import('../register')).rejects.toThrow('Missing Convex URL');
+        await expect(import('../register').then((module) => module.default)).rejects.toThrow('Missing Convex URL');
         expect(registerSyncGatewayAdapterMock).not.toHaveBeenCalled();
     });
 
@@ -103,7 +106,7 @@ describe('convex register plugin', () => {
             public: { sync: { convexUrl: 'http://localhost:3210' } },
         });
 
-        await expect(import('../register')).rejects.toThrow(
+        await expect(import('../register').then((module) => module.default)).rejects.toThrow(
             'Convex URL must use HTTPS unless OR3_CONVEX_ALLOW_INSECURE_HTTP=true is explicitly set.'
         );
         expect(registerSyncGatewayAdapterMock).not.toHaveBeenCalled();
@@ -135,10 +138,25 @@ describe('convex register plugin', () => {
             },
         });
 
-        await import('../register');
+        await (await import('../register')).default;
 
         expect(registerConnectStoreMock).toHaveBeenCalledWith(
             expect.objectContaining({ id: 'convex' })
         );
+    });
+
+    it.each([
+        { status: 'success', value: { ...convexBackendContract, digest: 'a'.repeat(64) } },
+        { status: 'error', errorMessage: 'Could not find public function or3Backend:version' },
+    ])('refuses startup before registering against an incompatible backend: %j', async (body) => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(body))));
+        await expect(import('../register').then((module) => module.default)).rejects.toThrow(/backend.*match/i);
+        expect(registerAuthWorkspaceStoreMock).not.toHaveBeenCalled();
+    });
+
+    it('does not contact Convex in the SQLite profile', async () => {
+        useRuntimeConfigMock.mockReturnValue({ auth: { enabled: true }, sync: { enabled: true, provider: 'sqlite' }, storage: { enabled: true, provider: 'fs' } });
+        await (await import('../register')).default;
+        expect(fetch).not.toHaveBeenCalled();
     });
 });
