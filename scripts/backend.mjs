@@ -108,8 +108,21 @@ async function withLease(root, operation) {
         try { process.kill(owner.pid, 0); throw Error('A Convex update is already running for this checkout. Retry after it finishes.'); }
         catch (probe) {
             if (probe.code !== 'ESRCH') throw probe;
-            const abandoned = lock + '.' + randomUUID() + '.abandoned';
-            renameSync(lock, abandoned); rmSync(abandoned, { recursive: true }); mkdirSync(lock, { mode: 0o700 });
+            const recovery = join(lock, 'recovering');
+            try { writeFileSync(recovery, String(process.pid), { flag: 'wx', mode: 0o600 }); }
+            catch (claim) {
+                if (claim.code !== 'EEXIST') throw claim;
+                throw Error('Convex lease recovery is in progress or was interrupted. Inspect .or3/convex-update.lock before retrying.');
+            }
+            try {
+                // A second starter may have observed the same dead owner. The
+                // exclusive claim and re-read prevent it from stealing a live
+                // replacement lease during that ownership handoff.
+                const latest = JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8'));
+                try { process.kill(latest.pid, 0); throw Error('A Convex update is already running.'); }
+                catch (live) { if (live.code !== 'ESRCH') throw live; }
+                atomicWrite(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid }));
+            } finally { rmSync(recovery, { force: true }); }
         }
     }
     writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid }), { mode: 0o600 });
@@ -124,34 +137,46 @@ async function deploy(root, url, key) {
     const requireFromProvider = createRequire(import.meta.url);
     const cli = join(dirname(requireFromProvider.resolve('convex/package.json')), 'bin/main.js');
     const envPath = destination(root, '.or3/convex-deploy-' + randomUUID() + '.env');
-    atomicWrite(envPath, `CONVEX_SELF_HOSTED_URL=${url}\nCONVEX_SELF_HOSTED_ADMIN_KEY=${key}\n`);
     const env = { ...process.env, CONVEX_DEPLOYMENT: '', CONVEX_DEPLOY_KEY: '', CONVEX_SELF_HOSTED_URL: url, CONVEX_SELF_HOSTED_ADMIN_KEY: key, CI: 'true' };
+    let child, killTimer, timer, interrupted = false;
+    const terminate = () => {
+        interrupted = true;
+        if (child) {
+            const signal = (value) => {
+                if (process.platform === 'win32') child.kill(value);
+                else {
+                    try { process.kill(-child.pid, value); }
+                    catch (error) { if (error.code !== 'ESRCH') throw error; }
+                }
+            };
+            signal('SIGTERM');
+            killTimer ??= setTimeout(() => signal('SIGKILL'), 5_000);
+        }
+    };
+    // Register before creating deployment state or spawning a child: SIGTERM
+    // can otherwise kill this process in that gap, leaving the child orphaned.
+    process.once('SIGINT', terminate); process.once('SIGTERM', terminate);
     try {
+        atomicWrite(envPath, `CONVEX_SELF_HOSTED_URL=${url}\nCONVEX_SELF_HOSTED_ADMIN_KEY=${key}\n`);
         await new Promise((accept, reject) => {
-            const child = spawn(process.versions.bun ? 'node' : process.execPath, [cli, 'deploy', '--yes', '--typecheck', 'enable', '--env-file', envPath], { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] });
+            if (interrupted) { reject(Error('Convex deployment interrupted before startup.')); return; }
+            child = spawn(process.versions.bun ? 'node' : process.execPath, [cli, 'deploy', '--yes', '--typecheck', 'enable', '--env-file', envPath], { cwd: root, env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
             let output = '';
             const capture = (chunk) => { output = (output + String(chunk)).slice(-1024 * 1024); };
             child.stdout.on('data', capture); child.stderr.on('data', capture);
-            let killTimer;
-            const terminate = () => {
-                child.kill('SIGTERM');
-                killTimer ??= setTimeout(() => child.kill('SIGKILL'), 5_000);
-            };
-            process.once('SIGINT', terminate); process.once('SIGTERM', terminate);
-            const timer = setTimeout(terminate, 180_000);
-            const cleanup = () => {
-                clearTimeout(timer); clearTimeout(killTimer);
-                process.removeListener('SIGINT', terminate); process.removeListener('SIGTERM', terminate);
-            };
-            child.once('error', (error) => { cleanup(); reject(error); });
+            timer = setTimeout(terminate, 180_000);
+            child.once('error', reject);
             child.once('exit', (code) => {
-                cleanup();
                 const safe = output.split(key).join('[redacted]');
-                if (code === 0) { console.log(safe.trim()); accept(); }
+                if (code === 0 && !interrupted) { console.log(safe.trim()); accept(); }
                 else reject(Error(`Convex deployment failed (${code ?? 'terminated'}). Backend readiness was not recorded; retry after fixing the error.\n${safe}`));
             });
         });
-    } finally { rmSync(envPath, { force: true }); }
+    } finally {
+        clearTimeout(timer); clearTimeout(killTimer);
+        process.removeListener('SIGINT', terminate); process.removeListener('SIGTERM', terminate);
+        rmSync(envPath, { force: true });
+    }
 }
 
 export async function ensureBackend(root) {
