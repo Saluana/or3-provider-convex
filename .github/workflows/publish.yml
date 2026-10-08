@@ -49,6 +49,37 @@ jobs:
       - run: bun run build
       - name: Validate package archive
         run: npm pack --dry-run --json > "$RUNNER_TEMP/package-pack.json"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Saluana/or3-chat
+          ref: 3466408a440f37df6a8dea8683eec9d31b4b64a3
+          path: qualification-host
+      - name: Install canonical host qualification dependencies
+        working-directory: qualification-host
+        run: bun install --frozen-lockfile
+      - name: Verify startup compatibility guard
+        run: OR3_CANONICAL_HOST_ROOT="$PWD/qualification-host" bun x vitest run src/runtime/server/plugins/__tests__/register.test.ts
+      - name: Qualify packaged backend update lifecycle
+        run: |
+          set -euo pipefail
+          backend_dir="$HOME/.cache/convex/binaries/precompiled-2026-09-21-0cf49cb"
+          mkdir -p "$backend_dir" "$RUNNER_TEMP/qualified-provider"
+          curl --fail --location --silent --show-error --output "$RUNNER_TEMP/convex.zip" https://github.com/get-convex/convex-backend/releases/download/precompiled-2026-09-21-0cf49cb/convex-local-backend-x86_64-unknown-linux-gnu.zip
+          echo '90c680a70a817a4cb46b9610a2ea92b3b53e608f3d485d0417bc3cbb6196db2f  '"$RUNNER_TEMP/convex.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/convex.zip" -d "$backend_dir"
+          chmod +x "$backend_dir/convex-local-backend"
+          npm pack --pack-destination "$RUNNER_TEMP/qualified-provider" >/dev/null
+          tar -xzf "$RUNNER_TEMP/qualified-provider"/*.tgz -C "$RUNNER_TEMP/qualified-provider"
+          (cd "$RUNNER_TEMP/qualified-provider/package" && bun install --production --ignore-scripts)
+          bun run test:backend-lifecycle "$backend_dir/convex-local-backend" "$PWD/qualification-host" "$PWD/qualification-host/node_modules/or3-provider-convex/templates/convex.pack.json.gz" "$RUNNER_TEMP/convex-lifecycle" "$RUNNER_TEMP/qualified-provider/package"
+      - name: Upload backend lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: convex-backend-lifecycle
+          path: ${{ runner.temp }}/convex-lifecycle
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Create publish archive
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -96,8 +127,8 @@ jobs:
           package_json="$RUNNER_TEMP/or3-npm-package/package.json"
           name="$(node -e 'console.log(require(process.argv[1]).name)' "$package_json")"
           version="$(node -e 'console.log(require(process.argv[1]).version)' "$package_json")"
-          for attempt in {1..8}; do
-            if [[ "$(npm view "$name@$version" version 2>/dev/null || true)" == "$version" ]]; then exit 0; fi
+          for attempt in {1..24}; do
+            if [[ "$(npm view --prefer-online "$name@$version" version 2>/dev/null || true)" == "$version" ]]; then exit 0; fi
             sleep 5
           done
           echo "Timed out waiting for $name@$version to become visible on npm." >&2

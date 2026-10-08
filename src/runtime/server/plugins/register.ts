@@ -31,6 +31,7 @@ import {
 } from '../notifications/emit';
 import { useRuntimeConfig } from '#imports';
 import { createConvexConnectStore } from '../connect/convex-connect-store';
+import { convexBackendContract } from '../../backend-contract';
 
 const ALLOW_INSECURE_CONVEX_HTTP_ENV = 'OR3_CONVEX_ALLOW_INSECURE_HTTP';
 
@@ -57,7 +58,7 @@ type RuntimeConfigWithConvex = ReturnType<typeof useRuntimeConfig> & {
 
 function isConvexSelected(config: RuntimeConfigWithConvex): boolean {
     const syncSelected =
-        config.sync?.enabled === true &&
+        (config.sync?.enabled === true || config.auth.enabled === true) &&
         config.sync?.provider === CONVEX_PROVIDER_ID;
     const storageSelected =
         config.storage?.enabled === true &&
@@ -102,7 +103,7 @@ function validateConvexStartupConfig(config: RuntimeConfigWithConvex): string[] 
     return errors;
 }
 
-export default defineNitroPlugin(() => {
+export default defineNitroPlugin(async () => {
     const config = useRuntimeConfig() as RuntimeConfigWithConvex;
     if (!config.auth.enabled) return;
 
@@ -111,6 +112,24 @@ export default defineNitroPlugin(() => {
         throw new Error(
             `[or3-provider-convex] ${errors.join(' ')} Install/configure Convex provider env values and restart.`
         );
+    }
+
+    if (isConvexSelected(config)) {
+        const url = config.sync?.convexUrl?.trim() || config.public?.sync?.convexUrl?.trim();
+        try {
+            const response = await fetch(`${url}/api/query`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: 'or3Backend:version', args: {}, format: 'json' }),
+                signal: AbortSignal.timeout(10_000),
+            });
+            const result = await response.json();
+            if (!response.ok || result.status !== 'success' || result.value?.digest !== convexBackendContract.digest) {
+                throw new Error('Convex backend does not match this provider.');
+            }
+        } catch {
+            throw new Error('[or3-provider-convex] Convex backend could not be verified or does not match this provider. Start the source checkout with bun run dev or bun run preview to apply its backend update; custom deployments must run the installed or3-provider-convex deploy command.');
+        }
     }
 
     registerAuthWorkspaceStore({

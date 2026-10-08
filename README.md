@@ -34,16 +34,62 @@ Scaffold the Convex backend templates into your host project:
 bunx or3-provider-convex init
 ```
 
-Flags: `--update` adds missing files without touching existing ones, and
-`--force` deletes and rewrites the entire `convex/` directory.
+Flags: `--update` updates untouched provider-owned files and stops before any
+change if a file was customized. `--force` replaces provider-owned files after
+preserving a source backup; unrelated custom functions are retained.
 
-Then run codegen:
+For a manual development scaffold, run codegen:
 
 ```bash
 bunx convex dev --once
 ```
 
 This generates `convex/_generated/` in your host repo. The `_generated/` directory should be gitignored. The scaffold includes `convex/tsconfig.json`, so `convex dev --typecheck enable` checks the generated functions instead of skipping them. `convex dev --once` fails when `convex/` is absent, so `init` must run first.
+
+## Automatic updates from an OR3 source checkout
+
+With the matching OR3 source launcher, `bun run dev` / `bun run dev:ssr` and
+`bun run preview` check the deployed backend before starting the app. If the
+provider's backend changed, they update the scaffold, deploy it, then verify
+its actual code digest. Subsequent starts skip deployment. Builds, typechecks
+and static generation never deploy. A bare Nitro server only verifies; it
+cannot push backend code.
+
+Configure a server-only deployment credential once: `CONVEX_DEPLOY_KEY` for
+the exact Convex Cloud deployment, or `CONVEX_SELF_HOSTED_ADMIN_KEY` for a
+self-hosted deployment. The app's `VITE_CONVEX_URL` is the explicit target;
+`CONVEX_SELF_HOSTED_URL`, when supplied, must match it. Local CLI login state
+cannot select another project. Existing deployment environment variables are
+preserved, including Clerk issuer settings. No credential enters browser
+config, command-line arguments, or the source hash metadata. A deployment key
+takes precedence over a separate runtime admin credential for this operation.
+
+The standalone installed command is `bunx or3-provider-convex deploy`. It uses
+environment variables supplied by the source launcher; for direct invocation,
+load the deployment environment in your shell first. The built-in Convex CLI
+is taken from this installed provider, without downloading a latest CLI.
+
+Untouched 0.0.12 scaffolds are adopted automatically. After that,
+`.or3/convex-templates.json` tracks provider-owned file hashes, so later
+versions can replace untouched files and refuse local edits or deletions.
+Generated declarations and custom functions are not overwritten. Earlier or
+customized scaffolds need one deliberate merge; a conflict applies no files.
+Before a changed scaffold is installed, the old source is saved under
+`.or3/convex-backups/`. Keep these backups until the update is accepted.
+These are source backups, not backups of the remote Convex database.
+
+A checkout lease rejects concurrent updates and recovers a dead owner.
+Deployment failure stops app startup and leaves source backups available for
+inspection/retry. A remote backend newer than the local package (or a different
+digest at the same immutable version) is never downgraded automatically.
+Shared backends should have one designated updater. App rollback does not
+automatically roll back the remote backend or its data; use a compatible source
+version and review any intentional backend rollback separately.
+
+The public `or3Backend:version` query returns only `{ providerVersion, digest }`.
+The provider's Nitro startup guard refuses a missing or mismatched digest before
+registering persistence providers. Custom process managers should invoke the
+installed provider's `deploy` command before starting Nitro.
 
 ### 3. Required environment variables
 
@@ -188,7 +234,7 @@ their declarations.
   lease and atomic-admission mutations must match the server adapter version.
 - Background-job abort is poll-based (`checkJobAborted`); there is no in-process AbortController.
 - Never hand-edit `convex/_generated/`; codegen regenerates it.
-- `init --update` never overwrites modified scaffold files — it reports them as conflicts.
+- `init --update` stops before changing files when a provider-owned file was customized.
 
 ## Runtime entrypoints
 
@@ -256,10 +302,9 @@ plugin enablement, consent reviews, access policy, migration state, and guest
 access are **not** copied — they must be re-established through trusted host
 paths, with fresh approval where required.
 
-Upgrading an existing deployment: run `bunx or3-provider-convex init --update`.
-It adds the new `hostSettings.ts`, but it never overwrites existing template
-files — it reports them as conflicts. You **must** merge all of the following
-from the provider templates before deploying, or the upgrade is incomplete:
+For older or customized backends that cannot be adopted automatically, review
+the provider templates and merge the following host-settings changes before
+deploying. `init --update` refuses conflicting files before applying any update:
 
 1. `schema.ts` — the `host_settings` table definition.
 2. `sync.ts` — the reserved-key guard that blocks editor sync writes to
@@ -272,11 +317,9 @@ from the provider templates before deploying, or the upgrade is incomplete:
    Without this merge, hard-deleting a workspace retains its plugin
    configuration, consent reviews, and budget records.
 
-Do not rely on `init --update` to apply these. Review each reported conflict
-against the bundled template and merge it deliberately (or scaffold fresh with
-`--force`). Then run `bunx convex dev --once` (or deploy) before using the new
-server adapter. The adapter calls the new functions and must not be deployed
-ahead of them.
+Review each reported conflict against the bundled template and merge it
+deliberately. Then use the automatic source launcher or the installed provider
+`deploy` command before using the updated server adapter.
 
 
 ### Testing local changes in OR3 Chat

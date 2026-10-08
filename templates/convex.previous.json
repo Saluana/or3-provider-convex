@@ -1,0 +1,29 @@
+{
+  "version": "0.0.12",
+  "files": {
+    "admin.ts": "8ac128410f0448fcb99a153ee610d139936ae16e9127154018705299930f9e69",
+    "auth.config.ts": "9ad609fe26cf774dccc4033ad60f2a96465378f6318235576b306729765f54d5",
+    "authz.ts": "cceca40cc09e9b429ce3f1f976c952c7570faa1fe28e6ba2a810ab5522eb3ea1",
+    "backgroundJobs.ts": "0f4794408df279d58e09fcb19ce4c17c8bddfd5dcf35bea4be20559fdb6ae964",
+    "connect.ts": "620231dd60e267ee83a5634f3e99cb9f1964a99162434b70ed2434222ae3eb08",
+    "crons.ts": "25fe83dcaf336dfbadae11be424eef48bb79a161f1c5bfb1f8afab57d6e2cde0",
+    "historySeek.ts": "2adc6269abf764c61a720ccac305f0dcc8f106a67cb33ce2b4e760c0a24ef880",
+    "hostSettings.ts": "2ee0e523701fe843a421f9292f03f251783e24ace3a794ffdbb08929beee25bf",
+    "notifications.ts": "1f06b6a4900386be3b25d13f3b72bdea4dc81d1155e127dd688a139a04bdb251",
+    "rateLimits.ts": "7258424200aafb68010db18a13ab4e245e3f2701a4382145a081e87f1b8b7981",
+    "requestUsage.ts": "fa80ff02544a708d1d4bcf4f7d659d89c90b443d9bb8a880248edcc5c56c03f9",
+    "schema.ts": "641bb5e9a99b36f35fdc219599d364bc9439ee5941c6ba6e2bee6afa2975bc44",
+    "snapshot.ts": "f053ee65cfa8161ab05dbf5f5fa7558d5a8f4fa842997dd2d5c636a4dff3a76e",
+    "storage.ts": "e83007b24365ca387d150336a4ba1adfa4a62ec1f6a8dd64808a746ab2f1e523",
+    "storageDeletion.ts": "4ddc990dcabe7103d7542d72d19150634bcd728abffbf6f8283a2b07d4727027",
+    "sync.ts": "c00f4b0de00bad358dcd50465ceb347cdf9d1e0e5e1152acbdff4b8df44315e9",
+    "syncAuthoring.ts": "6806ce4981b9b49a8e5cd9fd960407e185d227d3312db40dc332470c7411d3a6",
+    "syncHistoryGcPolicy.ts": "136a5ac7d39f8ce430418bced7d34de6a6a5d2e3ff0a2be89c34404d870e75cb",
+    "tableMetadata.ts": "46e970ed2044d65dd615798d70b786673db44671c9c01653c7a4d77304831ef8",
+    "tsconfig.json": "6fc4c97410c21aca55e3568723bec5d50697ea50ee8d503f463f383a339726f3",
+    "users.ts": "15f42fd247bad750028d8a73b0afd73ec200d801adb4b9929eb1f0527f6d9f42",
+    "webhooks.ts": "66dc1f50f609837fff400552b836071bd6abb0c8436ae9d12ec415c5686b3b82",
+    "workspaceItemCapability.ts": "c22aa285d0b94b268abd2d747a6c4ccdcb711d542af9ea82712584ca31fb2c7c",
+    "workspaces.ts": "8b32a2b936886cf447a06873234c0a056d129f40fe4053c883a81427ebad46c6"
+  }
+}
