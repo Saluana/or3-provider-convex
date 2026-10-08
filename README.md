@@ -90,6 +90,9 @@ The public `or3Backend:version` query returns only `{ providerVersion, digest }`
 The provider's Nitro startup guard refuses a missing or mismatched digest before
 registering persistence providers. Custom process managers should invoke the
 installed provider's `deploy` command before starting Nitro.
+Prerendering skips the remote compatibility probe, so a source production build
+can finish before its backend update. Runtime startup still requires a matching
+backend before persistence services register.
 
 ### 3. Required environment variables
 

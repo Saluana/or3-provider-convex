@@ -114,7 +114,7 @@ export default defineNitroPlugin(async () => {
         );
     }
 
-    if (isConvexSelected(config)) {
+    if (!import.meta.prerender && isConvexSelected(config)) {
         const url = config.sync?.convexUrl?.trim() || config.public?.sync?.convexUrl?.trim();
         try {
             const response = await fetch(`${url}/api/query`, {
