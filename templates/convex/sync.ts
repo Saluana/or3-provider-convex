@@ -1485,7 +1485,18 @@ export const readChatHistory = internalQuery({
                 q.eq('workspace_id', args.workspace_id).eq('id', request.thread_id)).first();
             const threadRevision = await ctx.db.query('chat_history_revisions').withIndex('by_workspace_thread', (q) =>
                 q.eq('workspace_id', args.workspace_id).eq('thread_id', request.thread_id)).first();
-            return { status: 'ok', revision: String(threadRevision?.value ?? 0), thread: row ? wire(row) : undefined };
+            if (!row || row.project_id) return { status: 'ok', project_ownership: 'resolved',
+                revision: String(threadRevision?.value ?? 0), thread: row ? wire(row) : undefined };
+            const projects = await ctx.db.query('projects').withIndex('by_workspace', (q) => q.eq('workspace_id', args.workspace_id)).collect();
+            const owners = projects.filter(project => {
+                if (project.deleted) return false;
+                const entries: unknown = typeof project.data === 'string' ? JSON.parse(project.data) : project.data ?? [];
+                if (!Array.isArray(entries)) throw new Error('Canonical project membership is unresolved.');
+                return entries.some(entry => typeof entry === 'string' ? entry === request.thread_id
+                    : entry && typeof entry === 'object' && !Array.isArray(entry) && (entry.kind === undefined || entry.kind === 'chat') && entry.id === request.thread_id);
+            });
+            return { status: 'ok', project_ownership: owners.length > 1 ? 'conflict' : 'resolved',
+                revision: String(threadRevision?.value ?? 0), thread: { ...wire(row), project_id: owners[0]?.id ?? null } };
         }
         if (request.kind === 'messages') {
             if (request.message_ids.length > 100 || request.message_ids.some((id) => !validId(id))) throw new Error('Invalid bounded message query');

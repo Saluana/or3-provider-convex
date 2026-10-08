@@ -298,6 +298,10 @@ The canonical-history qualification lane defaults to a sibling `../or3-chat` che
 
 ## Workspace Files and Trash admission
 
+Persistent Projects preserves opaque `or3:project-settings`, `or3:project-memory`, and `or3:project-source` posts, including complete JSON, metadata, and all original/extraction hash references. The project-aware `readChatHistory` scaffold resolves explicit and legacy project ownership within the authorized transaction and returns `project_ownership: resolved | conflict`. Ambiguous/malformed memberships refuse server admission. Rebuild the template pack and deploy the updated scaffold when upgrading; a host-only update cannot add this ownership check.
+
+Version 0.0.12 declares `projectOwnership: 'v1'` on the canonical-history adapter. Deploy the updated sync scaffold before enabling server execution with this version; the runtime marker alone cannot upgrade an existing backend. Projects qualification: `OR3_CANONICAL_HOST_ROOT=/absolute/path/to/or3-chat bun x vitest run src/runtime/__tests__/convex-snapshot-contract.test.ts`, followed by the host's disposable deployed Convex cloud journey.
+
 Updated direct and gateway transports send workspace_item_capability v1.
 Deploy the matching sync.ts and workspaceItemCapability.ts templates before
 using the updated runtime; older deployed argument validators reject the new
