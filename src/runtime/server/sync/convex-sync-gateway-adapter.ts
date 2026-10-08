@@ -366,6 +366,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         historyRetention: 'snapshot-v1',
         backgroundGenerationHistory: 'v1',
         canonicalChatHistory: 'v1',
+        projectOwnership: 'v1',
         workspaceItems: 'v1',
     } as const;
 

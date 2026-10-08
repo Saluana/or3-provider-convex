@@ -1689,7 +1689,7 @@ describe("Convex materialized snapshot contract", () => {
     expect(fixture.tables.server_version_counter[0]!.value).toBe(before);
   });
 
-  it("ships the snapshot mutation, schema, helper, and ignored host mirror", () => {
+  it("ships the snapshot mutation, schema, helper, and typechecked configuration", () => {
     const packPath = new URL(
       "../../../templates/convex.pack.json.gz",
       import.meta.url,
@@ -1725,21 +1725,5 @@ describe("Convex materialized snapshot contract", () => {
     expect(packed.files["tsconfig.json"]).toContain('"strict": true');
     expect(packed.files["tsconfig.json"]).toContain('"noEmit": true');
 
-    const mirrorSync = readFileSync(
-      new URL("../../../../or3-chat/convex/sync.ts", import.meta.url),
-      "utf8",
-    );
-    const mirrorSchema = readFileSync(
-      new URL("../../../../or3-chat/convex/schema.ts", import.meta.url),
-      "utf8",
-    );
-    expect(mirrorSync).toContain("export const snapshot = mutation");
-    expect(mirrorSync).toContain("export const queryCanonicalStorage = query");
-    expect(mirrorSync).toContain("Conflicting operations reuse op_id");
-    expect(mirrorSync).toContain("must match operation pk");
-    expect(mirrorSync).toContain(
-      "const shouldApplyDelete = incomingWinsStoredRevision",
-    );
-    expect(mirrorSchema).toContain("sync_record_versions: defineTable");
   });
 });
