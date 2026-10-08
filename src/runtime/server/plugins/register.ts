@@ -103,10 +103,10 @@ function validateConvexStartupConfig(config: RuntimeConfigWithConvex): string[] 
     return errors;
 }
 
-export default defineNitroPlugin(async () => {
-    const config = useRuntimeConfig() as RuntimeConfigWithConvex;
-    if (!config.auth.enabled) return;
-
+// Nitro invokes plugins synchronously. Verify during module initialization so
+// provider validation and the HTTP listener cannot race an unfinished probe.
+const config = useRuntimeConfig() as RuntimeConfigWithConvex;
+if (config.auth.enabled) {
     const errors = validateConvexStartupConfig(config);
     if (errors.length > 0) {
         throw new Error(
@@ -114,7 +114,7 @@ export default defineNitroPlugin(async () => {
         );
     }
 
-    if (isConvexSelected(config)) {
+    if (!import.meta.prerender && isConvexSelected(config)) {
         const url = config.sync?.convexUrl?.trim() || config.public?.sync?.convexUrl?.trim();
         try {
             const response = await fetch(`${url}/api/query`, {
@@ -131,6 +131,10 @@ export default defineNitroPlugin(async () => {
             throw new Error('[or3-provider-convex] Convex backend could not be verified or does not match this provider. Start the source checkout with bun run dev or bun run preview to apply its backend update; custom deployments must run the installed or3-provider-convex deploy command.');
         }
     }
+}
+
+export default defineNitroPlugin(() => {
+    if (!config.auth.enabled) return;
 
     registerAuthWorkspaceStore({
         id: CONVEX_PROVIDER_ID,
