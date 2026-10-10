@@ -744,6 +744,12 @@ export const claimClientTool = internalMutation({
                 ...pending,
                 claimToken: args.claim_token,
                 claimExpiresAt: args.claim_expires_at,
+                // Bind this claim to the exact arguments the user is about to
+                // review. If the parked call is re-parked with different
+                // arguments, the fresh object carries no token; if arguments
+                // are mutated in place, the fingerprint check in
+                // settleClientTool rejects the stale claim.
+                claimFingerprint: pending.argumentFingerprint,
             },
         };
         await ctx.db.patch(job._id, {
@@ -791,7 +797,13 @@ export const settleClientTool = internalMutation({
             !pending ||
             pending.callId !== args.call_id ||
             pending.claimToken !== args.claim_token ||
-            (pending.claimExpiresAt ?? 0) <= now
+            (pending.claimExpiresAt ?? 0) <= now ||
+            // The claim was granted for a specific argument digest. If the
+            // parked arguments changed since (replacement race or in-place
+            // mutation), this approval must not authorize the new arguments.
+            // Claims granted before the fingerprint existed skip this check.
+            (pending.claimFingerprint !== undefined &&
+                pending.argumentFingerprint !== pending.claimFingerprint)
         ) return false;
         await ctx.db.patch(job._id, {
             execution: args.execution,
