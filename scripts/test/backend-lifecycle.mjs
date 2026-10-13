@@ -31,6 +31,12 @@ for (const [name, contents] of Object.entries(old.files)) {
     await mkdir(resolve(target, '..'), { recursive: true });
     await writeFile(target, contents);
 }
+if (!signupOnly && old.files['or3Backend.ts']) {
+    // Current published installations include the manifest written by their
+    // initializer. Exercise that owner rather than inventing an install receipt.
+    const { initializeTemplates } = await import(join(resolve(basePack, '../..'), 'scripts/backend.mjs'));
+    initializeTemplates(root);
+}
 // A real extra function/table-independent persistent record, preserved by deploy.
 await writeFile(join(root, 'convex', 'upgradeProbe.ts'), `
 import { internalMutation, internalQuery } from './_generated/server';
@@ -66,6 +72,13 @@ async function run(args, override = {}) {
     return { code, output };
 }
 async function convexRun(...args) { const result = await run([convex, ...args, '--env-file', envPath]); assert.equal(result.code, 0, result.output); return result; }
+async function assertOriginalMarker() {
+    const source = await readFile(join(root, 'convex/or3Backend.ts'), 'utf8').catch(error => {
+        if (error.code === 'ENOENT') return undefined;
+        throw error;
+    });
+    assert.equal(source, old.files['or3Backend.ts']);
+}
 const checks = [];
 async function check(name, operation) { await operation(); checks.push(name); console.log('PASS ' + name); }
 try {
@@ -213,7 +226,7 @@ try {
     await check('missing deployment credential refuses before any source mutation', async () => {
         const result = await run([cli, 'deploy'], { CONVEX_SELF_HOSTED_ADMIN_KEY: '' });
         assert.notEqual(result.code, 0); assert.match(result.output, /credential|CONVEX_DEPLOY_KEY/i);
-        await assert.rejects(readFile(join(root, 'convex/or3Backend.ts')));
+        await assertOriginalMarker();
     });
     await check('custom edits block before any scaffold change', async () => {
         const schemaPath = join(root, 'convex/schema.ts');
@@ -222,7 +235,7 @@ try {
         const result = await run([cli, 'deploy']);
         assert.notEqual(result.code, 0);
         assert.match(result.output, /customized|conflict/i);
-        await assert.rejects(readFile(join(root, 'convex/or3Backend.ts')));
+        await assertOriginalMarker();
         await writeFile(schemaPath, schema);
     });
     await check('a template symlink cannot overwrite a file outside the scaffold', async () => {
@@ -232,13 +245,13 @@ try {
         try {
             const result = await run([cli, 'deploy']); assert.notEqual(result.code, 0); assert.match(result.output, /symbolic link/i);
             assert.deepEqual(await readFile(outside), contents);
-            await assert.rejects(readFile(join(root, 'convex/or3Backend.ts')));
+            await assertOriginalMarker();
         } finally { await rm(schemaPath); await writeFile(schemaPath, contents); }
     });
     await check('credential destination mismatch refuses before mutation', async () => {
         const result = await run([cli, 'deploy'], { CONVEX_SELF_HOSTED_URL: `http://127.0.0.1:${sitePort}` });
         assert.notEqual(result.code, 0); assert.match(result.output, /match|target/i);
-        await assert.rejects(readFile(join(root, 'convex/or3Backend.ts')));
+        await assertOriginalMarker();
     });
     await check('upgrade adopts untouched previous scaffold and verifies the real backend', async () => {
         const result = await run([cli, 'deploy'], { CONVEX_DEPLOY_KEY: adminKey, CONVEX_SELF_HOSTED_ADMIN_KEY: 'separate-runtime-auth-key' });
