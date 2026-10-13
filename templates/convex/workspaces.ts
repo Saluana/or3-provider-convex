@@ -27,10 +27,11 @@ import {
     type MutationCtx,
     type QueryCtx,
 } from './_generated/server';
-import { v } from 'convex/values';
+import { ConvexError, v } from 'convex/values';
 import type { Id, TableNames } from './_generated/dataModel';
 import {
     requireCallerSubject,
+    isTrustedServerIdentity,
     requireInviteAcceptance,
     requireActiveWorkspace,
     requireWorkspaceRole,
@@ -384,6 +385,7 @@ export const create = mutation({
             // Create user first
             userId = await ctx.db.insert('users', {
                 email: identity.email ?? undefined,
+                normalized_email: normalizeEmail(identity.email ?? ''),
                 display_name: identity.name ?? undefined,
                 created_at: now,
             });
@@ -573,6 +575,7 @@ export const ensure = mutation({
         if (!authAccount) {
             userId = await ctx.db.insert('users', {
                 email: args.email,
+                normalized_email: normalizeEmail(args.email ?? ''),
                 display_name: args.name,
                 created_at: now,
             });
@@ -905,6 +908,7 @@ export const acceptInviteAndProvisionUser = internalMutation({
         } else {
             userId = await ctx.db.insert('users', {
                 email,
+                normalized_email: email,
                 display_name: args.name,
                 active_workspace_id: args.workspace_id,
                 created_at: now,
@@ -1045,5 +1049,136 @@ export const consumeInvite = mutation({
         });
 
         return { ok: true as const, role: invite.role };
+    },
+});
+
+
+// Signup invitations are internal-only and require the existing SSR admin bridge.
+async function requireSignupServer(ctx: MutationCtx | QueryCtx) {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity || !isTrustedServerIdentity(identity)) throw new Error('Forbidden');
+    return identity;
+}
+async function cleanupSignupInvites(ctx: MutationCtx) {
+    const rows = await ctx.db.query('signup_invites').withIndex('by_retention', q => q.lt('retain_until', Date.now())).take(100);
+    for (const row of rows) await ctx.db.delete(row._id);
+}
+async function signupInvite(ctx: MutationCtx | QueryCtx, id: string) {
+    return ctx.db.query('signup_invites').withIndex('by_invite_id', (q: any) => q.eq('id', id)).unique();
+}
+function checkSignupInvite(invite: any, email: string, hash: string) {
+    if (!invite) return { ok: false as const, reason: 'not_found' as const };
+    if (invite.token_hash !== hash) return { ok: false as const, reason: 'token_mismatch' as const };
+    if (invite.email !== normalizeEmail(email)) return { ok: false as const, reason: 'email_mismatch' as const };
+    if (invite.status === 'accepted') return { ok: false as const, reason: 'already_used' as const };
+    if (invite.status === 'revoked') return { ok: false as const, reason: 'revoked' as const };
+    if (invite.expires_at <= Date.now()) return { ok: false as const, reason: 'expired' as const };
+    return { ok: true as const };
+}
+// Missing index values are the persistent migration queue. Each transaction
+// handles at most 100 legacy rows, so interruptions and concurrent callers can
+// resume without rescanning migrated users or retaining an in-memory cursor.
+export const backfillSignupInviteEmails = internalMutation({
+    args: {},
+    handler: async (ctx) => {
+        await requireSignupServer(ctx);
+        const users = await ctx.db.query('users')
+            .withIndex('by_normalized_email', q => q.eq('normalized_email', undefined))
+            .take(100);
+        for (const user of users) {
+            await ctx.db.patch(user._id, { normalized_email: normalizeEmail(user.email ?? '') });
+        }
+        return { done: users.length < 100, updated: users.length };
+    },
+});
+
+export const createSignupInvite = internalMutation({
+    args: { id: v.string(), email: v.string(), token_hash: v.string(), expires_at: v.number(), created_by_admin: v.string() },
+    handler: async (ctx, args) => {
+        await requireSignupServer(ctx);
+        await cleanupSignupInvites(ctx);
+        if (await signupInvite(ctx, args.id) || await ctx.db.query('signup_invites').withIndex('by_token_hash', q => q.eq('token_hash', args.token_hash)).first()) throw new Error('Invitation already exists');
+        await ctx.db.insert('signup_invites', { ...args, email: normalizeEmail(args.email), status: 'pending', created_at: Date.now(), retain_until: args.expires_at + 90 * 86400_000 });
+        return { id: args.id };
+    },
+});
+export const listSignupInvites = internalMutation({
+    args: { limit: v.number(), cursor: v.optional(v.string()) },
+    handler: async (ctx, args) => {
+        await requireSignupServer(ctx);
+        await cleanupSignupInvites(ctx);
+        let page;
+        try {
+            page = await ctx.db.query('signup_invites').withIndex('by_created').order('desc')
+                .paginate({ numItems: Math.max(1, Math.min(100, Math.trunc(args.limit))), cursor: args.cursor ?? null });
+        } catch (error) {
+            // Malformed cursors fail during decoding; query-mismatched cursors
+            // use the system error recognized by Convex's pagination client.
+            if (
+                (error instanceof ConvexError && typeof error.data === 'object' &&
+                    error.data?.isConvexSystemError === true && error.data?.paginationError === 'InvalidCursor') ||
+                (error instanceof Error && (error.message === 'Failed to parse cursor' || error.message.includes('InvalidCursor')))
+            ) {
+                throw new ConvexError({ code: 'invalid_signup_invite_cursor' });
+            }
+            throw error;
+        }
+        return { invites: page.page.map(row => ({
+            id: row.id, email: row.email, status: row.status === 'pending' && row.expires_at <= Date.now() ? 'expired' : row.status,
+            expires_at: row.expires_at, created_at: row.created_at, created_by_admin: row.created_by_admin,
+            revoked_at: row.revoked_at, accepted_at: row.accepted_at, user_id: row.user_id, workspace_id: row.workspace_id,
+        })), next_cursor: page.isDone ? null : page.continueCursor };
+    },
+});
+export const revokeSignupInvite = internalMutation({
+    args: { id: v.string() },
+    handler: async (ctx, args) => {
+        await requireSignupServer(ctx);
+        const row = await signupInvite(ctx, args.id);
+        if (!row) return { ok: false as const, reason: 'not_found' as const };
+        if (row.status !== 'pending' || row.expires_at <= Date.now()) return { ok: false as const, reason: 'already_used' as const };
+        const now = Date.now();
+        await ctx.db.patch(row._id, { status: 'revoked', revoked_at: now, retain_until: now + 90 * 86400_000 });
+        return { ok: true as const };
+    },
+});
+export const validateSignupInvite = internalQuery({
+    args: { id: v.string(), email: v.string(), token_hash: v.string() },
+    handler: async (ctx, args) => {
+        await requireSignupServer(ctx);
+        return checkSignupInvite(await signupInvite(ctx, args.id), args.email, args.token_hash);
+    },
+});
+export const acceptSignupInviteAndProvisionUser = internalMutation({
+    args: { invite_id: v.string(), token_hash: v.string(), provider: v.string(), provider_user_id: v.string(), email: v.string(), display_name: v.optional(v.string()) },
+    handler: async (ctx, args) => {
+        const identity = await requireSignupServer(ctx);
+        await requireCallerSubject(ctx, { provider: args.provider, providerUserId: args.provider_user_id });
+        const email = normalizeEmail(args.email);
+        if (typeof identity.email !== 'string' || normalizeEmail(identity.email) !== email) throw new Error('Forbidden');
+        const row = await signupInvite(ctx, args.invite_id);
+        if (row?.status === 'accepted' && row.token_hash === args.token_hash && row.email === email
+            && row.accepted_provider === args.provider && row.accepted_provider_user_id === args.provider_user_id) {
+            return { ok: true as const, user_id: row.user_id!, workspace_id: row.workspace_id!, workspace_name: 'My Workspace', created: false };
+        }
+        const check = checkSignupInvite(row, email, args.token_hash);
+        if (!check.ok) return check;
+        const mapped = await ctx.db.query('auth_accounts').withIndex('by_provider', q => q.eq('provider', args.provider).eq('provider_user_id', args.provider_user_id)).first();
+        // Refuse partial migration rather than overlooking a legacy address.
+        // The provider completes bounded backfill transactions before this call.
+        const unindexed = await ctx.db.query('users')
+            .withIndex('by_normalized_email', q => q.eq('normalized_email', undefined)).first();
+        if (unindexed) throw new Error('Signup email index requires backfill');
+        const existing = await ctx.db.query('users').withIndex('by_normalized_email', q => q.eq('normalized_email', email)).first();
+        if (mapped || existing) return { ok: false as const, reason: 'account_exists' as const };
+        const now = Date.now();
+        const userId = await ctx.db.insert('users', { email, normalized_email: email, display_name: args.display_name, created_at: now });
+        await ctx.db.insert('auth_accounts', { user_id: userId, provider: args.provider, provider_user_id: args.provider_user_id, created_at: now });
+        const workspaceId = await ctx.db.insert('workspaces', { name: 'My Workspace', owner_user_id: userId, created_at: now });
+        await ctx.db.insert('workspace_members', { workspace_id: workspaceId, user_id: userId, role: 'owner', created_at: now });
+        await ctx.db.patch(userId, { active_workspace_id: workspaceId });
+        await ctx.db.patch(row!._id, { status: 'accepted', accepted_at: now, user_id: userId, workspace_id: workspaceId,
+            accepted_provider: args.provider, accepted_provider_user_id: args.provider_user_id, retain_until: now + 90 * 86400_000 });
+        return { ok: true as const, user_id: userId, workspace_id: workspaceId, workspace_name: 'My Workspace', created: true };
     },
 });

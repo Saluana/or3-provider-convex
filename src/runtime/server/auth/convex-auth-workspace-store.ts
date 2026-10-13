@@ -9,11 +9,15 @@
  */
 import type {
     AuthWorkspaceStore,
+    SignupInviteSummary,
+    SignupValidationResult,
+    SignupProvisionResult,
     InviteProvisionResult,
     InviteValidationResult,
 } from '~~/server/auth/store/types';
 import type { WorkspaceRole } from '~~/app/core/hooks/hook-types';
-import type { GenericId as Id } from 'convex/values';
+import { createError } from 'h3';
+import { ConvexError, type GenericId as Id } from 'convex/values';
 import { ConvexHttpClient } from 'convex/browser';
 import {
     convexApi as api,
@@ -147,6 +151,7 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         try {
             return await withConvexTransportRetry(operation, run);
         } catch (error) {
+            if (operation.includes('SignupInvite') && error instanceof Error && /Could not find (?:public|internal) function/.test(error.message)) throw createError({ statusCode: 503, statusMessage: 'Signup invite functions are not deployed on the selected Convex backend.' });
             throwAsConvexServiceUnavailable(error, 'Auth backend unavailable');
         }
     }
@@ -520,6 +525,49 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
                 invite_id: input.inviteId as any,
             })
         );
+    }
+
+    private async ensureSignupInviteEmails(client: ConvexHttpClient): Promise<void> {
+        for (;;) {
+            const page = await this.runConvexOperation('workspaces.backfillSignupInviteEmails', () =>
+                client.mutation(internalApi.workspaces.backfillSignupInviteEmails, {})
+            ) as { done: boolean };
+            if (page.done) return;
+        }
+    }
+
+    async createSignupInvite(input: { id: string; email: string; token_hash: string; expires_at: number; created_by_admin: string }): Promise<{ id: string }> {
+        const client = getAdminConvexClient(getConfiguredAuthProvider(), input.created_by_admin);
+        await this.ensureSignupInviteEmails(client);
+        return this.runConvexOperation('workspaces.createSignupInvite', () => client.mutation(internalApi.workspaces.createSignupInvite, input));
+    }
+    async listSignupInvites(input: { limit: number; cursor?: string }): Promise<{ invites: SignupInviteSummary[]; next_cursor: string | null }> {
+        const client = getAdminConvexClient(getConfiguredAuthProvider(), 'signup-invite-admin');
+        try {
+            return await this.runConvexOperation('workspaces.listSignupInvites', () => client.mutation(internalApi.workspaces.listSignupInvites, input));
+        } catch (error) {
+            if (error instanceof ConvexError && error.data && typeof error.data === 'object' &&
+                Reflect.get(error.data, 'code') === 'invalid_signup_invite_cursor') {
+                throw createError({ statusCode: 400, statusMessage: 'Invalid invite cursor' });
+            }
+            throw error;
+        }
+    }
+    async revokeSignupInvite(input: { id: string }): Promise<{ ok: true } | { ok: false; reason: 'not_found' | 'already_used' }> {
+        const client = getAdminConvexClient(getConfiguredAuthProvider(), 'signup-invite-admin');
+        return this.runConvexOperation('workspaces.revokeSignupInvite', () => client.mutation(internalApi.workspaces.revokeSignupInvite, input));
+    }
+    async validateSignupInvite(input: { id: string; email: string; token_hash: string }): Promise<SignupValidationResult> {
+        const client = getAdminConvexClient(getConfiguredAuthProvider(), 'signup-invite-preflight');
+        await this.ensureSignupInviteEmails(client);
+        return this.runConvexOperation('workspaces.validateSignupInvite', () => client.query(internalApi.workspaces.validateSignupInvite, input));
+    }
+    async acceptSignupInviteAndProvisionUser(input: { invite_id: string; token_hash: string; provider: string; provider_user_id: string; email: string; display_name?: string }): Promise<SignupProvisionResult> {
+        const client = getAdminConvexClient(input.provider, input.provider_user_id, { email: input.email });
+        await this.ensureSignupInviteEmails(client);
+        const result = await this.runConvexOperation('workspaces.acceptSignupInviteAndProvisionUser', () => client.mutation(internalApi.workspaces.acceptSignupInviteAndProvisionUser, input)) as SignupProvisionResult;
+        if (result.ok) this.rememberProviderIdentity({ userId: result.user_id, provider: input.provider, providerUserId: input.provider_user_id });
+        return result;
     }
 
     async validateInvite(input: {

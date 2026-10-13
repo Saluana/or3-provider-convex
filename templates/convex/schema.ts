@@ -32,11 +32,14 @@ export default defineSchema({
      */
     users: defineTable({
         email: v.optional(v.string()),
+        // Absent only on pre-migration rows; an empty string represents no email.
+        normalized_email: v.optional(v.string()),
         display_name: v.optional(v.string()),
         active_workspace_id: v.optional(v.id('workspaces')),
         created_at: v.number(),
     })
         .index('by_email', ['email'])
+        .index('by_normalized_email', ['normalized_email'])
         .index('by_display_name', ['display_name']),
 
 
@@ -81,6 +84,17 @@ export default defineSchema({
     /**
      * Workspace invites - invite-only onboarding records.
      */
+    signup_invites: defineTable({
+        id: v.string(), email: v.string(), token_hash: v.string(),
+        status: v.union(v.literal('pending'), v.literal('accepted'), v.literal('revoked')),
+        expires_at: v.number(), created_at: v.number(), created_by_admin: v.string(),
+        revoked_at: v.optional(v.number()), accepted_at: v.optional(v.number()),
+        user_id: v.optional(v.id('users')), workspace_id: v.optional(v.id('workspaces')),
+        accepted_provider: v.optional(v.string()), accepted_provider_user_id: v.optional(v.string()),
+        retain_until: v.number(),
+    }).index('by_invite_id', ['id']).index('by_token_hash', ['token_hash'])
+        .index('by_created', ['created_at', 'id']).index('by_retention', ['retain_until']),
+
     auth_invites: defineTable({
         workspace_id: v.id('workspaces'),
         email: v.string(),
