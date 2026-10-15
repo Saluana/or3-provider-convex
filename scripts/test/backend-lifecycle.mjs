@@ -319,6 +319,21 @@ try {
         const result = await run([cli, 'deploy']); assert.notEqual(result.code, 0); assert.match(result.output, /newer|downgrade/i);
         await writeFile(markerPath, source); await convexRun('deploy', '--yes', '--typecheck', 'enable');
     });
+    // Real concurrent transactions must enforce shared capacity; a route-side
+    // count or a scripted database cannot prove this invariant.
+    await check('concurrent webhook registrations cannot exceed the durable scope quota', async () => {
+        const { ConvexHttpClient } = await import(join(host, 'node_modules/convex/dist/esm/browser/index.js'));
+        const client = new ConvexHttpClient(url);
+        client.setAdminAuth(adminKey);
+        const outcomes = await Promise.all(Array.from({ length: 12 }, () => client.mutation('webhooks:createWebhook', {
+            id: crypto.randomUUID(), scope: 'user', user_id: 'quota-member', workspace_id: 'quota-workspace',
+            url: 'https://example.test/webhook', label: '', events: ['thread.created'], custom_hooks: [],
+            signing_secret_enc: 'synthetic', enabled: true, health: 'unknown',
+            created_at: Date.now(), updated_at: Date.now(), registration_limit: 5,
+        })));
+        assert.equal(outcomes.filter(Boolean).length, 5);
+        assert.equal(outcomes.filter(value => value === null).length, 7);
+    });
     await check('unavailable backend never becomes permission to deploy', async () => {
         backend.kill(); await backend.exited; backend = undefined;
         const result = await run([cli, 'deploy']); assert.notEqual(result.code, 0); assert.match(result.output, /reach|fetch|connect/i);
