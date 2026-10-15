@@ -20,6 +20,7 @@ const deliveryStatus = v.union(
 
 export const createWebhook = internalMutation({
     args: {
+        registration_limit: v.optional(v.number()),
         id: v.string(),
         scope: v.union(v.literal('user'), v.literal('admin')),
         user_id: v.optional(v.union(v.string(), v.null())),
@@ -35,12 +36,21 @@ export const createWebhook = internalMutation({
         updated_at: v.number(),
     },
     handler: async (ctx, args) => {
+        const { registration_limit: limit, ...registration } = args;
+        if (limit !== undefined) {
+            if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('Invalid webhook registration limit');
+            const query = ctx.db.query('webhook_registrations');
+            const scoped = args.scope === 'admin'
+                ? query.withIndex('by_scope_created', (q: any) => q.eq('scope', 'admin'))
+                : query.withIndex('by_scope_user_workspace_created', (q: any) => q.eq('scope', 'user').eq('user_id', args.user_id ?? undefined).eq('workspace_id', args.workspace_id ?? undefined));
+            if ((await scoped.take(limit)).length >= limit) return null;
+        }
         await ctx.db.insert('webhook_registrations', {
-            ...args,
+            ...registration,
             user_id: args.user_id ?? undefined,
             workspace_id: args.workspace_id ?? undefined,
         });
-        return args;
+        return registration;
     },
 });
 

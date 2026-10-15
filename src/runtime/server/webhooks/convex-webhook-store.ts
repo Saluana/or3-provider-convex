@@ -134,11 +134,13 @@ function toDeliveryLog(row: ConvexDeliveryLogRow): WebhookDeliveryLog {
 }
 
 class ConvexWebhookStore implements WebhookStore {
+    readonly registrationLimit = 'atomic-v1' as const;
     async createWebhook(
         webhook: Omit<
             WebhookRegistration,
             'id' | 'health' | 'created_at' | 'updated_at'
-        >
+        >,
+        registrationLimit?: number
     ): Promise<WebhookRegistration> {
         const now = Date.now();
         const row: WebhookRegistration = {
@@ -152,6 +154,7 @@ class ConvexWebhookStore implements WebhookStore {
         const client = getConvexWebhookClient();
         const created = await runConvexOperation('webhooks.createWebhook', () =>
             client.mutation(internalApi.webhooks.createWebhook, {
+                registration_limit: registrationLimit,
                 id: row.id,
                 scope: row.scope,
                 user_id: row.user_id,
@@ -168,6 +171,7 @@ class ConvexWebhookStore implements WebhookStore {
             })
         );
 
+        if (!created) throw Object.assign(new Error('Webhook limit exceeded'), { code: 'WEBHOOK_LIMIT_EXCEEDED' });
         return toWebhookRegistration(created as ConvexWebhookRow);
     }
 
