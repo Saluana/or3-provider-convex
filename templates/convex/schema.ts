@@ -405,12 +405,14 @@ export default defineSchema({
             v.literal('cancelled')
         ),
         storage_id: v.optional(v.id('_storage')),
+        storage_provider_id: v.optional(v.string()),
         created_at: v.number(),
         consumed_at: v.optional(v.number()),
         cancelled_at: v.optional(v.number()),
     })
         .index('by_workspace_status', ['workspace_id', 'status'])
         .index('by_workspace_hash_status', ['workspace_id', 'hash', 'status'])
+        .index('by_workspace_hash_status_expiry', ['workspace_id', 'hash', 'status', 'expires_at'])
         .index('by_expiry', ['expires_at']),
 
     /**
@@ -450,6 +452,20 @@ export default defineSchema({
         value: v.string(),
         updated_at: v.number(),
     }).index('by_workspace_key', ['workspace_id', 'key']),
+
+    // Private encrypted plugin credentials and revision-bound test evidence.
+    // These tables must never enter sync, snapshots or change_log.
+    plugin_connections: defineTable({
+        id: v.string(), ownerUserId: v.string(), workspace_id: v.id('workspaces'),
+        pluginId: v.string(), providerId: v.string(), slotId: v.optional(v.string()),
+        label: v.string(), scopes: v.array(v.string()), revision: v.number(),
+        secretCiphertext: v.string(), createdAt: v.number(), updatedAt: v.number(),
+    }).index('by_connection_id', ['id']).index('by_workspace_owner', ['workspace_id', 'ownerUserId']),
+    plugin_connection_tests: defineTable({
+        workspace_id: v.id('workspaces'), connectionId: v.string(), revision: v.number(),
+        operationId: v.string(), ok: v.boolean(), code: v.optional(v.string()),
+        checkedAt: v.number(), detail: v.optional(v.string()),
+    }).index('by_connection', ['connectionId']).index('by_workspace', ['workspace_id']),
 
     /**
      * Notifications - user notification center entries

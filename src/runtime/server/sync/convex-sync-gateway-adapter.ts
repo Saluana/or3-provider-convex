@@ -368,6 +368,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         canonicalChatHistory: 'v1',
         projectOwnership: 'v1',
         workspaceItems: 'v1',
+        retainedStorageMetadata: 'v1',
     } as const;
 
     async readChatHistory(actor: CanonicalHistoryActor, query: CanonicalChatQuery, signal?: AbortSignal): Promise<CanonicalChatReadResult> {

@@ -29,6 +29,7 @@ vi.mock('~~/server/auth/token-broker/resolve', () => ({
     resolveProviderToken: resolveProviderTokenMock as any,
 }));
 const resolveSessionContextMock = vi.hoisted(() => vi.fn());
+vi.mock('~~/server/utils/storage/workspace-access', () => ({ requireStorageWorkspaceAccess: async () => {} }));
 vi.mock('~~/server/auth/session', () => ({
     resolveSessionContext: resolveSessionContextMock as any,
 }));
@@ -67,9 +68,12 @@ function makeEvent(): H3Event {
 describe('ConvexStorageGatewayAdapter', () => {
     beforeEach(() => {
         resolveProviderTokenMock.mockReset().mockResolvedValue('provider-jwt');
-        resolveSessionContextMock.mockReset();
+        resolveSessionContextMock.mockReset().mockResolvedValue({
+            authenticated: true, user: { id: 'user-1' },
+            provider: 'clerk', providerUserId: 'subject-1',
+        });
         getConvexAdminGatewayClientMock.mockClear();
-        runtimeConfig.sync.convexAdminKey = '';
+        runtimeConfig.sync.convexAdminKey = 'server-admin-key';
         resolvePresignExpiresAtMock.mockReset().mockReturnValue(111_111);
         queryMock.mockReset().mockResolvedValue({ version: 1 });
         mutationMock.mockReset();
@@ -82,9 +86,10 @@ describe('ConvexStorageGatewayAdapter', () => {
         expect(mutationMock).not.toHaveBeenCalled();
     });
 
-    it('requires token and returns 401 when missing', async () => {
+    it('requires a verified host session for storage operations', async () => {
         const adapter = new ConvexStorageGatewayAdapter();
         resolveProviderTokenMock.mockResolvedValue(null);
+        resolveSessionContextMock.mockResolvedValue({ authenticated: false });
 
         await expect(
             adapter.presignUpload(makeEvent(), {
@@ -110,14 +115,34 @@ describe('ConvexStorageGatewayAdapter', () => {
         await expect(adapter.gc(makeEvent(), {})).rejects.toMatchObject({ statusCode: 401 });
     });
 
-    it('falls back to admin gateway client when provider token is unavailable', async () => {
+    it.each(['presignUpload', 'commit', 'deleteObject', 'gc'] as const)('%s refuses browser credentials without the server admin key', async operation => {
         const adapter = new ConvexStorageGatewayAdapter();
-        resolveProviderTokenMock.mockResolvedValue(null);
+        runtimeConfig.sync.convexAdminKey = '';
+        mutationMock.mockResolvedValue({ uploadUrl: 'https://upload.example', intentId: 'intent-1' });
+        const result = operation === 'presignUpload'
+            ? adapter.presignUpload(makeEvent(), {
+                workspaceId: 'ws-1', hash: 'sha256:abc', mimeType: 'image/png', sizeBytes: 100,
+            })
+            : operation === 'commit' ? adapter.commit(makeEvent(), {
+                workspace_id: 'ws-1', intent_id: 'intent-1', hash: 'sha256:abc',
+                storage_id: 'st_1', storage_provider_id: 'convex',
+                mime_type: 'image/png', size_bytes: 100, name: 'a.png', kind: 'image',
+            })
+            : operation === 'deleteObject' ? adapter.deleteObject(makeEvent(), { workspaceId: 'ws-1', hash: 'sha256:abc' })
+            : adapter.gc(makeEvent(), { workspace_id: 'ws-1', retention_seconds: 0 });
+
+        await expect(result).rejects.toMatchObject({ statusCode: 503 });
+        expect(mutationMock).not.toHaveBeenCalled();
+    });
+
+    it('binds upload authority to the verified host session even when a browser token is available', async () => {
+        const adapter = new ConvexStorageGatewayAdapter();
         runtimeConfig.sync.convexAdminKey = 'admin-key';
         resolveSessionContextMock.mockResolvedValue({
             authenticated: true,
+            user: { id: 'user-1' },
             provider: 'basic-auth',
-            providerUserId: 'user-1',
+            providerUserId: 'verified-subject',
         });
         mutationMock.mockResolvedValueOnce({ uploadUrl: 'https://upload.example', intentId: 'intent-1' });
 
@@ -131,14 +156,13 @@ describe('ConvexStorageGatewayAdapter', () => {
         expect(getConvexAdminGatewayClientMock).toHaveBeenCalledWith(
             expect.any(Object),
             'admin-key',
-            { provider: 'basic-auth', providerUserId: 'user-1' }
+            { provider: 'basic-auth', providerUserId: 'verified-subject' }
         );
     });
 
-    it('maps presign upload/download and resolves expiry', async () => {
+    it('maps presign upload and resolves expiry', async () => {
         const adapter = new ConvexStorageGatewayAdapter();
         mutationMock.mockResolvedValueOnce({ uploadUrl: 'https://upload.example', intentId: 'intent-1', expiresAt: '2026-02-06T12:00:00Z' });
-        queryMock.mockResolvedValueOnce({ url: 'https://download.example', expiresAt: 123 });
 
         await expect(
             adapter.presignUpload(makeEvent(), {
@@ -149,13 +173,6 @@ describe('ConvexStorageGatewayAdapter', () => {
             })
         ).resolves.toEqual({ url: 'https://upload.example', expiresAt: 111_111, intentId: 'intent-1' });
 
-        await expect(
-            adapter.presignDownload(makeEvent(), {
-                workspaceId: 'ws-1',
-                hash: 'sha256:abc',
-            })
-        ).resolves.toEqual({ url: 'https://download.example', expiresAt: 111_111 });
-
         expect(mutationMock).toHaveBeenCalledWith('storage.generateUploadUrl', {
             workspace_id: 'ws-1',
             hash: 'sha256:abc',
@@ -164,20 +181,38 @@ describe('ConvexStorageGatewayAdapter', () => {
             workspace_quota_bytes: undefined,
         });
 
-        expect(queryMock).toHaveBeenCalledWith('storage.getFileUrl', {
-            workspace_id: 'ws-1',
-            hash: 'sha256:abc',
+    });
+
+    it('never exposes the permanent native URL when issuing a bounded download', async () => {
+        runtimeConfig.sync.convexAdminKey = 'server-admin-key';
+        resolveSessionContextMock.mockResolvedValue({
+            authenticated: true, user: { id: 'user-1' },
+            provider: 'basic-auth', providerUserId: 'subject-1',
         });
+        queryMock.mockResolvedValue({
+            url: 'https://native.example/permanent-blob',
+            storageId: 'blob-1', mimeType: 'text/html', name: 'unsafe.html', fileKind: 'file',
+        });
+        const result = await new ConvexStorageGatewayAdapter().presignDownload(makeEvent(), {
+            workspaceId: 'ws-1', hash: 'sha256:' + 'a'.repeat(64),
+            storageId: 'blob-1', expiresInMs: 1234,
+        });
+        expect(result.url).toMatch(/^\/api\/storage\/convex\/download\?token=/);
+        expect(result.expiresAt).toBeGreaterThan(Date.now());
+        expect(result.expiresAt).toBeLessThanOrEqual(Date.now() + 1234);
+        expect(result.url).not.toContain('native.example');
     });
 
     it('returns 404 when download URL is absent', async () => {
         const adapter = new ConvexStorageGatewayAdapter();
-        queryMock.mockResolvedValue({ url: undefined });
+        runtimeConfig.sync.convexAdminKey = 'server-admin-key';
+        resolveSessionContextMock.mockResolvedValue({ authenticated: true, user: { id: 'user-1' }, provider: 'basic-auth', providerUserId: 'subject-1' });
+        queryMock.mockResolvedValue(null);
 
         await expect(
             adapter.presignDownload(makeEvent(), {
                 workspaceId: 'ws-1',
-                hash: 'sha256:abc',
+                hash: 'sha256:' + 'a'.repeat(64),
             })
         ).rejects.toMatchObject({ statusCode: 404 });
     });

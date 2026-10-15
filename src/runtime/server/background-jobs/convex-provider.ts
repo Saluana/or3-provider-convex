@@ -138,6 +138,20 @@ export const convexJobProvider: BackgroundJobProvider = {
         return toBackgroundJob(job);
     },
 
+    async findJobByIdempotencyKey(idempotencyKey, userId) {
+        const client = getClient();
+        const jobId = await client.query(internalApi.backgroundJobs.findByIdempotencyKey, {
+            user_id: userId,
+            idempotency_key: idempotencyKey,
+        });
+        if (!jobId) return null;
+        const job = await client.query(internalApi.backgroundJobs.get, {
+            job_id: jobId,
+            user_id: userId,
+        });
+        return job ? toBackgroundJob(job) : null;
+    },
+
     async updateJob(jobId: string, update: JobUpdate): Promise<void> {
         const client = getClient();
         const usage = readRequestUsage(update.usage);

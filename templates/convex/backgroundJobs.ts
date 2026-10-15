@@ -345,6 +345,17 @@ export const requestAdmissionCancel = internalMutation({
  * Authorization:
  * - The job must belong to the server-resolved `user_id`.
  */
+/** Resolve an admission's durable job ID without crossing its owner boundary. */
+export const findByIdempotencyKey = internalQuery({
+    args: { user_id: v.string(), idempotency_key: v.string() },
+    handler: async (ctx, args) => {
+        const job = await ctx.db.query('background_jobs')
+            .withIndex('by_user_idempotency', q => q.eq('user_id', args.user_id).eq('idempotency_key', args.idempotency_key))
+            .first();
+        return job?._id ?? null;
+    },
+});
+
 export const get = internalQuery({
     args: {
         job_id: v.id('background_jobs'),

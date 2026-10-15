@@ -9,7 +9,7 @@
  * - Validates workspace membership for all operations
  * - Generates short-lived upload URLs
  * - Commits metadata and deduplicates by `hash`
- * - Provides read access to stored file URLs
+ * - Keeps native download URLs in an internal server-only query
  * - Supports GC of deleted metadata and storage blobs
  *
  * Constraints:
@@ -22,7 +22,7 @@
  */
 
 import { v } from 'convex/values';
-import { mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
+import { internalMutation, internalQuery, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id } from './_generated/dataModel';
 import { claimStorageDeletion, releaseStorageDeletion } from './storageDeletion';
 import { applyServerAuthoredOp } from './syncAuthoring';
@@ -164,7 +164,7 @@ async function verifyWorkspaceMembership(
  * Constraints:
  * - Enforces a 100MB size cap
  */
-export const generateUploadUrl = mutation({
+export const generateUploadUrl = internalMutation({
     args: {
         workspace_id: v.id('workspaces'),
         hash: v.string(),
@@ -202,14 +202,27 @@ export const generateUploadUrl = mutation({
             .withIndex('by_workspace_status', (q: any) =>
                 q.eq('workspace_id', args.workspace_id).eq('status', 'active'))
             .collect();
-        const alreadyStored = liveFiles.some((file: any) => normalizeHash(file.hash) === hash);
-        const alreadyReserved = activeIntents.some((intent: any) =>
-            intent.expires_at > now && intent.hash === hash && intent.reserved_bytes > 0);
-        const reservedBytes = alreadyStored || alreadyReserved ? 0 : args.size_bytes;
+        const liveHashes = new Set(liveFiles.map((file) => normalizeHash(file.hash)));
+        // Charge content once while any unexpired intent can still commit it.
+        // A historical per-intent delta cannot survive cancellation/expiry of
+        // the first intent, or a later same-hash intent reserving more bytes.
+        const reservations = new Map<string, number>();
+        for (const intent of activeIntents) {
+            if (intent.expires_at <= now) continue;
+            if (!Number.isSafeInteger(intent.expires_at) ||
+                !Number.isSafeInteger(intent.size_bytes) || intent.size_bytes < 0 ||
+                !/^[0-9a-f]{64}$/.test(intent.hash)) {
+                throw new Error('Invalid upload reservation');
+            }
+            if (liveHashes.has(intent.hash)) continue;
+            reservations.set(intent.hash, Math.max(reservations.get(intent.hash) ?? 0, intent.size_bytes));
+        }
+        const reservedBytes = liveHashes.has(hash)
+            ? 0
+            : Math.max(0, args.size_bytes - (reservations.get(hash) ?? 0));
         if (args.workspace_quota_bytes !== undefined) {
             const usedBytes = liveFiles.reduce((total: number, file: any) => total + file.size_bytes, 0);
-            const activeReservedBytes = activeIntents.reduce(
-                (total: number, intent: any) => total + (intent.expires_at > now ? intent.reserved_bytes : 0), 0);
+            const activeReservedBytes = [...reservations.values()].reduce((total, size) => total + size, 0);
             if (usedBytes + activeReservedBytes + reservedBytes > args.workspace_quota_bytes) {
                 throw new Error('Workspace storage quota exceeded');
             }
@@ -231,7 +244,7 @@ export const generateUploadUrl = mutation({
     },
 });
 
-export const cancelUploadIntent = mutation({
+export const cancelUploadIntent = internalMutation({
     args: { workspace_id: v.id('workspaces'), intent_id: v.id('upload_intents') },
     handler: async (ctx, args) => {
         const userId = await verifyWorkspaceMembership(ctx, args.workspace_id, 'write');
@@ -255,7 +268,7 @@ export const cancelUploadIntent = mutation({
  * - Otherwise inserts a new row with `ref_count = 1`
  * - Performs a small dedup sweep to resolve rare race duplicates
  */
-export const commitUpload = mutation({
+export const commitUpload = internalMutation({
     args: {
         workspace_id: v.id('workspaces'),
         intent_id: v.id('upload_intents'),
@@ -278,11 +291,19 @@ export const commitUpload = mutation({
         if (!intent || intent.workspace_id !== args.workspace_id || intent.user_id !== userId) {
             throw new Error('Upload intent not found');
         }
-        if (intent.status !== 'active') throw new Error('Upload intent already consumed or cancelled');
-        if (intent.expires_at <= nowSec()) throw new Error('Upload intent expired');
         if (intent.hash !== hash || intent.size_bytes !== args.size_bytes || intent.mime_type !== mimeType) {
             throw new Error('Upload metadata does not match intent');
         }
+        if (intent.status === 'consumed') {
+            if (intent.storage_id !== args.storage_id || intent.storage_provider_id !== args.storage_provider_id) {
+                throw new Error('Upload metadata does not match committed intent');
+            }
+            // Receipt replay acknowledges the prior commit without changing
+            // materialized metadata or releasing a later deletion claim.
+            return;
+        }
+        if (intent.status !== 'active') throw new Error('Upload intent already consumed or cancelled');
+        if (intent.expires_at <= nowSec()) throw new Error('Upload intent expired');
         const object = await ctx.db.system.get(args.storage_id);
         if (!object) throw new Error('Uploaded storage object not found');
         if (object.size !== intent.size_bytes || normalizeMime(object.contentType ?? '') !== intent.mime_type) {
@@ -321,7 +342,8 @@ export const commitUpload = mutation({
                 },
             });
             await ctx.db.patch(intent._id, {
-                status: 'consumed', storage_id: args.storage_id, consumed_at: nowSec(),
+                status: 'consumed', storage_id: args.storage_id,
+                storage_provider_id: args.storage_provider_id, consumed_at: nowSec(),
             });
             return;
         }
@@ -374,21 +396,23 @@ export const commitUpload = mutation({
             }
         }
         await ctx.db.patch(intent._id, {
-            status: 'consumed', storage_id: args.storage_id, consumed_at: nowSec(),
+            status: 'consumed', storage_id: args.storage_id,
+            storage_provider_id: args.storage_provider_id, consumed_at: nowSec(),
         });
     },
 });
 
 /**
- * `storage.getFileUrl` (query)
+ * `storage.getFileUrl` (internal query)
  *
  * Purpose:
- * Retrieves a signed URL for a stored file.
+ * Retrieves a native URL and canonical response metadata for the server gateway.
+ * Native Convex URLs do not expire and must never be exposed to browsers.
  *
  * Behavior:
  * - Returns `null` when metadata exists but the blob is missing
  */
-export const getFileUrl = query({
+export const getFileUrl = internalQuery({
     args: {
         workspace_id: v.id('workspaces'),
         hash: v.string(),
@@ -424,7 +448,10 @@ export const getFileUrl = query({
         if (!url) {
             return null;
         }
-        return { url };
+        return {
+            url, storageId: file.storage_id,
+            mimeType: file.mime_type, name: file.name, fileKind: file.kind,
+        };
     },
 });
 
@@ -433,7 +460,7 @@ export const getFileUrl = query({
  * no-op, making retries safe. A caller-supplied storage id is accepted only
  * when it matches the canonical workspace/hash metadata record.
  */
-export const deleteObject = mutation({
+export const deleteObject = internalMutation({
     args: {
         workspace_id: v.id('workspaces'),
         hash: v.string(),
@@ -499,7 +526,7 @@ export const deleteObject = mutation({
  * - Bounds candidate and reference reads independently of dataset size
  * - Uses a caller-provided retention window in seconds
  */
-export const gcDeletedFiles = mutation({
+export const gcDeletedFiles = internalMutation({
     args: {
         workspace_id: v.id('workspaces'),
         retention_seconds: v.number(),

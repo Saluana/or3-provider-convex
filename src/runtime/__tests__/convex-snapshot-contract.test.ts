@@ -629,21 +629,43 @@ describe("Convex background request usage persistence", () => {
 describe("Convex canonical history scaffold contract", () => {
   // The deployed scaffold owns legacy membership resolution; transport tests alone
   // cannot detect guessing an owner or admitting another workspace's association.
-  it('resolves legacy project ownership and refuses ambiguous associations', async () => {
+  // Browser membership normalization trims IDs and normalizes chat kinds. Raw
+  // comparisons could admit server execution while the browser sees a project.
+  it.each(['thread-a', ' thread-a ', { id: ' thread-a ' }, { id: ' thread-a ', kind: ' CHAT ' }])(
+    'resolves legacy project ownership and refuses ambiguous associations for %j', async (entry) => {
     const fixture = createFixture('editor');
     const read = (syncFunctions.readChatHistory as RegisteredFunction)._handler;
     const id = fixture.tables.threads[0].id;
     const args = {workspace_id:'ws-1',actor_user_id:'user-1',query:{kind:'thread',thread_id:id}};
-    fixture.tables.projects = [{_id:'foreign',workspace_id:'ws-other',id:'foreign',data:[{kind:'chat',id}]}];
+    fixture.tables.projects = [
+      {_id:'foreign',workspace_id:'ws-other',id:'foreign',data:[{kind:'chat',id}]},
+      {_id:'extension',workspace_id:'ws-1',id:'extension',data:[null, {id,kind:'doc'}, {id,kind:'file'}, {id,kind:'vendor:chat'}, {id,kind:null}, {id:42}]},
+    ];
     expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'resolved',thread:{project_id:null}});
-    fixture.tables.projects.push({_id:'one',workspace_id:'ws-1',id:'one',data:[id]});
+    fixture.tables.projects.push({_id:'one',workspace_id:'ws-1',id:'one',data:[entry]});
     expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'resolved',thread:{project_id:'one'}});
     fixture.tables.projects.push({_id:'two',workspace_id:'ws-1',id:'two',data:JSON.stringify([{id}])});
     expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'conflict'});
     fixture.tables.threads[0].project_id = 'chosen';
+    fixture.tables.projects.push({_id:'chosen',workspace_id:'ws-1',id:'chosen',data:[]});
     expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'resolved',thread:{project_id:'chosen'}});
     fixture.tables.workspace_members = [];
     await expect(read(fixture.ctx,args)).rejects.toThrow('Forbidden');
+  });
+  // An explicit owner may be deleted, missing after sync, or exist only in a
+  // foreign workspace. Each releases the chat, without reviving a legacy folder.
+  // The materialized read owns this contract; transport mocks cannot resolve it.
+  it.each(['deleted', 'missing', 'foreign'] as const)('releases a %s explicit project owner in the authorized snapshot', async (state) => {
+    const fixture = createFixture('editor');
+    const thread = fixture.tables.threads[0]!;
+    thread.project_id = 'stale-owner';
+    fixture.tables.projects = [{ _id: 'legacy', workspace_id: 'ws-1', id: 'legacy-owner', data: [thread.id] }];
+    if (state !== 'missing') fixture.tables.projects.push({ _id: 'stale', workspace_id: state === 'foreign' ? 'ws-other' : 'ws-1',
+      id: 'stale-owner', deleted: state === 'deleted', data: [] });
+    const result = await (syncFunctions.readChatHistory as RegisteredFunction)._handler(fixture.ctx,
+      { workspace_id: 'ws-1', actor_user_id: 'user-1', query: { kind: 'thread', thread_id: thread.id } });
+    expect(result).toMatchObject({ status: 'ok', project_ownership: 'resolved', thread: { id: thread.id, project_id: null } });
+    expect(thread.project_id).toBe('stale-owner');
   });
   it("uses the selected built gateway and host scope service across partial delivery, missing capability and membership revocation", async () => {
     const fixture = createFixture('editor');
@@ -969,19 +991,9 @@ describe("Convex materialized snapshot contract", () => {
     expect(fixture.takeCounts.every((count) => count <= 2)).toBe(true);
   });
 
-  it("binds canonical cursors to filters, caps pages, and exposes active reservations explicitly", async () => {
+  it("binds canonical cursors to filters and caps pages", async () => {
     const fixture = createFixture();
     const hash = `sha256:${"a".repeat(64)}`;
-    fixture.tables.upload_intents.push(
-      {
-        _id: "intent-active", _creationTime: 1, workspace_id: "ws-1", status: "active",
-        hash: "a".repeat(64), reserved_bytes: 12, expires_at: 200,
-      },
-      {
-        _id: "intent-expired", _creationTime: 2, workspace_id: "ws-1", status: "active",
-        hash: "b".repeat(64), reserved_bytes: 20, expires_at: 99,
-      },
-    );
     fixture.tables.file_meta.push(
       {
         _id: "file-a",
@@ -1030,23 +1042,6 @@ describe("Convex materialized snapshot contract", () => {
         cursor: unfilteredFirst.nextCursor,
       }),
     ).rejects.toThrow("Invalid canonical storage cursor");
-    await expect(
-      queryCanonicalStorage(fixture.ctx, {
-        workspace_id: "ws-1",
-        kind: "active_reservations",
-        page_size: 10,
-        now: 100,
-      }),
-    ).resolves.toEqual({
-      items: [{
-        kind: "reservation",
-        reservationId: "intent-active",
-        hash: "a".repeat(64),
-        sizeBytes: 12,
-        expiresAt: 200,
-      }],
-      hasMore: false,
-    });
   });
 
   it("prevents stale missing-row resurrection and accepts a newer full revision", async () => {

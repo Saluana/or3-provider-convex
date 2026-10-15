@@ -268,6 +268,7 @@ type DynamicIndexBuilder = {
 
 type CanonicalStorageKind =
     | 'live_metadata'
+    | 'retained_metadata'
     | 'reference_edges'
     | 'active_reservations';
 
@@ -1485,15 +1486,28 @@ export const readChatHistory = internalQuery({
                 q.eq('workspace_id', args.workspace_id).eq('id', request.thread_id)).first();
             const threadRevision = await ctx.db.query('chat_history_revisions').withIndex('by_workspace_thread', (q) =>
                 q.eq('workspace_id', args.workspace_id).eq('thread_id', request.thread_id)).first();
-            if (!row || row.project_id) return { status: 'ok', project_ownership: 'resolved',
-                revision: String(threadRevision?.value ?? 0), thread: row ? wire(row) : undefined };
+            if (!row) return { status: 'ok', project_ownership: 'resolved',
+                revision: String(threadRevision?.value ?? 0), thread: undefined };
+            if (row.project_id) {
+                // Deleted or missing owners release chats, matching the browser
+                // resolver even when the delete/detach writes arrive out of order.
+                const owner = await ctx.db.query('projects').withIndex('by_workspace_id', (q) =>
+                    q.eq('workspace_id', args.workspace_id).eq('id', row.project_id!)).first();
+                return { status: 'ok', project_ownership: 'resolved', revision: String(threadRevision?.value ?? 0),
+                    thread: { ...wire(row), project_id: owner && !owner.deleted ? owner.id : null } };
+            }
             const projects = await ctx.db.query('projects').withIndex('by_workspace', (q) => q.eq('workspace_id', args.workspace_id)).collect();
             const owners = projects.filter(project => {
                 if (project.deleted) return false;
                 const entries: unknown = typeof project.data === 'string' ? JSON.parse(project.data) : project.data ?? [];
                 if (!Array.isArray(entries)) throw new Error('Canonical project membership is unresolved.');
-                return entries.some(entry => typeof entry === 'string' ? entry === request.thread_id
-                    : entry && typeof entry === 'object' && !Array.isArray(entry) && (entry.kind === undefined || entry.kind === 'chat') && entry.id === request.thread_id);
+                return entries.some(entry => {
+                    if (typeof entry === 'string') return entry.trim() === request.thread_id;
+                    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+                    const kind = typeof entry.kind === 'string' ? entry.kind.trim().toLowerCase() : entry.kind;
+                    return (kind === undefined || kind === 'chat') && typeof entry.id === 'string'
+                        && entry.id.trim() === request.thread_id;
+                });
             });
             return { status: 'ok', project_ownership: owners.length > 1 ? 'conflict' : 'resolved',
                 revision: String(threadRevision?.value ?? 0), thread: { ...wire(row), project_id: owners[0]?.id ?? null } };
@@ -2190,6 +2204,7 @@ export const queryCanonicalStorage = query({
         workspace_id: v.id('workspaces'),
         kind: v.union(
             v.literal('live_metadata'),
+            v.literal('retained_metadata'),
             v.literal('reference_edges'),
             v.literal('active_reservations')
         ),
@@ -2235,17 +2250,51 @@ export const queryCanonicalStorage = query({
             const rows = await reservationQuery.take(args.page_size + 1);
             const hasMore = rows.length > args.page_size;
             const scanned = hasMore ? rows.slice(0, args.page_size) : rows;
-            const items = scanned.flatMap((row) => {
-                if (row.expires_at <= now || row.reserved_bytes <= 0 ||
-                    (hash !== undefined && row.hash !== hash)) return [];
-                return [{
+            const items = [];
+            const processedHashes = new Set<string>();
+            for (const row of scanned) {
+                if (row.expires_at <= now || (hash !== undefined && row.hash !== hash)) continue;
+                if (!Number.isSafeInteger(row.expires_at) ||
+                    !Number.isSafeInteger(row.size_bytes) || row.size_bytes < 0 ||
+                    !/^[0-9a-f]{64}$/.test(row.hash)) {
+                    throw new Error('Invalid upload reservation');
+                }
+                if (row.size_bytes === 0 || processedHashes.has(row.hash)) continue;
+                processedHashes.add(row.hash);
+                const canonicalFile = await ctx.db.query('file_meta')
+                    .withIndex('by_workspace_hash', q => q.eq('workspace_id', args.workspace_id).eq('hash', `sha256:${row.hash}`))
+                    .filter(q => q.eq(q.field('deleted'), false)).first();
+                const legacyFile = canonicalFile ? null : await ctx.db.query('file_meta')
+                    .withIndex('by_workspace_hash', q => q.eq('workspace_id', args.workspace_id).eq('hash', row.hash))
+                    .filter(q => q.eq(q.field('deleted'), false)).first();
+                if (canonicalFile || legacyFile) continue;
+                const group = await ctx.db.query('upload_intents')
+                    .withIndex('by_workspace_hash_status_expiry', q => q.eq('workspace_id', args.workspace_id).eq('hash', row.hash).eq('status', 'active').gt('expires_at', now))
+                    .take(MAX_CANONICAL_STORAGE_PAGE_SIZE + 1);
+                // Bound group reads independently of the outer scan. Refuse to
+                // report a partial group, which could silently lose its charge.
+                if (group.length > MAX_CANONICAL_STORAGE_PAGE_SIZE) throw new Error('Upload reservation group exceeds the query limit');
+                group.sort((a, b) => a._creationTime - b._creationTime || String(a._id).localeCompare(String(b._id)));
+                const pending = group.filter(intent => {
+                    if (intent.expires_at <= now) return false;
+                    if (!Number.isSafeInteger(intent.expires_at) ||
+                        !Number.isSafeInteger(intent.size_bytes) || intent.size_bytes < 0) {
+                        throw new Error('Invalid upload reservation');
+                    }
+                    return intent.size_bytes > 0;
+                });
+                // Every page observes the same current leader for a hash. The
+                // leader remains charged even when another intent expires or
+                // is cancelled, and later pages never charge it a second time.
+                if (pending[0]?._id !== row._id) continue;
+                items.push({
                     kind: 'reservation' as const,
                     reservationId: String(row._id),
                     hash: row.hash,
-                    sizeBytes: row.reserved_bytes,
-                    expiresAt: row.expires_at,
-                }];
-            });
+                    sizeBytes: Math.max(...pending.map(intent => intent.size_bytes)),
+                    expiresAt: Math.max(...pending.map(intent => intent.expires_at)),
+                });
+            }
             const last = scanned[scanned.length - 1];
             return {
                 items,
@@ -2258,7 +2307,8 @@ export const queryCanonicalStorage = query({
             };
         }
 
-        if (args.kind === 'live_metadata') {
+        if (args.kind === 'live_metadata' || args.kind === 'retained_metadata') {
+            const retained = args.kind === 'retained_metadata';
             const queryByHash = (storedHash: string) => ctx.db
                 .query('file_meta')
                 .withIndex('by_workspace_hash', (q) =>
@@ -2266,7 +2316,7 @@ export const queryCanonicalStorage = query({
                 )
                 .take(args.page_size + 1);
             let rows = hash !== undefined
-                ? await queryByHash(`sha256:${hash}`)
+                ? await queryByHash(`${hash.length === 32 ? 'md5' : 'sha256'}:${hash}`)
                 : await ctx.db
                     .query('file_meta')
                     .withIndex('by_workspace_hash', (q) =>
@@ -2274,7 +2324,7 @@ export const queryCanonicalStorage = query({
                     )
                     .take(args.page_size + 1);
             if (hash !== undefined && rows.length === 0) {
-                // New rows use the sha256 prefix; retain a fallback for older
+                // Canonical hashes use their algorithm prefix; retain a fallback for older
                 // rows that stored the bare digest.
                 rows = await queryByHash(hash);
             }
@@ -2282,12 +2332,12 @@ export const queryCanonicalStorage = query({
             const scanned = hasMore ? rows.slice(0, args.page_size) : rows;
             const items = scanned.flatMap((row) => {
                 const normalizedHash = normalizeStorageHash(row.hash);
-                if (row.deleted || (hash !== undefined && normalizedHash !== hash)) return [];
+                if (row.deleted !== retained || (hash !== undefined && normalizedHash !== hash)) return [];
                 if (!Number.isSafeInteger(row.size_bytes) || row.size_bytes < 0) {
                     throw new Error('Invalid canonical file size');
                 }
                 return [{
-                    kind: 'metadata' as const,
+                    kind: retained ? 'retained_metadata' as const : 'metadata' as const,
                     hash: normalizedHash,
                     sizeBytes: row.size_bytes,
                     ...(row.storage_id ? { storageId: String(row.storage_id) } : {}),

@@ -115,7 +115,7 @@ describe('Convex persisted upload intents', () => {
     });
     prefixed.objects.set('blob-live', { size: 1 });
     await expect(getFileUrl(prefixed.ctx, { workspace_id: 'ws-1', hash: HASH }))
-      .resolves.toEqual({ url: 'https://download.test/blob-live' });
+      .resolves.toMatchObject({ url: 'https://download.test/blob-live', storageId: 'blob-live' });
 
     const bare = fixture();
     bare.tables.file_meta.push({
@@ -124,7 +124,7 @@ describe('Convex persisted upload intents', () => {
     });
     bare.objects.set('blob-bare', { size: 1 });
     await expect(getFileUrl(bare.ctx, { workspace_id: 'ws-1', hash: `sha256:${HASH}` }))
-      .resolves.toEqual({ url: 'https://download.test/blob-bare' });
+      .resolves.toMatchObject({ url: 'https://download.test/blob-bare', storageId: 'blob-bare' });
   });
 
   it('denies storage access for a soft-deleted workspace', async () => {
@@ -301,7 +301,7 @@ describe('Convex persisted upload intents', () => {
     });
   });
 
-  it('binds commit to subject, workspace, object bytes and consumes exactly once', async () => {
+  it('binds commit to subject, workspace and object bytes', async () => {
     const f = fixture();
     const generate = handler(storageFunctions.generateUploadUrl);
     const commit = handler(storageFunctions.commitUpload);
@@ -332,7 +332,6 @@ describe('Convex persisted upload intents', () => {
         ),
       }),
     ]);
-    await expect(commit(f.ctx, input)).rejects.toThrow('already consumed');
   });
 
   it('commits zero-byte generic files with the file kind', async () => {

@@ -99,7 +99,7 @@ backend before persistence services register.
 | Variable | Required | Description |
 |---|---|---|
 | `VITE_CONVEX_URL` | yes | Convex deployment URL |
-| `CONVEX_SELF_HOSTED_ADMIN_KEY` | yes (server persistence) | Server-only admin credential required for internal auth/session, background-job, notification, webhook, and rate-limit functions. Keep it out of public runtime config and browser bundles |
+| `CONVEX_SELF_HOSTED_ADMIN_KEY` | yes (server persistence) | Server-only admin credential required for native storage, internal auth/session, background-job, notification, webhook, and rate-limit functions. Keep it out of public runtime config and browser bundles |
 | `SSR_AUTH_ENABLED` | yes | Set to `true` to enable SSR auth |
 | `OR3_SYNC_PROVIDER` | when sync enabled | Set to `convex` (the default when sync is enabled) |
 | `NUXT_PUBLIC_STORAGE_PROVIDER` | when storage enabled | Set to `convex` (the default when storage is enabled) |
@@ -136,7 +136,7 @@ The provider registers itself via the OR3 hook/registry system at startup (Nitro
   mutations and `background_generation_receipts`; each Convex mutation
   atomically allocates sync versions, applies LWW materialized rows, appends the
   change log, and records replay outcome before returning.
-- **Rate limiter**: Convex-backed request rate limiting with an in-memory fallback
+- **Rate limiter**: Convex-backed request rate limiting that fails closed when durable enforcement is unavailable
 - **Webhook store**: `ConvexWebhookStore` — webhook definitions, signing secrets, and delivery logs
 - **Notifications**: Convex-backed notification emitter for background-job completion/error
 - **Deployment admin checker**: verifies `admin_users` grants in Convex
@@ -175,8 +175,10 @@ incremental replay then starts strictly after the returned watermark.
 Gateway storage lifecycle also uses bounded canonical pages over materialized
 `file_meta` and live message/post file-reference edges. Quota and filesystem GC
 never reconstruct state from retained sync logs. Cursor filters are immutable
-across pages and each request is capped at 500 records. Active reservations are
-an explicit empty view until upload-intent persistence is installed.
+across pages and each request is capped at 500 records. Active reservations read
+persisted native upload intents and expose one current charge per content hash.
+The expiry index excludes historical expired intents from bounded group reads;
+deploy the updated schema and `sync.ts` together when upgrading.
 
 ## What `init` scaffolds
 
@@ -199,8 +201,15 @@ The `init` command installs the Convex backend into `convex/`:
 ## How it works
 
 - **Sync** — Direct mode: the client sync plugin binds the token-broker JWT to the Convex client and pushes/pulls via Convex functions with reactive subscriptions (`watchChanges`). Gateway mode (SSR auth enabled): the sync gateway adapter resolves the SSR session, mints an identity-bound client, and calls the same functions through the Nuxt server; the browser never talks to Convex directly. Both paths enforce the shared 256 KB serialized payload ceiling per operation.
-- **Storage** — The client storage provider calls `/api/storage/*` SSR endpoints that proxy Convex upload URL generation, commit, and signed URLs. Uploads are reserved via upload intents; download URLs require live canonical `file_meta` with a storage ID (soft-deleted/pending rows return no URL); quota and GC read only canonical `file_meta` + message/post `file_hashes` pages.
-- **Generic files** — The host admits them only with its explicit `allowAnyFileType` setting and applies the canonical attachment/octet-stream download policy. Gateway clients advertise the typed file-kind `v1` capability; older readers and writers receive an explicit HTTP 426 update boundary before generic metadata or bytes cross the gateway. Convex signed URLs do not support response-header overrides, so deployments needing provider-enforced `Content-Disposition`/MIME headers should use filesystem or S3 storage.
+- **Storage** — The client uses the host's shared storage gateway (`mode: 'gateway'`) for `/api/storage/*`, including scoped `deleteObject`. It sends the current generic-file capability and mutation-intent headers for upload, download, and commit. Upload quota counts the maximum size of each unexpired active content hash once, promotes remaining intents after cancellation/expiry, and exempts hashes already present in live metadata. Reservation pages expose that same current per-hash charge and fail closed when a group exceeds 500 rows; download URLs use a provider-owned, authenticated streaming route with live canonical `file_meta` and storage identity revalidation (soft-deleted/pending/replaced rows return no bytes); quota and GC read only canonical `file_meta` + message/post `file_hashes` pages.
+- **Native storage controls** — `storage:generateUploadUrl`, `storage:commitUpload`, `storage:cancelUploadIntent`, `storage:deleteObject`, and `storage:gcDeletedFiles` are internal mutations. The SSR gateway uses `CONVEX_SELF_HOSTED_ADMIN_KEY` with the verified session's provider identity; browser JWTs cannot invoke these mutations or choose a quota, generic-file policy, or GC retention outside the host's checks. The read-only `storage:deletionCapability` query remains public and requires workspace membership. Deploy the updated `storage.ts` and rebuild the provider together; a host-only update leaves the old public mutation entry points available.
+- **Generic files** — The host admits them only with its explicit `allowAnyFileType` setting and applies the canonical attachment/octet-stream download policy. Gateway clients advertise the typed file-kind `v1` capability; older readers and writers receive an explicit HTTP 426 update boundary before generic metadata or bytes cross the gateway. The Convex download route enforces canonical MIME, sanitized filenames, disposition, `nosniff`, and private/no-store caching. Native Convex URLs stay inside the server-only `storage:getFileUrl` query; redeploy the updated backend to remove its former public entry point. Downloads require the server-only `CONVEX_SELF_HOSTED_ADMIN_KEY` (`runtimeConfig.sync.convexAdminKey`), use user-bound signed URLs (5-minute default, requested TTL capped at 15 minutes), and recheck the current session and workspace membership on retrieval. Bytes stream through the host server; native URL headers and redirects are never forwarded.
+
+Native download URLs issued by earlier provider versions remain permanent
+bearer links until the corresponding blob is deleted or rotated. Redeploying
+the backend secures newly issued downloads; it cannot revoke historical native
+URLs. See [Convex file storage](https://docs.convex.dev/file-storage/overview).
+
 - **Internal persistence** (background jobs, notifications, webhooks, rate limits, connect) is invoked only by admin-authenticated server adapters; the underlying Convex functions are internal-only.
 - **Mixed-runtime tools** — Internal atomic claim/settle mutations assign each
   browser-only call to one tab while Convex keeps the server job parked.
@@ -231,7 +240,7 @@ their declarations.
 - `convex dev --once` fails when `convex/` is missing or empty: run `bunx or3-provider-convex init` first.
 - Startup error `Convex URL must use HTTPS`: set `OR3_CONVEX_ALLOW_INSECURE_HTTP=true` only for intentionally `http://` local endpoints.
 - Startup error `Missing Convex URL`: `VITE_CONVEX_URL` must be present when the Nuxt module evaluates (or `convex.url` in nuxt.config).
-- Background jobs, notifications, and webhook storage fail closed without `CONVEX_SELF_HOSTED_ADMIN_KEY`; the rate-limit provider uses its in-memory fallback instead.
+- Background jobs, notifications, and webhook storage fail closed without `CONVEX_SELF_HOSTED_ADMIN_KEY`; the rate-limit provider also fails closed.
 - After upgrading the provider, run the provider init/update flow and deploy the
   generated Convex schema/functions before enabling background streaming; the
   lease and atomic-admission mutations must match the server adapter version.
@@ -346,6 +355,14 @@ The canonical-history qualification lane defaults to a sibling `../or3-chat` che
 
 Persistent Projects preserves opaque `or3:project-settings`, `or3:project-memory`, and `or3:project-source` posts, including complete JSON, metadata, and all original/extraction hash references. The project-aware `readChatHistory` scaffold resolves explicit and legacy project ownership within the authorized transaction and returns `project_ownership: resolved | conflict`. Ambiguous/malformed memberships refuse server admission. Rebuild the template pack and deploy the updated scaffold when upgrading; a host-only update cannot add this ownership check.
 
+Canonical ownership reads verify explicit project pointers against live projects
+in the same workspace. A missing, deleted, or foreign owner releases the chat
+without falling back to old folder memberships, matching browser ownership
+resolution when project deletion and chat detachment sync out of order. Legacy
+membership reads also trim entry IDs and normalize chat-kind case/whitespace
+like the browser, so these projects cannot bypass server execution policy.
+Deploy the updated `sync.ts` scaffold to apply these corrections to an existing backend.
+
 Version 0.0.12 declares `projectOwnership: 'v1'` on the canonical-history adapter. Deploy the updated sync scaffold before enabling server execution with this version; the runtime marker alone cannot upgrade an existing backend. Projects qualification: `OR3_CANONICAL_HOST_ROOT=/absolute/path/to/or3-chat bun x vitest run src/runtime/__tests__/convex-snapshot-contract.test.ts`, followed by the host's disposable deployed Convex cloud journey.
 
 Updated direct and gateway transports send workspace_item_capability v1.
@@ -379,3 +396,46 @@ Signup invite functions are trusted internal Convex functions called through the
 Signup email uniqueness uses `users.normalized_email` and its index. After deploying the matching schema/functions, the SSR provider automatically backfills legacy users in transactions of at most 100 rows before creating, validating, or accepting a signup invitation. Progress persists between calls and resumes after an interruption. The first call on a large installation may take longer; retries keep completed work. Acceptance refuses while any legacy rows remain unindexed. All built-in user creation paths maintain the index, including users without an email; custom writers must also set `normalized_email` to the trimmed lowercase email, or `''` when absent. The lifecycle harness verifies migration and signup with 33,000 legacy users, including mixed-case duplicate rejection.
 
 Invalid signup-invite history cursors return HTTP 400 (`Invalid invite cursor`) through a structured backend error. Other backend failures retain their server/service error behavior. The signup lifecycle harness verifies the host HTTP response and valid page continuation against a disposable Convex backend.
+
+## Provider parity updates
+
+The Convex provider now persists encrypted plugin connections and their test
+results in private `plugin_connections` and `plugin_connection_tests` tables.
+Owner/workspace listings, insert-only identities, revision compare-and-swap,
+and rejection of stale test results match the SQLite store. These functions
+are internal and require the server's Convex admin key. Credentials remain
+ciphertext; the host's `OR3_PLUGIN_CONNECTION_SECRET` stays outside Convex.
+Removing a workspace also removes its connection records and test evidence.
+Deploy the updated schema, `pluginConnections.ts`, and `workspaces.ts` together.
+
+Selecting Convex for background jobs or rate limits alone now performs the same
+startup URL and backend compatibility checks as selecting it for sync/storage.
+Convex URLs must be HTTP(S) endpoints without embedded credentials; local HTTP
+still requires `OR3_CONVEX_ALLOW_INSECURE_HTTP=true`. Durable rate limits reject
+missing credentials, invalid policies, and backend failures; they no longer
+switch to process-local memory during an outage. Select the host's `memory`
+rate-limit provider explicitly when process-local limits are intended.
+
+Background jobs also implement owner-scoped lookup by admission idempotency
+key, allowing the host to recover an admitted job when the original response
+was lost. Deploy the updated `backgroundJobs.ts` before using this recovery.
+
+The sync adapter advertises `retainedStorageMetadata: 'v1'` and supports bounded
+`retained_metadata` pages of deleted materialized file metadata. This is
+read-only accounting, independent of sync-history retention, and does not grant
+permission to delete physical objects. Convex stores delete-before-put records
+as tombstones rather than fabricated zero-size file metadata; only actual
+materialized file records appear in these pages.
+
+A native upload commit can safely retry its exact consumed receipt without
+writing history again. Workspace, user, normalized hash, MIME type, size,
+provider and storage ID must match; cancelled intents and changed receipts
+remain rejected. Deploy the updated schema and `storage.ts` to enable this.
+
+`bun scripts/test/provider-parity.mjs <cached-convex-local-backend> <host-source>
+<evidence-dir>` runs these contracts against a disposable localhost backend and
+writes `provider-parity.json`. It verifies owner-scoped admission recovery,
+concurrent durable rate limiting,
+invalid/missing configuration and outages, retained metadata pagination,
+native upload retries, durable connection CAS/evidence, internal-only access,
+and workspace cleanup. It never accepts a production deployment URL.

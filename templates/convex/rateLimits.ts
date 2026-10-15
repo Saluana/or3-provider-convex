@@ -37,6 +37,13 @@ const CLEANUP_BATCH_SIZE = 500;
 /** Maximum batches processed per cleanup run */
 const MAX_CLEANUP_BATCHES = 5;
 
+function requireConfig(args: { windowMs: number; maxRequests: number }): void {
+    if (!Number.isSafeInteger(args.windowMs) || args.windowMs <= 0 ||
+        !Number.isSafeInteger(args.maxRequests) || args.maxRequests <= 0) {
+        throw new Error('Invalid Convex rate-limit configuration');
+    }
+}
+
 // ============================================================
 // MUTATIONS
 // ============================================================
@@ -64,6 +71,7 @@ export const checkAndRecord = internalMutation({
         maxRequests: v.number(),
     },
     handler: async (ctx, args) => {
+        requireConfig(args);
         const now = Date.now();
         const windowStart = now - args.windowMs;
 
@@ -88,7 +96,7 @@ export const checkAndRecord = internalMutation({
         }
 
         // Check if window has expired
-        if (existing.window_start < windowStart) {
+        if (existing.window_start <= windowStart) {
             // Reset window
             await ctx.db.patch(existing._id, {
                 count: 1,
@@ -140,6 +148,7 @@ export const getStats = internalQuery({
         maxRequests: v.number(),
     },
     handler: async (ctx, args) => {
+        requireConfig(args);
         const now = Date.now();
         const windowStart = now - args.windowMs;
 
@@ -148,7 +157,7 @@ export const getStats = internalQuery({
             .withIndex('by_key', (q) => q.eq('key', args.key))
             .unique();
 
-        if (!existing || existing.window_start < windowStart) {
+        if (!existing || existing.window_start <= windowStart) {
             return {
                 limit: args.maxRequests,
                 remaining: args.maxRequests,

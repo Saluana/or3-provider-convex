@@ -272,6 +272,8 @@ async function deleteWorkspaceData(ctx: MutationCtx, workspaceId: Id<'workspaces
     await deleteByIndexBatched('posts', 'by_workspace_id');
     await deleteByIndexBatched('kv', 'by_workspace_name');
     await deleteByIndexBatched('host_settings', 'by_workspace_key');
+    await deleteByIndexBatched('plugin_connections', 'by_workspace_owner');
+    await deleteByIndexBatched('plugin_connection_tests', 'by_workspace');
     await deleteByIndexBatched('file_meta', 'by_workspace_hash');
     await deleteByIndexBatched('storage_deletion_claims', 'by_workspace_hash');
     await deleteByIndexBatched('notifications', 'by_workspace');

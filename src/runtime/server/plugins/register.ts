@@ -11,6 +11,7 @@ import { registerNotificationEmitter } from '~~/server/utils/notifications/regis
 import { registerWebhookStore } from '~~/server/utils/webhooks/store/registry';
 import { registerDeploymentAdminChecker } from '~~/server/auth/deployment-admin';
 import { registerConnectStore } from '~~/server/connect/store/registry';
+import { registerPluginConnectionStore } from '~~/server/utils/plugins/connections/store/registry';
 import { createConvexAuthWorkspaceStore } from '../auth/convex-auth-workspace-store';
 import { createConvexSyncGatewayAdapter } from '../sync/convex-sync-gateway-adapter';
 import { createConvexStorageGatewayAdapter } from '../storage/convex-storage-gateway-adapter';
@@ -31,6 +32,7 @@ import {
 } from '../notifications/emit';
 import { useRuntimeConfig } from '#imports';
 import { createConvexConnectStore } from '../connect/convex-connect-store';
+import { createConvexPluginConnectionStore } from '../plugin-connections/convex-connection-store';
 import { convexBackendContract } from '../../backend-contract';
 
 const ALLOW_INSECURE_CONVEX_HTTP_ENV = 'OR3_CONVEX_ALLOW_INSECURE_HTTP';
@@ -49,6 +51,8 @@ type RuntimeConfigWithConvex = ReturnType<typeof useRuntimeConfig> & {
         enabled?: boolean;
         provider?: string;
     };
+    backgroundJobs?: { enabled?: boolean; storageProvider?: string };
+    limits?: { enabled?: boolean; storageProvider?: string };
     public?: {
         sync?: {
             convexUrl?: string;
@@ -66,7 +70,11 @@ function isConvexSelected(config: RuntimeConfigWithConvex): boolean {
     const connectSelected =
         config.connect?.enabled === true &&
         config.connect?.provider === CONVEX_PROVIDER_ID;
-    return syncSelected || storageSelected || connectSelected;
+    const jobsSelected = config.backgroundJobs?.enabled === true &&
+        config.backgroundJobs.storageProvider === CONVEX_PROVIDER_ID;
+    const limitsSelected = config.limits?.enabled === true &&
+        config.limits.storageProvider === CONVEX_PROVIDER_ID;
+    return syncSelected || storageSelected || connectSelected || jobsSelected || limitsSelected;
 }
 
 function validateConvexStartupConfig(config: RuntimeConfigWithConvex): string[] {
@@ -88,6 +96,11 @@ function validateConvexStartupConfig(config: RuntimeConfigWithConvex): string[] 
         parsed = new URL(convexUrl);
     } catch {
         errors.push('Convex URL must be a valid URL.');
+        return errors;
+    }
+
+    if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+        errors.push('Convex URL must be an HTTP(S) endpoint without embedded credentials.');
         return errors;
     }
 
@@ -152,6 +165,12 @@ export default defineNitroPlugin(() => {
         id: CONVEX_STORAGE_PROVIDER_ID,
         order: 100,
         create: createConvexStorageGatewayAdapter,
+    });
+
+    registerPluginConnectionStore({
+        id: CONVEX_PROVIDER_ID,
+        order: 100,
+        create: createConvexPluginConnectionStore,
     });
 
     if (

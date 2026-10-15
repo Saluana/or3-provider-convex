@@ -20,17 +20,15 @@ import type {
     DeleteObjectRequest,
 } from '~~/server/storage/gateway/types';
 import type { GenericId as Id } from 'convex/values';
-import { convexApi as api } from '../../utils/convex-api';
+import { convexApi as api, convexInternalApi as internalApi } from '../../utils/convex-api';
 import {
     buildGatewayAdminIdentity,
     getConvexAdminGatewayClient,
-    getConvexGatewayClient,
 } from '../utils/convex-gateway';
 import { resolveConvexAuthProvider } from '../utils/provider-compat';
-import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 import { resolvePresignExpiresAt } from '~~/server/utils/storage/presign-expiry';
-import { resolveProviderToken } from '~~/server/auth/token-broker/resolve';
 import { resolveSessionContext } from '~~/server/auth/session';
+import { createConvexDownloadUrl } from './convex-download';
 
 const CommitInputSchema = z.object({
     workspace_id: z.string().min(1),
@@ -68,23 +66,16 @@ function toStorageId(storageId: string): Id<'_storage'> {
 }
 
 async function getStorageGatewayClient(event: H3Event) {
-    const token = await resolveProviderToken(event, {
-        providerId: CONVEX_PROVIDER_ID,
-        template: CONVEX_JWT_TEMPLATE,
-    });
-    if (token) {
-        return getConvexGatewayClient(event, token);
+    // Native writes are host-internal so browser JWTs cannot bypass the host's
+    // quota, file policy, or administration guards.
+    const session = await resolveSessionContext(event);
+    if (!session.authenticated || !session.user?.id || !session.provider || !session.providerUserId) {
+        throw createError({ statusCode: 401, statusMessage: 'Unauthorized' });
     }
-
     const config = useRuntimeConfig(event);
     const adminKey = config.sync?.convexAdminKey;
     if (!adminKey) {
-        throw createError({ statusCode: 401, statusMessage: 'Missing provider token' });
-    }
-
-    const session = await resolveSessionContext(event);
-    if (!session.authenticated || !session.provider || !session.providerUserId) {
-        throw createError({ statusCode: 401, statusMessage: 'Unauthorized' });
+        throw createError({ statusCode: 503, statusMessage: 'Convex storage writes require the server admin key' });
     }
 
     return getConvexAdminGatewayClient(
@@ -102,7 +93,7 @@ async function getStorageGatewayClient(event: H3Event) {
  *
  * Implementation:
  * - Uses Convex HTTP client for server-side queries/mutations
- * - Calls api.storage.generateUploadUrl/getFileUrl/etc
+ * - Uses session-bound admin calls for native storage writes
  * - Maps types between gateway interface and Convex API
  */
 export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
@@ -111,7 +102,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
 
     async presignUpload(event: H3Event, input: PresignUploadRequest): Promise<PresignUploadResponse> {
         const client = await getStorageGatewayClient(event);
-        const result = await client.mutation(api.storage.generateUploadUrl, {
+        const result = await client.mutation(internalApi.storage.generateUploadUrl, {
             workspace_id: toWorkspaceId(input.workspaceId),
             hash: input.hash,
             mime_type: input.mimeType,
@@ -133,22 +124,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
     }
 
     async presignDownload(event: H3Event, input: PresignDownloadRequest): Promise<PresignDownloadResponse> {
-        const client = await getStorageGatewayClient(event);
-        const result = await client.query(api.storage.getFileUrl, {
-            workspace_id: toWorkspaceId(input.workspaceId),
-            hash: input.hash,
-        });
-
-        if (!result?.url) {
-            throw createError({ statusCode: 404, statusMessage: 'File not found' });
-        }
-
-        const expiresAt = resolvePresignExpiresAt(result, undefined);
-
-        return {
-            url: result.url,
-            expiresAt,
-        };
+        return createConvexDownloadUrl(event, input);
     }
 
     async commit(event: H3Event, input: unknown): Promise<void> {
@@ -159,7 +135,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
         }
         const commitInput = parsed.data;
 
-        await client.mutation(api.storage.commitUpload, {
+        await client.mutation(internalApi.storage.commitUpload, {
             workspace_id: toWorkspaceId(commitInput.workspace_id),
             intent_id: commitInput.intent_id as Id<'upload_intents'>,
             hash: commitInput.hash,
@@ -186,7 +162,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
     async deleteObject(event: H3Event, input: DeleteObjectRequest): Promise<void> {
         const client = await getStorageGatewayClient(event);
         await this.requireDeletionProtocol(client, input.workspaceId);
-        await client.mutation(api.storage.deleteObject, {
+        await client.mutation(internalApi.storage.deleteObject, {
             workspace_id: toWorkspaceId(input.workspaceId),
             hash: input.hash,
             storage_id: input.storageId
@@ -203,7 +179,7 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
         }
         const gcInput = parsed.data;
         await this.requireDeletionProtocol(client, gcInput.workspace_id);
-        const result = await client.mutation(api.storage.gcDeletedFiles, {
+        const result = await client.mutation(internalApi.storage.gcDeletedFiles, {
             workspace_id: toWorkspaceId(gcInput.workspace_id),
             retention_seconds: gcInput.retention_seconds,
             limit: gcInput.limit,
