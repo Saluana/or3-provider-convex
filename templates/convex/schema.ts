@@ -215,6 +215,7 @@ export default defineSchema({
         user_id: v.string(),
         high_watermark: v.number(),
         tables: v.array(v.string()),
+        retained_files: v.optional(v.boolean()),
         created_at: v.number(),
         expires_at: v.number(),
     })

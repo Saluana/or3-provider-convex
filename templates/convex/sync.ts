@@ -31,6 +31,10 @@ import { getPkField } from './tableMetadata';
 import { requireActiveWorkspace, requireWorkspaceRole } from './authz';
 import { SYNC_HISTORY_GC_POLICY, computePullRetention } from './syncHistoryGcPolicy';
 import {
+    legacySnapshotRevision,
+    materializedSnapshotCandidate,
+    recordMaterializedPreimage,
+    type MaterializedDoc,
     decodeSnapshotCursor,
     encodeSnapshotCursor,
     normalizeSnapshotTables,
@@ -222,18 +226,6 @@ const TABLE_INDEX_MAP: Partial<Record<string, { table: string; indexName: string
     notifications: { table: 'notifications', indexName: 'by_workspace_id' },
 };
 
-type MaterializedDoc = {
-    _id: Id<TableNames>;
-    _creationTime?: number;
-    id?: string;
-    hash?: string;
-    deleted?: boolean;
-    deleted_at?: number;
-    clock?: number;
-    hlc?: string;
-    op_id?: string;
-    server_version?: number;
-} & Record<string, unknown>;
 
 type TombstoneDoc = {
     _id: Id<'tombstones'>;
@@ -335,23 +327,6 @@ function decodeCanonicalStorageCursor(
     }
 }
 
-function legacySnapshotRevision(
-    tableName: string,
-    pk: string,
-    value: { clock?: number; hlc?: string; op_id?: string }
-): SnapshotRevision {
-    const clock = Number.isInteger(value.clock) && (value.clock as number) >= 0
-        ? (value.clock as number)
-        : 0;
-    const hlc = typeof value.hlc === 'string' && value.hlc.length > 0
-        ? value.hlc
-        : `legacy-${clock}`;
-    const opId = typeof value.op_id === 'string' && value.op_id.length > 0
-        ? value.op_id
-        : `legacy:${tableName}:${pk}:${clock}:${hlc}`;
-    return { clock, hlc, opId };
-}
-
 function completeStoredRevision(
     value: { clock?: number; hlc?: string; op_id?: string }
 ): SnapshotRevision | null {
@@ -382,64 +357,6 @@ function incomingWinsStoredRevision(
     return complete ? compareSnapshotRevisions(incoming, complete) > 0 : false;
 }
 
-function snapshotPayloadFromDoc(
-    doc: MaterializedDoc,
-    pkField: string,
-    pk: string,
-    revision: SnapshotRevision
-): Record<string, unknown> {
-    const {
-        _id,
-        _creationTime,
-        workspace_id,
-        server_version,
-        op_id,
-        ...payload
-    } = doc;
-    void _id;
-    void _creationTime;
-    void workspace_id;
-    void server_version;
-    void op_id;
-    return {
-        ...payload,
-        [pkField]: pk,
-        clock: revision.clock,
-        hlc: revision.hlc,
-    };
-}
-
-function materializedSnapshotCandidate(
-    tableName: string,
-    pk: string,
-    doc: MaterializedDoc,
-    serverVersionOverride?: number
-): SnapshotCandidate {
-    const revision = legacySnapshotRevision(tableName, pk, doc);
-    const serverVersion = serverVersionOverride ?? doc.server_version;
-    if (doc.deleted === true) {
-        return {
-            kind: 'tombstone',
-            tableName,
-            pk,
-            revision,
-            serverDeletedAt:
-                typeof doc.deleted_at === 'number' && doc.deleted_at >= 0
-                    ? Math.floor(doc.deleted_at)
-                    : nowSec(),
-            serverVersion,
-        };
-    }
-    return {
-        kind: 'row',
-        tableName,
-        pk,
-        payload: snapshotPayloadFromDoc(doc, getPkField(tableName), pk, revision),
-        revision,
-        serverVersion,
-    };
-}
-
 function tombstoneSnapshotCandidate(
     tableName: string,
     pk: string,
@@ -467,6 +384,7 @@ function historySnapshotCandidate(history: SnapshotHistoryDoc): SnapshotCandidat
             tableName: history.table_name,
             pk: history.pk,
             revision,
+            ...(history.table_name === 'file_meta' && history.payload ? { payload: history.payload } : {}),
             serverDeletedAt: Math.max(0, Math.floor(history.server_deleted_at ?? 0)),
             serverVersion: history.server_version,
         };
@@ -479,35 +397,6 @@ function historySnapshotCandidate(history: SnapshotHistoryDoc): SnapshotCandidat
         revision,
         serverVersion: history.server_version,
     };
-}
-
-async function recordMaterializedPreimage(
-    ctx: MutationCtx,
-    workspaceId: Id<'workspaces'>,
-    tableName: string,
-    pk: string,
-    doc: MaterializedDoc,
-    fallbackServerVersion: number
-): Promise<void> {
-    const candidate = materializedSnapshotCandidate(
-        tableName,
-        pk,
-        doc,
-        doc.server_version ?? fallbackServerVersion
-    );
-    await ctx.db.insert('sync_record_versions', {
-        workspace_id: workspaceId,
-        table_name: tableName,
-        pk,
-        server_version: candidate.serverVersion ?? fallbackServerVersion,
-        kind: candidate.kind,
-        payload: candidate.kind === 'row' ? candidate.payload : undefined,
-        clock: candidate.revision.clock,
-        hlc: candidate.revision.hlc,
-        op_id: candidate.revision.opId,
-        server_deleted_at:
-            candidate.kind === 'tombstone' ? candidate.serverDeletedAt : undefined,
-    });
 }
 
 async function readSnapshotHistory(
@@ -580,7 +469,8 @@ async function resolveSnapshotKey(
     highWatermark: number,
     row: MaterializedDoc | undefined,
     tombstone: TombstoneDoc | undefined,
-    callerUserId: Id<'users'>
+    callerUserId: Id<'users'>,
+    retainedFiles = false
 ): Promise<SnapshotCandidate | null> {
     if (
         tableName === 'notifications' &&
@@ -601,7 +491,19 @@ async function resolveSnapshotKey(
     if (history) candidates.push(history);
     if (row) candidates.push(materializedSnapshotCandidate(tableName, pk, row));
     if (tombstone) candidates.push(tombstoneSnapshotCandidate(tableName, pk, tombstone));
-    return resolveSnapshotWinner(candidates, highWatermark);
+    const winner = resolveSnapshotWinner(candidates, highWatermark);
+    if (retainedFiles && tableName === 'file_meta' && winner?.kind === 'tombstone') {
+        const retained = candidates.find(candidate => candidate.kind === 'tombstone' && candidate.payload &&
+            candidate.serverVersion !== undefined && candidate.serverVersion <= highWatermark &&
+            compareSnapshotRevisions(candidate.revision, winner.revision) === 0);
+        if (retained?.kind === 'tombstone') return {
+            kind: 'row', tableName, pk, payload: retained.payload, revision: winner.revision, serverVersion: winner.serverVersion,
+        };
+        // Old pre-images may lack retained metadata. Never label a concurrent
+        // replacement as the original or silently omit an ambiguous original.
+        if (row && (row.server_version ?? 0) > highWatermark) throw new Error('Retained backup metadata is unavailable; retry the backup');
+    }
+    return winner;
 }
 
 /**
@@ -1998,200 +1900,218 @@ export const updateDeviceCursor = mutation({
  * to the persisted session and reconstruct pre-watermark state from bounded
  * pre-image lookups if writes occurred after the first page.
  */
+const snapshotArgs = {
+    workspace_id: v.id('workspaces'),
+    workspace_item_capability: v.optional(v.literal('v1')),
+    page_size: v.number(),
+    page_token: v.optional(v.string()),
+    tables: v.optional(v.array(v.string())),
+};
 export const snapshot = mutation({
-    args: {
-        workspace_id: v.id('workspaces'),
-        workspace_item_capability: v.optional(v.literal('v1')),
-        page_size: v.number(),
-        page_token: v.optional(v.string()),
-        tables: v.optional(v.array(v.string())),
-    },
-    handler: async (ctx, args) => {
-        if (
-            !Number.isInteger(args.page_size) ||
-            args.page_size <= 0 ||
-            args.page_size > MAX_SNAPSHOT_PAGE_SIZE
-        ) {
-            throw new Error(
-                `Snapshot page size must be between 1 and ${MAX_SNAPSHOT_PAGE_SIZE}`
-            );
-        }
-
-        const tables = normalizeSnapshotTables(args.tables, Object.keys(TABLE_INDEX_MAP));
-        const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
-
-        const now = nowSec();
-        let snapshotId: string;
-        let highWatermark: number;
-        let tableIndex = 0;
-        let afterPk: string | null = null;
-
-        if (args.page_token) {
-            const cursor = decodeSnapshotCursor(args.page_token);
-            let session: {
-                workspace_id: Id<'workspaces'>;
-                user_id: string;
-                high_watermark: number;
-                tables: string[];
-                expires_at: number;
-            } | null = null;
-            try {
-                session = await ctx.db.get(
-                    cursor.snapshotId as Id<'sync_snapshot_sessions'>
-                );
-            } catch {
-                throw new Error('Snapshot session is unavailable');
-            }
-            if (
-                !session ||
-                String(session.workspace_id) !== String(args.workspace_id) ||
-                session.user_id !== callerUserId ||
-                session.expires_at <= now
-            ) {
-                throw new Error('Snapshot session is unavailable');
-            }
-            if (JSON.stringify(session.tables) !== JSON.stringify(tables)) {
-                throw new Error('Snapshot page token does not match the requested tables');
-            }
-            if (cursor.tableIndex > session.tables.length) {
-                throw new Error('Invalid snapshot page token');
-            }
-            snapshotId = cursor.snapshotId;
-            highWatermark = session.high_watermark;
-            tableIndex = cursor.tableIndex;
-            afterPk = cursor.afterPk;
-        } else {
-            const counter = await ctx.db
-                .query('server_version_counter')
-                .withIndex('by_workspace', (q) =>
-                    q.eq('workspace_id', args.workspace_id)
-                )
-                .first();
-            highWatermark = counter?.value ?? 0;
-            snapshotId = String(await ctx.db.insert('sync_snapshot_sessions', {
-                workspace_id: args.workspace_id,
-                user_id: callerUserId,
-                high_watermark: highWatermark,
-                tables,
-                created_at: now,
-                expires_at: now + SNAPSHOT_TTL_SECONDS,
-            }));
-        }
-
-        type PageItem =
-            | {
-                  kind: 'row';
-                  tableName: string;
-                  pk: string;
-                  payload: unknown;
-                  revision: SnapshotRevision;
-              }
-            | {
-                  kind: 'tombstone';
-                  tableName: string;
-                  pk: string;
-                  revision: SnapshotRevision;
-                  serverDeletedAt: number;
-              };
-        const items: PageItem[] = [];
-        let examined = 0;
-        let stoppedWithinTable = false;
-
-        while (tableIndex < tables.length && examined < args.page_size) {
-            const tableName = tables[tableIndex];
-            if (!tableName) break;
-            const remaining = args.page_size - examined;
-            const [rows, tombstones] = await Promise.all([
-                readMaterializedSnapshotRows(
-                    ctx,
-                    args.workspace_id,
-                    tableName,
-                    afterPk,
-                    remaining + 1
-                ),
-                readSnapshotTombstones(
-                    ctx,
-                    args.workspace_id,
-                    tableName,
-                    afterPk,
-                    remaining + 1
-                ),
-            ]);
-
-            const pkField = getPkField(tableName);
-            const rowsByPk = new Map<string, MaterializedDoc>();
-            for (const row of rows) {
-                const pk = row[pkField];
-                if (typeof pk === 'string' && pk.length > 0) rowsByPk.set(pk, row);
-            }
-            const tombstonesByPk = new Map(tombstones.map((row) => [row.pk, row]));
-            const orderedPks = [
-                ...new Set([...rowsByPk.keys(), ...tombstonesByPk.keys()]),
-            ].sort();
-            const pagePks = orderedPks.slice(0, remaining);
-
-            for (const pk of pagePks) {
-                const winner = await resolveSnapshotKey(
-                    ctx,
-                    args.workspace_id,
-                    tableName,
-                    pk,
-                    highWatermark,
-                    rowsByPk.get(pk),
-                    tombstonesByPk.get(pk),
-                    callerUserId
-                );
-                if (!winner) continue;
-                if (winner.kind === 'row') {
-                    items.push({
-                        kind: 'row',
-                        tableName: winner.tableName,
-                        pk: winner.pk,
-                        payload: winner.payload,
-                        revision: winner.revision,
-                    });
-                } else {
-                    items.push({
-                        kind: 'tombstone',
-                        tableName: winner.tableName,
-                        pk: winner.pk,
-                        revision: winner.revision,
-                        serverDeletedAt: winner.serverDeletedAt,
-                    });
-                }
-            }
-
-            examined += pagePks.length;
-            if (orderedPks.length > pagePks.length) {
-                afterPk = pagePks[pagePks.length - 1] ?? afterPk;
-                stoppedWithinTable = true;
-                break;
-            }
-
-            tableIndex += 1;
-            afterPk = null;
-        }
-
-        const hasMore = stoppedWithinTable || tableIndex < tables.length;
-        const nextPageToken = hasMore
-            ? encodeSnapshotCursor({
-                  version: 1,
-                  snapshotId,
-                  tableIndex,
-                  afterPk,
-              })
-            : null;
-
-        if (items.some(item => item.kind === 'row' && hasWorkspaceItemSemantics(item.tableName, item.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
-        return {
-            workspaceId: String(args.workspace_id),
-            snapshotId,
-            highWatermark,
-            items,
-            nextPageToken,
-        };
-    },
+    args: snapshotArgs,
+    handler: (ctx, args) => captureSnapshot(ctx, args, false),
 });
+/** Host archives retain file metadata which sync bootstrap sends as tombstones. */
+export const backupSnapshot = internalMutation({
+    args: snapshotArgs,
+    handler: (ctx, args) => captureSnapshot(ctx, args, true),
+});
+
+async function captureSnapshot(ctx: MutationCtx, args: {
+    workspace_id: Id<'workspaces'>;
+    workspace_item_capability?: 'v1';
+    page_size: number;
+    page_token?: string;
+    tables?: string[];
+}, retainedFiles: boolean) {
+    if (
+        !Number.isInteger(args.page_size) ||
+        args.page_size <= 0 ||
+        args.page_size > MAX_SNAPSHOT_PAGE_SIZE
+    ) {
+        throw new Error(
+            `Snapshot page size must be between 1 and ${MAX_SNAPSHOT_PAGE_SIZE}`
+        );
+    }
+
+    const tables = normalizeSnapshotTables(args.tables, Object.keys(TABLE_INDEX_MAP));
+    const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
+
+    const now = nowSec();
+    let snapshotId: string;
+    let highWatermark: number;
+    let tableIndex = 0;
+    let afterPk: string | null = null;
+
+    if (args.page_token) {
+        const cursor = decodeSnapshotCursor(args.page_token);
+        let session: {
+            workspace_id: Id<'workspaces'>;
+            user_id: string;
+            high_watermark: number;
+            tables: string[];
+            retained_files?: boolean;
+            expires_at: number;
+        } | null = null;
+        try {
+            session = await ctx.db.get(
+                cursor.snapshotId as Id<'sync_snapshot_sessions'>
+            );
+        } catch {
+            throw new Error('Snapshot session is unavailable');
+        }
+        if (
+            !session ||
+            String(session.workspace_id) !== String(args.workspace_id) ||
+            session.user_id !== callerUserId ||
+            session.expires_at <= now
+        ) {
+            throw new Error('Snapshot session is unavailable');
+        }
+        if (JSON.stringify(session.tables) !== JSON.stringify(tables)) {
+            throw new Error('Snapshot page token does not match the requested tables');
+        }
+        if ((session.retained_files === true) !== retainedFiles) throw new Error('Snapshot page token does not match the requested mode');
+        if (cursor.tableIndex > session.tables.length) {
+            throw new Error('Invalid snapshot page token');
+        }
+        snapshotId = cursor.snapshotId;
+        highWatermark = session.high_watermark;
+        tableIndex = cursor.tableIndex;
+        afterPk = cursor.afterPk;
+    } else {
+        const counter = await ctx.db
+            .query('server_version_counter')
+            .withIndex('by_workspace', (q) =>
+                q.eq('workspace_id', args.workspace_id)
+            )
+            .first();
+        highWatermark = counter?.value ?? 0;
+        snapshotId = String(await ctx.db.insert('sync_snapshot_sessions', {
+            workspace_id: args.workspace_id,
+            user_id: callerUserId,
+            high_watermark: highWatermark,
+            tables,
+            retained_files: retainedFiles,
+            created_at: now,
+            expires_at: now + SNAPSHOT_TTL_SECONDS,
+        }));
+    }
+
+    type PageItem =
+        | {
+              kind: 'row';
+              tableName: string;
+              pk: string;
+              payload: unknown;
+              revision: SnapshotRevision;
+          }
+        | {
+              kind: 'tombstone';
+              tableName: string;
+              pk: string;
+              revision: SnapshotRevision;
+              serverDeletedAt: number;
+          };
+    const items: PageItem[] = [];
+    let examined = 0;
+    let stoppedWithinTable = false;
+
+    while (tableIndex < tables.length && examined < args.page_size) {
+        const tableName = tables[tableIndex];
+        if (!tableName) break;
+        const remaining = args.page_size - examined;
+        const [rows, tombstones] = await Promise.all([
+            readMaterializedSnapshotRows(
+                ctx,
+                args.workspace_id,
+                tableName,
+                afterPk,
+                remaining + 1
+            ),
+            readSnapshotTombstones(
+                ctx,
+                args.workspace_id,
+                tableName,
+                afterPk,
+                remaining + 1
+            ),
+        ]);
+
+        const pkField = getPkField(tableName);
+        const rowsByPk = new Map<string, MaterializedDoc>();
+        for (const row of rows) {
+            const pk = row[pkField];
+            if (typeof pk === 'string' && pk.length > 0) rowsByPk.set(pk, row);
+        }
+        const tombstonesByPk = new Map(tombstones.map((row) => [row.pk, row]));
+        const orderedPks = [
+            ...new Set([...rowsByPk.keys(), ...tombstonesByPk.keys()]),
+        ].sort();
+        const pagePks = orderedPks.slice(0, remaining);
+
+        for (const pk of pagePks) {
+            const winner = await resolveSnapshotKey(
+                ctx,
+                args.workspace_id,
+                tableName,
+                pk,
+                highWatermark,
+                rowsByPk.get(pk),
+                tombstonesByPk.get(pk),
+                callerUserId,
+                retainedFiles
+            );
+            if (!winner) continue;
+            if (winner.kind === 'row') {
+                items.push({
+                    kind: 'row',
+                    tableName: winner.tableName,
+                    pk: winner.pk,
+                    payload: winner.payload,
+                    revision: winner.revision,
+                });
+            } else {
+                items.push({
+                    kind: 'tombstone',
+                    tableName: winner.tableName,
+                    pk: winner.pk,
+                    revision: winner.revision,
+                    serverDeletedAt: winner.serverDeletedAt,
+                });
+            }
+        }
+
+        examined += pagePks.length;
+        if (orderedPks.length > pagePks.length) {
+            afterPk = pagePks[pagePks.length - 1] ?? afterPk;
+            stoppedWithinTable = true;
+            break;
+        }
+
+        tableIndex += 1;
+        afterPk = null;
+    }
+
+    const hasMore = stoppedWithinTable || tableIndex < tables.length;
+    const nextPageToken = hasMore
+        ? encodeSnapshotCursor({
+              version: 1,
+              snapshotId,
+              tableIndex,
+              afterPk,
+          })
+        : null;
+
+    if (items.some(item => item.kind === 'row' && hasWorkspaceItemSemantics(item.tableName, item.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
+    return {
+        workspaceId: String(args.workspace_id),
+        snapshotId,
+        highWatermark,
+        items,
+        nextPageToken,
+    };
+}
 
 /**
  * `sync.queryCanonicalStorage` (query)

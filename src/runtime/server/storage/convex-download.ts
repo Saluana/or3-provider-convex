@@ -73,14 +73,16 @@ async function requireSession(event: H3Event) {
     return session as typeof session & { user: { id: string }; provider: string; providerUserId: string };
 }
 
-async function readNativeFile(event: H3Event, session: Awaited<ReturnType<typeof requireSession>>, workspaceId: string, hash: string) {
+async function readNativeFile(event: H3Event, session: Awaited<ReturnType<typeof requireSession>>, workspaceId: string, hash: string, backupStorageId?: string) {
     const client = getConvexAdminGatewayClient(event, getAdminKey(event), buildGatewayAdminIdentity(
         resolveConvexAuthProvider(session.provider), session.providerUserId,
     ));
     // This is an internal Convex query. Browser/user JWT clients cannot invoke it.
     let result: unknown;
     try {
-        result = await client.query(convexInternalApi.storage.getFileUrl, { workspace_id: workspaceId, hash });
+        result = backupStorageId === undefined
+            ? await client.query(convexInternalApi.storage.getFileUrl, { workspace_id: workspaceId, hash })
+            : await client.query(convexInternalApi.storage.getBackupFileUrl, { workspace_id: workspaceId, hash, storage_id: backupStorageId });
     } catch {
         throw createError({ statusCode: 503, statusMessage: 'Convex download authorization unavailable' });
     }
@@ -92,6 +94,31 @@ async function readNativeFile(event: H3Event, session: Awaited<ReturnType<typeof
         throw createError({ statusCode: 502, statusMessage: 'Invalid Convex download URL' });
     }
     return parsed.data;
+}
+
+/** No browser token or URL: only the host archive route calls this method. */
+export async function readConvexBackupFile(event: H3Event, input: { workspaceId: string; hash: string; storageId: string }): Promise<Response> {
+    const session = await requireSession(event);
+    await requireStorageWorkspaceAccess(event, session, input.workspaceId);
+    const read = () => readNativeFile(event, session, input.workspaceId, input.hash, input.storageId);
+    const file = await read();
+    if (file.storageId !== input.storageId) throw createError({ statusCode: 404, statusMessage: 'File not found' });
+    let response: Response;
+    try {
+        response = await fetch(file.url, { redirect: 'error', signal: AbortSignal.timeout(120_000) });
+    } catch {
+        throw createError({ statusCode: 502, statusMessage: 'Convex backup download unavailable' });
+    }
+    try {
+        if (!response.ok || !response.body) throw createError({ statusCode: response.status === 404 ? 404 : 502, statusMessage: 'Convex original unavailable' });
+        await requireStorageWorkspaceAccess(event, session, input.workspaceId);
+        if ((await read()).storageId !== input.storageId) throw createError({ statusCode: 404, statusMessage: 'File not found' });
+        await requireStorageWorkspaceAccess(event, session, input.workspaceId);
+        return response;
+    } catch (error) {
+        await response.body?.cancel().catch(() => undefined);
+        throw error;
+    }
 }
 
 export async function createConvexDownloadUrl(event: H3Event, input: PresignDownloadRequest): Promise<PresignDownloadResponse> {

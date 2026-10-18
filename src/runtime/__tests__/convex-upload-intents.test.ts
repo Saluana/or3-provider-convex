@@ -127,6 +127,35 @@ describe('Convex persisted upload intents', () => {
       .resolves.toMatchObject({ url: 'https://download.test/blob-bare', storageId: 'blob-bare' });
   });
 
+  // Backup failures: Trash gets omitted, snapshot IDs select other objects,
+  // uncommitted uploads become readable, revoked members retain access, or a
+  // read mutates/deletes the retained original. Ordinary downloads stay denied.
+  it.each(['ok', 'wrong-workspace', 'wrong-hash', 'replaced', 'missing-object', 'uncommitted', 'other-provider', 'revoked', 'deleted-workspace'])(
+    'reads retained backup originals with exact current authority: %s', async failure => {
+      const f = fixture();
+      const file = { _id: 'trash', workspace_id: 'ws-1', hash: `sha256:${HASH}`,
+        deleted: true, storage_id: 'blob-trash', storage_provider_id: 'convex' };
+      f.tables.file_meta.push(file);
+      f.objects.set('blob-trash', { size: 1 });
+      const input = { workspace_id: 'ws-1', hash: file.hash, storage_id: file.storage_id };
+      if (failure === 'wrong-workspace') file.workspace_id = 'ws-other';
+      if (failure === 'wrong-hash') input.hash = 'sha256:' + 'b'.repeat(64);
+      if (failure === 'replaced') file.storage_id = 'blob-new';
+      if (failure === 'missing-object') f.objects.clear();
+      if (failure === 'uncommitted') f.tables.file_meta.length = 0;
+      if (failure === 'other-provider') file.storage_provider_id = 's3';
+      if (failure === 'revoked') f.tables.workspace_members.length = 0;
+      if (failure === 'deleted-workspace') f.tables.workspaces[0].deleted = true;
+      const before = JSON.stringify(f.tables);
+      const result = handler(storageFunctions.getBackupFileUrl)(f.ctx, input);
+      if (['revoked', 'deleted-workspace'].includes(failure)) await expect(result).rejects.toThrow('Forbidden');
+      else if (failure === 'ok') await expect(result).resolves.toMatchObject({ storageId: 'blob-trash', url: 'https://download.test/blob-trash' });
+      else await expect(result).resolves.toBeNull();
+      expect(JSON.stringify(f.tables)).toBe(before);
+      expect(f.deletedObjects).toEqual([]);
+    },
+  );
+
   it('denies storage access for a soft-deleted workspace', async () => {
     const f = fixture();
     f.tables.workspaces[0].deleted = true;

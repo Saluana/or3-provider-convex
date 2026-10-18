@@ -500,6 +500,25 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         }
     }
 
+    async backupSnapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
+        // Backups always use a server-authenticated internal mutation. Browser
+        // JWTs cannot select the retained-file snapshot mode.
+        const client = await getSyncGcAdminClient(event);
+        try {
+            return await withConvexTransportRetry('sync.backupSnapshot', () =>
+                client.mutation(internalApi.sync.backupSnapshot, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    workspace_item_capability: input.workspaceItemCapability,
+                    page_size: input.pageSize,
+                    page_token: input.pageToken,
+                    tables: input.tables,
+                })
+            );
+        } catch (error) {
+            throwAsConvexServiceUnavailable(error, 'Convex backup backend unavailable. Update the provider scaffold.');
+        }
+    }
+
     async queryCanonicalStorage(
         event: H3Event,
         input: CanonicalStorageQueryRequest

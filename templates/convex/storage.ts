@@ -417,43 +417,54 @@ export const getFileUrl = internalQuery({
         workspace_id: v.id('workspaces'),
         hash: v.string(),
     },
-    handler: async (ctx, args) => {
-        await verifyWorkspaceMembership(ctx, args.workspace_id);
+    handler: (ctx, args) => readWorkspaceFileUrl(ctx, args.workspace_id, args.hash),
+});
 
-        const normalizedHash = normalizeHash(args.hash);
-        const canonicalHash = `sha256:${normalizedHash}`;
-        let file = await ctx.db
+/** Only the authenticated host archive reader may read retained Trash.
+ * The snapshot's exact storage ID cannot select an arbitrary storage object.
+ */
+export const getBackupFileUrl = internalQuery({
+    args: {
+        workspace_id: v.id('workspaces'),
+        hash: v.string(),
+        storage_id: v.id('_storage'),
+    },
+    handler: (ctx, args) => readWorkspaceFileUrl(ctx, args.workspace_id, args.hash, args.storage_id),
+});
+
+async function readWorkspaceFileUrl(ctx: QueryCtx, workspaceId: Id<'workspaces'>, hash: string, backupStorageId?: Id<'_storage'>) {
+    await verifyWorkspaceMembership(ctx, workspaceId);
+
+    const normalizedHash = normalizeHash(hash);
+    const canonicalHash = `sha256:${normalizedHash}`;
+    let file = await ctx.db
+        .query('file_meta')
+        .withIndex('by_workspace_hash', (q: any) =>
+            q.eq('workspace_id', workspaceId).eq('hash', canonicalHash)
+        )
+        .first();
+
+    // Older metadata rows may store the digest without the sha256 prefix.
+    // Only the canonical workspace row selects the storage object ID.
+    if (!file) {
+        file = await ctx.db
             .query('file_meta')
             .withIndex('by_workspace_hash', (q: any) =>
-                q.eq('workspace_id', args.workspace_id).eq('hash', canonicalHash)
+                q.eq('workspace_id', workspaceId).eq('hash', normalizedHash)
             )
             .first();
+    }
 
-        // Older metadata rows may store the digest without the sha256 prefix.
-        // Keep those rows readable while treating the canonical workspace row
-        // as the only source of the storage object ID.
-        if (!file) {
-            file = await ctx.db
-                .query('file_meta')
-                .withIndex('by_workspace_hash', (q: any) =>
-                    q.eq('workspace_id', args.workspace_id).eq('hash', normalizedHash)
-                )
-                .first();
-        }
+    if (!file || !file.storage_id || (file.storage_provider_id && file.storage_provider_id !== 'convex')) return null;
+    if (backupStorageId === undefined ? file.deleted : file.storage_id !== backupStorageId) return null;
 
-        if (!file || file.deleted || !file.storage_id || (file.storage_provider_id && file.storage_provider_id !== 'convex')) return null;
-
-        const url = await ctx.storage.getUrl(file.storage_id as Id<'_storage'>);
-        // Handle case where storage object was deleted but metadata remains
-        if (!url) {
-            return null;
-        }
-        return {
-            url, storageId: file.storage_id,
-            mimeType: file.mime_type, name: file.name, fileKind: file.kind,
-        };
-    },
-});
+    const url = await ctx.storage.getUrl(file.storage_id as Id<'_storage'>);
+    if (!url) return null;
+    return {
+        url, storageId: file.storage_id,
+        mimeType: file.mime_type, name: file.name, fileKind: file.kind,
+    };
+}
 
 /**
  * Deletes one unreferenced workspace file. Missing metadata is a successful

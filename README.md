@@ -455,6 +455,29 @@ invalid/missing configuration and outages, retained metadata pagination,
 native upload retries, durable connection CAS/evidence, internal-only access,
 and workspace cleanup. It never accepts a production deployment URL.
 
+Workspace archives include retained Trash originals through the server-only
+`sync:backupSnapshot` and `storage:getBackupFileUrl` functions. Normal sync still
+returns tombstones and ordinary downloads still refuse Trash. Backup reads
+require current membership and the snapshot's exact workspace, hash and storage
+ID, recheck access after opening the stream, and never delete or modify an
+original or upload intent. Missing, replaced or unavailable originals fail the
+archive instead of producing a successful partial backup. Native URLs stay on
+the server. Update the provider artifact and deploy the matching schema, sync,
+storage and snapshot templates together; older runtimes/backends fail closed.
+No new environment variable or dashboard setting is required. The disposable
+parity command above also writes `trash-backup.json`, proving checksummed Trash
+bytes in the real host archive and unchanged source and unfinished upload state.
+
+Native upload commits preserve snapshot preimages, so a re-upload between archive
+pages cannot silently omit the original metadata at the frozen watermark. If the
+selected original is no longer available, export fails instead of completing an
+incomplete archive. Restore advances destination revisions, verifies each write
+was applied, and preserves Trash through explicit soft-delete operations.
+Native writes advance beyond the current record and retained tombstone revisions,
+so fresh backups select the latest committed original even after synced edits or
+rapid reuploads. The parity receipt `concurrent-backup.json` verifies frozen and
+fresh snapshots, exact original bytes, and reupload after permanent deletion.
+
 ### Short signup codes
 
 New signup invitations use eight random characters (shown as `K7MP-4X9Q`) and retain clickable invite links. Lowercase, spaces, and an optional dash are accepted. The host hashes codes with HMAC using `OR3_AUTH_INVITE_TOKEN_SECRET`, shares a 20/minute/IP lookup limit across invitation entry points, and preserves email binding, expiry, revocation, and atomic single use. Previously issued signed links remain supported. Codes and hashes are omitted from invitation history.

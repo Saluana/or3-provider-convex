@@ -83,6 +83,8 @@ export const convexInternalApiContractNames = [
     'storage:deleteObject',
     'storage:gcDeletedFiles',
     'storage:getFileUrl',
+    'storage:getBackupFileUrl',
+    'sync:backupSnapshot',
     'sync:readChatHistory',
     'backgroundJobs:abort',
     'backgroundJobs:checkAborted',

@@ -1688,6 +1688,31 @@ describe("Convex materialized snapshot contract", () => {
     expect(fixture.tables.server_version_counter[0]!.value).toBe(before);
   });
 
+  // Backup failure inventory: ordinary sync changes, Trash becomes a bare
+  // tombstone, concurrent restore loses the frozen original, or continuations
+  // cross between normal/bootstrap and backup modes.
+  it('preserves retained file metadata through backup paging and concurrent restore', async () => {
+    const fixture = createFixture();
+    const backup = (syncFunctions.backupSnapshot as RegisteredFunction)._handler;
+    const normal = (syncFunctions.snapshot as RegisteredFunction)._handler;
+    const trash = { _id: 'trash-file', workspace_id: 'ws-1', hash: 'sha256:' + 'a'.repeat(64),
+      storage_id: 'old-blob', storage_provider_id: 'convex', size_bytes: 8, name: 'original.txt', mime_type: 'text/plain', kind: 'file',
+      deleted: true, deleted_at: 2, clock: 2, hlc: '2:0:dev', op_id: 'op-2', server_version: 2 };
+    fixture.tables.file_meta.push(trash, { ...trash, _id: 'second-file', hash: 'sha256:' + 'b'.repeat(64) });
+    const first = await backup(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'] });
+    expect(first.items).toMatchObject([{ kind: 'row', payload: { hash: trash.hash, deleted: true, storage_id: 'old-blob' } }]);
+    await expect(normal(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'], page_token: first.nextPageToken })).rejects.toThrow('mode');
+    const bootstrap = await normal(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'] });
+    expect(bootstrap.items[0].kind).toBe('tombstone');
+    await expect(backup(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'], page_token: bootstrap.nextPageToken })).rejects.toThrow('mode');
+    const second = fixture.tables.file_meta[1]!;
+    fixture.tables.sync_record_versions.push({ _id: 'trash-preimage', workspace_id: 'ws-1', table_name: 'file_meta', pk: second.hash,
+      server_version: 2, kind: 'tombstone', payload: { ...second }, clock: 2, hlc: '2:0:dev', op_id: 'op-2', server_deleted_at: 2 });
+    Object.assign(second, { deleted: false, storage_id: 'replacement', clock: 6, hlc: '6:0:dev', op_id: 'op-6', server_version: 6 });
+    const next = await backup(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'], page_token: first.nextPageToken });
+    expect(next.items).toMatchObject([{ kind: 'row', payload: { hash: second.hash, deleted: true, storage_id: 'old-blob' } }]);
+  });
+
   it("ships the snapshot mutation, schema, helper, and typechecked configuration", () => {
     const packPath = new URL(
       "../../../templates/convex.pack.json.gz",

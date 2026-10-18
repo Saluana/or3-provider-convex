@@ -7,6 +7,12 @@
 // metadata is confused with references/live bytes or loses its paging scope;
 // duplicate upload intents lose quota after cancellation/expiry, and legacy
 // MD5 metadata becomes invisible at the canonical storage boundary.
+// Backup failures: retained Trash bytes are omitted, snapshot identity widens
+// access, browser clients obtain permanent URLs, or reading changes an original
+// or unfinished upload. Qualify the real host archive with deployed Convex code.
+// Restore must beat native upload revisions and reject unapplied metadata;
+// Native writes must advance prior live/deleted revisions, keep new snapshots
+// current, and retain the frozen Trash preimage for continuations.
 import assert from 'node:assert/strict';
 import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
@@ -47,6 +53,15 @@ export const expireIntent = internalMutation({args:{intent_id:v.id('upload_inten
 export const seedMd5 = internalMutation({args:{workspace_id:v.id('workspaces'),storage_id:v.id('_storage')},handler:async(ctx,args)=>{
  for(const deleted of [false,true])await ctx.db.insert('file_meta',{workspace_id:args.workspace_id,hash:'md5:'+(deleted?'e':'d').repeat(32),name:'legacy.bin',mime_type:'application/octet-stream',kind:'file',size_bytes:100,storage_id:args.storage_id,storage_provider_id:'convex',ref_count:0,deleted,created_at:1,updated_at:1,clock:1});
 }});
+export const trashOriginal = internalMutation({args:{workspace_id:v.id('workspaces'),hash:v.string()},handler:async(ctx,args)=>{
+ const row=await ctx.db.query('file_meta').withIndex('by_workspace_hash',q=>q.eq('workspace_id',args.workspace_id).eq('hash',args.hash)).unique();
+ if(!row)throw new Error('Missing fixture original');
+ await ctx.db.patch(row._id,{deleted:true,deleted_at:Math.floor(Date.now()/1000)});
+}});
+export const originalState = internalMutation({args:{workspace_id:v.id('workspaces'),intent_id:v.id('upload_intents'),storage_id:v.id('_storage')},handler:async(ctx,args)=>({
+ files:await ctx.db.query('file_meta').withIndex('by_workspace_hash',q=>q.eq('workspace_id',args.workspace_id)).collect(),
+ intent:await ctx.db.get(args.intent_id),object:await ctx.db.system.get(args.storage_id),
+})});
 
 `);
 const instance = 'or3-parity-' + randomBytes(8).toString('hex');
@@ -147,6 +162,181 @@ try {
         for (const change of [{ hash: 'f'.repeat(64) }, { size_bytes: bytes.length + 1 }, { mime_type: 'text/html' }, { storage_provider_id: 's3' }]) {
             await assert.rejects(client.mutation('storage:commitUpload', { ...commit, ...change }), /intent|metadata|receipt/i);
         }
+    });
+    await check('complete host backups include retained Convex Trash and preserve unfinished uploads', async () => {
+        const workspaceId = await client.mutation('parityProbe:quotaWorkspace', { user_id: user });
+        const bytes = new TextEncoder().encode('The only retained Trash original.');
+        const hash = 'sha256:' + createHash('sha256').update(bytes).digest('hex');
+        const intent = await client.mutation('storage:generateUploadUrl', { workspace_id: workspaceId, hash, mime_type: 'text/plain', size_bytes: bytes.length });
+        const { storageId } = await (await fetch(intent.uploadUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: bytes })).json();
+        await client.mutation('storage:commitUpload', { workspace_id: workspaceId, intent_id: intent.intentId, hash, storage_id: storageId, storage_provider_id: 'convex', mime_type: 'text/plain', size_bytes: bytes.length, name: 'retained.txt', kind: 'file' });
+        await client.mutation('parityProbe:trashOriginal', { workspace_id: workspaceId, hash });
+        const pendingBytes = new TextEncoder().encode('Still waiting for commit.');
+        const pendingHash = 'sha256:' + createHash('sha256').update(pendingBytes).digest('hex');
+        const pending = await client.mutation('storage:generateUploadUrl', { workspace_id: workspaceId, hash: pendingHash, mime_type: 'text/plain', size_bytes: pendingBytes.length });
+        const pendingObject = await (await fetch(pending.uploadUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: pendingBytes })).json();
+        const stateArgs = { workspace_id: workspaceId, intent_id: pending.intentId, storage_id: pendingObject.storageId };
+        const before = await client.mutation('parityProbe:originalState', stateArgs);
+        assert.equal(await client.query('storage:getFileUrl', { workspace_id: workspaceId, hash }), null);
+        const backupArgs = { workspace_id: workspaceId, hash, storage_id: storageId };
+        for (const change of [{ workspace_id: workspace }, { hash: pendingHash }, { storage_id: pendingObject.storageId }]) {
+            assert.equal(await client.query('storage:getBackupFileUrl', { ...backupArgs, ...change }), null);
+        }
+        const outsider = new ConvexHttpClient(url);
+        outsider.setAdminAuth(adminKey, { subject: 'not-a-member', issuer: 'https://or3.ai/auth/basic-auth', or3_server: true });
+        await assert.rejects(outsider.query('storage:getBackupFileUrl', backupArgs), /Unauthorized|Forbidden|not found/i);
+        await assert.rejects(new ConvexHttpClient(url).query('storage:getBackupFileUrl', backupArgs), /public function|internal function/i);
+
+        const session = { authenticated: true, user: { id: user }, provider: 'basic-auth', providerUserId: 'parity-owner', workspace: { id: workspaceId, name: 'Trash backup' }, role: 'owner' };
+        mock.module(join(host, 'server/auth/session.ts'), () => ({ resolveSessionContext: async () => session }));
+        mock.module(join(host, 'server/auth/token-broker/resolve.ts'), () => ({ resolveProviderToken: async () => null }));
+        mock.module(join(host, 'server/api/workspaces/_helpers.ts'), () => ({ requireWorkspaceSession: async () => session }));
+        mock.module(join(host, 'server/utils/storage/workspace-access.ts'), () => ({ requireStorageWorkspaceAccess: async () => {} }));
+        mock.module(join(host, 'server/utils/sync/is-sync-enabled.ts'), () => ({ isSyncEnabled: () => true }));
+        mock.module(join(host, 'server/utils/sync/rate-limiter.ts'), () => ({ checkSyncRateLimit: () => ({ allowed: true }), recordSyncRequest: () => {} }));
+        const { ConvexStorageGatewayAdapter } = await import(join(provider, 'src/runtime/server/storage/convex-storage-gateway-adapter.ts'));
+        const { ConvexSyncGatewayAdapter } = await import(join(provider, 'src/runtime/server/sync/convex-sync-gateway-adapter.ts'));
+        const storage = new ConvexStorageGatewayAdapter();
+        const sync = new ConvexSyncGatewayAdapter();
+        let selectedStorage = storage, selectedSync = sync;
+        mock.module(join(host, 'server/storage/gateway/registry.ts'), () => ({ getActiveStorageGatewayAdapter: () => selectedStorage }));
+        mock.module(join(host, 'server/sync/gateway/registry.ts'), () => ({ getActiveSyncGatewayAdapter: () => selectedSync }));
+        const { default: backup } = await import(join(host, 'server/api/workspaces/backup.get.ts'));
+        const { createApp, toWebHandler } = await import('h3');
+        const { scanCloudBackup } = await import(join(host, 'shared/storage/workspace-archive.ts'));
+        const request = () => toWebHandler(createApp().use('/backup', backup))(new Request(`http://or3.test/backup?workspaceId=${workspaceId}`));
+        // An older runtime must not silently export a snapshot which omits Trash.
+        selectedSync = { id: 'convex', snapshot: sync.snapshot.bind(sync) };
+        assert.equal((await request()).status, 503);
+        selectedSync = sync;
+        selectedStorage = { id: 'convex', presignDownload: storage.presignDownload.bind(storage) };
+        assert.equal((await request()).status, 503);
+        selectedStorage = storage;
+        const response = await request();
+        assert.equal(response.status, 200);
+        const archiveBytes = await response.arrayBuffer();
+        const found = [];
+        await scanCloudBackup(new Blob([archiveBytes]), async frame => {
+            if (frame.header.type === 'file') found.push({ hash: frame.header.hash, bytes: await frame.body.text() });
+            if (frame.header.type === 'row' && frame.header.table === 'file_meta') assert.equal((await frame.body.json()).deleted, true);
+        });
+        assert.deepEqual(found, [{ hash, bytes: new TextDecoder().decode(bytes) }]);
+        assert.deepEqual(await client.mutation('parityProbe:originalState', stateArgs), before);
+        const retained = await client.query('storage:getBackupFileUrl', backupArgs);
+        assert.equal(await (await fetch(retained.url)).text(), new TextDecoder().decode(bytes));
+        // Run the real host restore orchestration against the deployed adapter.
+        // Only browser session/workspace selection and direct-upload transport
+        // are supplied here; LWW, snapshot history and stored state are real.
+        const databases = new Map([[workspaceId, {}]]);
+        const workspaceApi = {
+            create: async () => { const id = await client.mutation('parityProbe:quotaWorkspace', { user_id: user }); databases.set(id, {}); return { id }; },
+            setActive: async ({ id }) => { session.workspace = { id, name: 'Restore target' }; },
+            update: async () => {},
+        };
+        mock.module(join(host, 'app/db/client.ts'), () => ({ getActiveWorkspaceId: () => session.workspace.id, getDb: () => databases.get(session.workspace.id) }));
+        mock.module(join(host, 'app/composables/auth/useSessionContext.ts'), () => ({ getCachedSessionContext: () => session }));
+        mock.module(join(host, 'app/core/workspace/gateway-workspace-api.ts'), () => ({ createGatewayWorkspaceApi: () => workspaceApi }));
+        let rejectMetadata = false;
+        mock.module(join(host, 'app/core/sync/providers/gateway-sync-provider.ts'), () => ({ createGatewaySyncProvider: () => ({
+            snapshot: input => sync.snapshot({}, input),
+            push: async input => { const result = await sync.push({}, input); return rejectMetadata ? { ...result, results: result.results.map(item => ({ ...item, applied: false })) } : result; },
+        }) }));
+        mock.module(join(host, 'app/core/sync/hlc.ts'), () => ({ generateHLC: () => `${String(Date.now()).padStart(15, '0')}:000000:restore`, getDeviceId: () => 'restore-probe' }));
+        mock.module(join(host, 'app/core/storage/file-policy.ts'), () => ({ loadFilePolicy: async () => ({ maxUploadBytes: 1024 * 1024 }) }));
+        mock.module(join(host, 'app/composables/admin/useAdminExtensions.ts'), () => ({ ADMIN_HEADERS: { 'x-or3-admin-intent': 'admin' } }));
+        mock.module(join(host, 'app/utils/errors.ts'), () => ({ reportError: () => {}, err: code => new Error(code) }));
+        mock.module(join(host, 'app/core/storage/provider-registry.ts'), () => ({ getActiveStorageProvider: () => ({ commitUpload: true }) }));
+        mock.module(join(host, 'app/core/storage/transfer-queue.ts'), () => ({ getStorageTransferQueue: () => ({
+            getWorkspaceId: () => session.workspace.id,
+            uploadDirect: async (row, body, context) => {
+                const intent = await client.mutation('storage:generateUploadUrl', { workspace_id: context.workspaceId, hash: row.hash, mime_type: row.mime_type, size_bytes: body.size });
+                const { storageId } = await (await fetch(intent.uploadUrl, { method: 'POST', headers: { 'Content-Type': row.mime_type }, body })).json();
+                await client.mutation('storage:commitUpload', { workspace_id: context.workspaceId, intent_id: intent.intentId, hash: row.hash, storage_id: storageId, storage_provider_id: 'convex', mime_type: row.mime_type, size_bytes: body.size, name: row.name, kind: row.kind });
+                return { ...row, storage_id: storageId, storage_provider_id: 'convex' };
+            },
+        }) }));
+        const { restoreCloudWorkspace } = await import(join(host, 'app/utils/cloud-workspace-backup.ts'));
+        await restoreCloudWorkspace(new Blob([archiveBytes]), { refresh: async () => {} }, () => {});
+        const restoredWorkspace = session.workspace.id;
+        const restored = await client.mutation('sync:backupSnapshot', { workspace_id: restoredWorkspace, tables: ['file_meta'], page_size: 100 });
+        assert.equal(restored.items.length, 1);
+        assert.equal(restored.items[0].payload.deleted, true, 'Restore resurrected Trash');
+        assert.notEqual(restored.items[0].payload.storage_id, storageId);
+        const restoredDownload = await client.query('storage:getBackupFileUrl', { workspace_id: restoredWorkspace, hash, storage_id: restored.items[0].payload.storage_id });
+        assert.equal(await (await fetch(restoredDownload.url)).text(), new TextDecoder().decode(bytes));
+        assert.deepEqual(await client.mutation('parityProbe:originalState', stateArgs), before);
+        rejectMetadata = true;
+        await assert.rejects(restoreCloudWorkspace(new Blob([archiveBytes]), { refresh: async () => {} }, () => {}), /did not finish/);
+        assert.equal(session.workspace.id, restoredWorkspace);
+        await writeFile(join(evidence, 'trash-restore.json'), JSON.stringify({ passed: true, restoredWorkspace, trashPreserved: true, restoredBytesVerified: true, sourceAndPendingUploadKept: true, unappliedMetadataRejected: true }, null, 2) + '\n');
+        await writeFile(join(evidence, 'trash-backup.json'), JSON.stringify({ passed: true, fileHash: hash, archiveSha256: createHash('sha256').update(new Uint8Array(archiveBytes)).digest('hex'), trashIncluded: true, originalKept: true, pendingUploadKept: true, publicAccessDenied: true, snapshotMismatchesDenied: true }, null, 2) + '\n');
+    });
+    await check('native reuploads advance synced revisions and preserve frozen Trash originals', async () => {
+        const workspaceId = await client.mutation('parityProbe:quotaWorkspace', { user_id: user });
+        const upload = async text => {
+            const bytes = new TextEncoder().encode(text), hash = 'sha256:' + createHash('sha256').update(bytes).digest('hex');
+            const intent = await client.mutation('storage:generateUploadUrl', { workspace_id: workspaceId, hash, mime_type: 'text/plain', size_bytes: bytes.length });
+            const { storageId } = await (await fetch(intent.uploadUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: bytes })).json();
+            await client.mutation('storage:commitUpload', { workspace_id: workspaceId, intent_id: intent.intentId, hash, storage_id: storageId, storage_provider_id: 'convex', mime_type: 'text/plain', size_bytes: bytes.length, name: 'original.txt', kind: 'file' });
+            return { hash, storageId, text };
+        };
+        const originals = [await upload('First retained original'), await upload('Second retained original')].sort((a, b) => a.hash.localeCompare(b.hash));
+        const deleteClock = Math.floor(Date.now() / 1000) + 60;
+        const trash = await client.mutation('sync:push', { workspace_id: workspaceId, ops: originals.map(original => ({
+            op_id: crypto.randomUUID(), table_name: 'file_meta', operation: 'delete', pk: original.hash,
+            clock: deleteClock, hlc: `${Date.now()}:revision-probe`, device_id: 'revision-probe',
+        })) });
+        assert(trash.results.every(result => result.success && result.applied));
+        const first = await client.mutation('sync:backupSnapshot', { workspace_id: workspaceId, tables: ['file_meta'], page_size: 1 });
+        const originalUrl = await client.query('storage:getBackupFileUrl', { workspace_id: workspaceId, hash: originals[1].hash, storage_id: originals[1].storageId });
+        let replacement = await upload(originals[1].text);
+        const next = await client.mutation('sync:backupSnapshot', { workspace_id: workspaceId, tables: ['file_meta'], page_size: 1, page_token: first.nextPageToken });
+        assert.equal(next.highWatermark, first.highWatermark);
+        assert.equal(next.nextPageToken, null);
+        const rows = [...first.items, ...next.items];
+        assert.deepEqual(rows.map(row => row.pk), originals.map(original => original.hash));
+        for (let index = 0; index < rows.length; index++) {
+            assert.equal(rows[index].payload.deleted, true);
+            assert.equal(rows[index].payload.storage_id, originals[index].storageId);
+            if (index === 1) assert.equal(await (await fetch(originalUrl.url)).text(), originals[index].text);
+        }
+        let lastClock = deleteClock;
+        // Fresh snapshots must select the canonical replacement, including
+        // rapid consecutive commits that can share the same wall-clock second.
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const current = await client.mutation('sync:backupSnapshot', { workspace_id: workspaceId, tables: ['file_meta'], page_size: 100 });
+            const row = current.items.find(item => item.pk === replacement.hash);
+            assert.equal(row?.payload.storage_id, replacement.storageId, 'Fresh backup selected an obsolete original');
+            assert.equal(row.payload.deleted, false);
+            assert(row.revision.clock > lastClock, 'Native revision did not advance past the prior revision');
+            lastClock = row.revision.clock;
+            const file = await client.query('storage:getBackupFileUrl', { workspace_id: workspaceId, hash: replacement.hash, storage_id: row.payload.storage_id });
+            assert.equal(await (await fetch(file.url)).text(), replacement.text);
+            if (attempt < 2) replacement = await upload(replacement.text);
+        }
+        // Permanent deletion leaves a tombstone after removing materialized
+        // metadata. A later verified reupload must also advance that revision.
+        const opId = crypto.randomUUID();
+        const deleted = await client.mutation('sync:push', { workspace_id: workspaceId, ops: [{
+            op_id: opId, table_name: 'file_meta', operation: 'delete', pk: replacement.hash,
+            clock: lastClock + 1, hlc: `${Date.now()}:revision-probe`, device_id: 'revision-probe',
+        }] });
+        assert(deleted.results[0].success && deleted.results[0].applied);
+        await client.mutation('storage:deleteObject', { workspace_id: workspaceId, hash: replacement.hash, storage_id: replacement.storageId });
+        const purged = await client.mutation('sync:snapshot', { workspace_id: workspaceId, tables: ['file_meta'], page_size: 100 });
+        const tombstone = purged.items.find(item => item.pk === replacement.hash);
+        assert.equal(tombstone.kind, 'tombstone');
+        replacement = await upload(replacement.text);
+        const restored = await client.mutation('sync:backupSnapshot', { workspace_id: workspaceId, tables: ['file_meta'], page_size: 100 });
+        const restoredRow = restored.items.find(item => item.pk === replacement.hash);
+        assert.equal(restoredRow?.payload.storage_id, replacement.storageId);
+        assert(restoredRow.revision.clock > tombstone.revision.clock);
+        assert.equal(restoredRow.payload.deleted, false);
+        const restoredFile = await client.query('storage:getBackupFileUrl', { workspace_id: workspaceId, hash: replacement.hash, storage_id: replacement.storageId });
+        assert.equal(await (await fetch(restoredFile.url)).text(), replacement.text);
+        assert.equal(await (await fetch(originalUrl.url)).text(), originals[1].text);
+        await writeFile(join(evidence, 'concurrent-backup.json'), JSON.stringify({ passed: true, files: rows.length, frozenWatermark: first.highWatermark,
+            trashAndOriginalBytesPreserved: true, freshOriginalVerified: true, nativeRevisionsAdvance: true, tombstoneReuploadVerified: true }, null, 2) + '\n');
     });
     for (const [name, args] of [
         ['generateUploadUrl', { workspace_id: workspace, hash: nativeReceipt?.hash, mime_type: 'text/plain', size_bytes: 18 }],

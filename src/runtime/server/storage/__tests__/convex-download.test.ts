@@ -136,4 +136,34 @@ describe('Convex HTTP download delivery', () => {
         f.config.sync.convexAdminKey = '';
         await expect(adapter.presignDownload(event, input)).rejects.toMatchObject({ statusCode: 503 });
     });
+
+    // Server backup reads never mint a browser URL. Revocation/replacement
+    // while fetching must cancel the body before it enters an archive.
+    it.each(['ok', 'revoked', 'replaced', 'missing', 'backend-outdated'])(
+        'streams a server-only backup original safely: %s', async failure => {
+            const adapter = new ConvexStorageGatewayAdapter();
+            const event = { context: {}, node: { req: { headers: {} } } } as any;
+            const cancelled = vi.fn();
+            f.fetch.mockImplementation(async () => {
+                if (failure === 'revoked') f.allowed = false;
+                if (failure === 'replaced') f.file = { ...f.file, storageId: 'replacement' };
+                return new Response(new ReadableStream({
+                    start(controller) { controller.enqueue(new TextEncoder().encode('retained original')); },
+                    cancel: cancelled,
+                }), { status: failure === 'missing' ? 404 : 200 });
+            });
+            if (failure === 'backend-outdated') f.query.mockRejectedValue(new Error('unknown function'));
+            const result = adapter.readBackupFile(event, { workspaceId: 'ws-1', hash: HASH, storageId: 'blob-1' });
+            if (failure === 'ok') {
+                const response = await result;
+                const reader = response.body!.getReader();
+                expect(new TextDecoder().decode((await reader.read()).value)).toBe('retained original');
+                await reader.cancel();
+                expect(f.query).toHaveBeenLastCalledWith(expect.anything(), { workspace_id: 'ws-1', hash: HASH, storage_id: 'blob-1' });
+            } else {
+                await expect(result).rejects.toMatchObject({ statusCode: failure === 'revoked' ? 403 : failure === 'backend-outdated' ? 503 : 404 });
+                if (failure !== 'backend-outdated') expect(cancelled).toHaveBeenCalled();
+            }
+        },
+    );
 });

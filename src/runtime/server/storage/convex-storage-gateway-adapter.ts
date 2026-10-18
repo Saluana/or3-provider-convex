@@ -28,7 +28,7 @@ import {
 import { resolveConvexAuthProvider } from '../utils/provider-compat';
 import { resolvePresignExpiresAt } from '~~/server/utils/storage/presign-expiry';
 import { resolveSessionContext } from '~~/server/auth/session';
-import { createConvexDownloadUrl } from './convex-download';
+import { createConvexDownloadUrl, readConvexBackupFile } from './convex-download';
 
 const CommitInputSchema = z.object({
     workspace_id: z.string().min(1),
@@ -125,6 +125,10 @@ export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
 
     async presignDownload(event: H3Event, input: PresignDownloadRequest): Promise<PresignDownloadResponse> {
         return createConvexDownloadUrl(event, input);
+    }
+
+    async readBackupFile(event: H3Event, input: { workspaceId: string; hash: string; storageId: string }): Promise<Response> {
+        return readConvexBackupFile(event, input);
     }
 
     async commit(event: H3Event, input: unknown): Promise<void> {
