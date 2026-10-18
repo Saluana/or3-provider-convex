@@ -160,6 +160,13 @@ admin-authenticated mutations. Collection is bounded, requires the explicit
 `snapshot-v1` capability, and deletes only old revisions acknowledged by every
 registered device; fresh devices bootstrap from canonical snapshots.
 
+When available, **Operations → Maintenance** labels these tools **Clear old sync
+history** (`sync.gc-change-log`) and **Clear old deletion history**
+(`sync.gc-tombstones`), with plain-language retention and device requirements.
+Neither empties Trash or removes stored files. **Remove unused files**
+(`storage.gc`) describes the separate permanent file cleanup action. Card
+descriptions wrap fully on narrow screens.
+
 Server-authored notification and storage writes mint a fresh UUID `op_id`
 (never a `server:*` prefix), allocate `server_version`, and append
 `change_log`. Host enforcement settings do not: they live in the private
@@ -367,6 +374,10 @@ membership reads also trim entry IDs and normalize chat-kind case/whitespace
 like the browser, so these projects cannot bypass server execution policy.
 Deploy the updated `sync.ts` scaffold to apply these corrections to an existing backend.
 
+Current hosts refuse server tools and workflows without resolved canonical
+ownership, including ordinary-looking chats with possible legacy memberships.
+Upgrade the provider and deploy its ownership-aware scaffold before retrying.
+
 Version 0.0.12 declares `projectOwnership: 'v1'` on the canonical-history adapter. Deploy the updated sync scaffold before enabling server execution with this version; the runtime marker alone cannot upgrade an existing backend. Projects qualification: `OR3_CANONICAL_HOST_ROOT=/absolute/path/to/or3-chat bun x vitest run src/runtime/__tests__/convex-snapshot-contract.test.ts`, followed by the host's disposable deployed Convex cloud journey.
 
 Updated direct and gateway transports send workspace_item_capability v1.
@@ -443,6 +454,14 @@ concurrent durable rate limiting,
 invalid/missing configuration and outages, retained metadata pagination,
 native upload retries, durable connection CAS/evidence, internal-only access,
 and workspace cleanup. It never accepts a production deployment URL.
+
+### Short signup codes
+
+New signup invitations use eight random characters (shown as `K7MP-4X9Q`) and retain clickable invite links. Lowercase, spaces, and an optional dash are accepted. The host hashes codes with HMAC using `OR3_AUTH_INVITE_TOKEN_SECRET`, shares a 20/minute/IP lookup limit across invitation entry points, and preserves email binding, expiry, revocation, and atomic single use. Previously issued signed links remain supported. Codes and hashes are omitted from invitation history.
+
+`findSignupInviteByTokenHash` is a trusted-server internal query using the existing `by_token_hash` index. Deploy the matching rebuilt backend templates with the provider before using short codes; no schema change is required. Public and provider-only callers cannot look up invitation emails.
+
+Run the disposable backend qualification with `bun --tsconfig-override ./tsconfig.json scripts/test/backend-lifecycle.mjs ...` so host and provider imports resolve the same Nuxt shim. The signup mode verifies pending hash lookup, consumed-code refusal, atomic provisioning, and transport behavior, and writes a repeatable JSON receipt.
 
 ## Dashboard restart drain accounting
 
