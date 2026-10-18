@@ -145,6 +145,10 @@ class MemoryQuery {
     return this.materialize().slice(0, count);
   }
 
+  async *[Symbol.asyncIterator]() {
+    yield* this.materialize();
+  }
+
   private materialize(): Row[] {
     const fields = INDEX_FIELDS[this.indexName] ?? ["_id"];
     const filtered = this.rows.filter((row) =>

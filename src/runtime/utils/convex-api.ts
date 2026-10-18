@@ -96,6 +96,7 @@ export const convexInternalApiContractNames = [
     'backgroundJobs:get',
     'backgroundJobs:findByIdempotencyKey',
     'backgroundJobs:getActiveCount',
+    'backgroundJobs:getShutdownBlockerCount',
     'backgroundJobs:listPendingHistory',
     'backgroundJobs:renewLease',
     'backgroundJobs:saveTerminalSnapshot',

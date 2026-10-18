@@ -59,7 +59,7 @@
         "provenance": true
     },
     "dependencies": {
-        "convex": "^1.31.3",
+        "convex": "^1.31.7",
         "convex-nuxt": "0.1.5",
         "convex-vue": "^0.1.4"
     },

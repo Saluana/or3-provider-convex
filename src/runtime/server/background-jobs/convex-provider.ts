@@ -397,4 +397,12 @@ export const convexJobProvider: BackgroundJobProvider = {
         const client = getClient();
         return await client.query(internalApi.backgroundJobs.getActiveCount, {});
     },
+
+    async getShutdownBlockerCount(): Promise<number> {
+        // Missing backend functions and transport failures must propagate. An
+        // unavailable count never grants permission to replace the server.
+        return await getClient().query(
+            internalApi.backgroundJobs.getShutdownBlockerCount, {}
+        );
+    },
 };

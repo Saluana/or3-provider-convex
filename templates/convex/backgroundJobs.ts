@@ -20,7 +20,7 @@
  * - Rich audit logging for job changes
  */
 
-import { v } from 'convex/values';
+import { getConvexSize, v, type Value } from 'convex/values';
 import { internalMutation, internalQuery } from './_generated/server';
 import { readRequestUsage } from './requestUsage';
 
@@ -30,6 +30,20 @@ import { readRequestUsage } from './requestUsage';
 
 /** Batch size for job cleanup operations */
 const CLEANUP_BATCH_SIZE = 100;
+
+/** Keep four cleanup buckets below the transaction read limit, even with 1 MiB documents. */
+async function readJobBatch<T extends Value>(query: AsyncIterable<T>, limit: number): Promise<T[]> {
+    const jobs: T[] = [];
+    let bytes = 0;
+    for await (const job of query) {
+        jobs.push(job);
+        bytes += getConvexSize(job);
+        // At most one document can exceed this per-bucket budget. Keep the
+        // count cap for small rows and preserve throughput on ordinary jobs.
+        if (jobs.length >= limit || bytes >= 2 * 1024 * 1024) break;
+    }
+    return jobs;
+}
 
 /**
  * Applies an atomic claim to a job row and returns the public projection.
@@ -900,10 +914,9 @@ export const cleanup = internalMutation({
         let cleaned = 0;
 
         // Get streaming jobs that have timed out (batched)
-        const streamingJobs = await ctx.db
+        const streamingJobs = await readJobBatch(ctx.db
             .query('background_jobs')
-            .withIndex('by_status', (q) => q.eq('status', 'streaming'))
-            .take(CLEANUP_BATCH_SIZE);
+            .withIndex('by_status', (q) => q.eq('status', 'streaming')), CLEANUP_BATCH_SIZE);
 
         for (const job of streamingJobs) {
             const idleAge = now - (job.last_activity_at ?? job.started_at);
@@ -937,10 +950,9 @@ export const cleanup = internalMutation({
 
         // Get completed jobs that are stale (batched)
         for (const status of ['complete', 'error', 'aborted'] as const) {
-            const jobs = await ctx.db
+            const jobs = await readJobBatch(ctx.db
                 .query('background_jobs')
-                .withIndex('by_status', (q) => q.eq('status', status))
-                .take(CLEANUP_BATCH_SIZE);
+                .withIndex('by_status', (q) => q.eq('status', status)), CLEANUP_BATCH_SIZE);
 
             for (const job of jobs) {
                 const completedAge = now - (job.completed_at ?? job.started_at);
@@ -978,6 +990,26 @@ export const getActiveCount = internalQuery({
     },
 });
 
+/**
+ * Restart blockers across the durable store, including parked tools/workflows
+ * and terminal jobs with unsettled admission/history. Return a lower-bound
+ * count (0 or 1): loading pages of large snapshots can exceed Convex's byte
+ * budget even with few records. Indexed existence checks in one transaction
+ * give a consistent snapshot with at most one document read per bucket.
+ */
+export const getShutdownBlockerCount = internalQuery({
+    args: {},
+    handler: async (ctx) => {
+        if (await ctx.db.query('background_jobs')
+            .withIndex('by_status', (q) => q.eq('status', 'streaming')).first()) return 1;
+        for (const phase of ['admission_pending', 'finalization_pending']) {
+            if (await ctx.db.query('background_jobs')
+                .withIndex('by_history_phase', (q) => q.eq('history_phase', phase)).first()) return 1;
+        }
+        return 0;
+    },
+});
+
 /** Return a bounded page of canonical-history deliveries awaiting retry. */
 export const listPendingHistory = internalQuery({
     args: { limit: v.number() },
@@ -985,14 +1017,14 @@ export const listPendingHistory = internalQuery({
         const limit = Math.max(1, Math.min(100, Math.floor(args.limit)));
         const jobs = (
             await Promise.all([
-                ctx.db.query('background_jobs')
+                readJobBatch(ctx.db.query('background_jobs')
                     .withIndex('by_history_phase', (q) =>
                         q.eq('history_phase', 'admission_pending')
-                    ).take(limit),
-                ctx.db.query('background_jobs')
+                    ), limit),
+                readJobBatch(ctx.db.query('background_jobs')
                     .withIndex('by_history_phase', (q) =>
                         q.eq('history_phase', 'finalization_pending')
-                    ).take(limit),
+                    ), limit),
             ])
         ).flat();
         return jobs

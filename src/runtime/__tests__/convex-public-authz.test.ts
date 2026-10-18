@@ -639,18 +639,21 @@ describe('Convex authorization boundary', () => {
 
     it('terminalizes legacy streaming jobs during startup cleanup', async () => {
         const patch = vi.fn(async () => undefined);
-        let queryCount = 0;
         const query = vi.fn(() => ({
             withIndex: (_index: string, build: (q: any) => unknown) => {
-                const chain = { eq: vi.fn(() => chain) };
+                let status: string | undefined;
+                const chain = { eq: (field: string, value: string) => {
+                    if (field === 'status') status = value;
+                    return chain;
+                } };
                 build(chain);
-                const jobs = queryCount++ === 0
+                const jobs = status === 'streaming'
                     ? [{
                           _id: 'job-legacy', status: 'streaming',
                           started_at: Date.now(),
                       }]
                     : [];
-                return { take: vi.fn(async () => jobs) };
+                return { async *[Symbol.asyncIterator]() { yield* jobs; } };
             },
         }));
         const ctx = { db: { query, patch, delete: vi.fn() } } as any;

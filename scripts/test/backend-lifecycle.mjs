@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // Real, disposable Convex upgrade proof. Never accepts a deployed backend URL.
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, readFile, writeFile, symlink, rm, readdir } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, writeFile, symlink, rm, readdir, open } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
 import { resolve, join } from 'node:path';
@@ -13,6 +13,7 @@ const [binary, host, basePack, evidence, qualifiedProvider] = process.argv.slice
 assert(binary?.startsWith(join(process.env.HOME, '.cache/convex/binaries/')) && binary.endsWith('/convex-local-backend'));
 assert(host && basePack && evidence, 'Usage: bun backend-lifecycle.mjs <cached-binary> <host-source> <base-pack> <evidence-dir>');
 const signupOnly = process.argv[7] === 'signup';
+const drainOnly = process.argv[7] === 'drain';
 const provider = qualifiedProvider ?? resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const root = await mkdtemp(join(tmpdir(), 'or3-convex-upgrade-'));
 await mkdir(evidence, { recursive: true });
@@ -31,7 +32,7 @@ for (const [name, contents] of Object.entries(old.files)) {
     await mkdir(resolve(target, '..'), { recursive: true });
     await writeFile(target, contents);
 }
-if (!signupOnly && old.files['or3Backend.ts']) {
+if (!signupOnly && !drainOnly && old.files['or3Backend.ts']) {
     // Current published installations include the manifest written by their
     // initializer. Exercise that owner rather than inventing an install receipt.
     const { initializeTemplates } = await import(join(resolve(basePack, '../..'), 'scripts/backend.mjs'));
@@ -88,7 +89,114 @@ try {
     await convexRun('run', 'upgradeProbe:put', '{}');
     const before = JSON.parse((await convexRun('run', 'upgradeProbe:read', '{}')).output.trim());
     assert.equal(before.length, 1);
-    if (signupOnly) {
+    if (drainOnly) {
+        // Failure inventory: worker-only counts omit browser/workflow work;
+        // terminal status hides pending history; a bounded page falsely reports
+        // idle; absent backend functions or lost transport permit replacement.
+        const config = { sync: { convexUrl: url, convexAdminKey: adminKey } };
+        mock.module(join(provider, 'src/shims/imports.ts'), () => ({ useRuntimeConfig: () => config }));
+        mock.module(join(host, 'server/utils/background-jobs/store.ts'), () => ({ getJobConfig: () => ({
+            maxConcurrentJobs: 1000, maxConcurrentJobsPerUser: 1000,
+            jobTimeoutMs: 300000, completedJobRetentionMs: 300000,
+        }) }));
+        const { convexJobProvider: jobs } = await import(join(provider, 'src/runtime/server/background-jobs/convex-provider.ts'));
+        const { createShutdownController } = await import(join(host, 'server/utils/shutdown/controller.ts'));
+        await check('legacy backend cannot grant drain permission', async () => {
+            assert.equal(typeof jobs.getShutdownBlockerCount, 'function');
+            await assert.rejects(jobs.getShutdownBlockerCount(), /getShutdownBlockerCount|function/i);
+        });
+        await cp(join(provider, 'templates/convex'), join(root, 'convex'), { recursive: true });
+        await convexRun('deploy', '--yes', '--typecheck', 'enable');
+        await check('durable drain recognizes each independent parked, workflow, admission and terminal-history blocker', async () => {
+            assert.equal(await jobs.getShutdownBlockerCount(), 0);
+            const params = { userId: 'drain-user', threadId: 'drain-thread', messageId: 'drain-message', model: 'fixture', generationId: 'drain-generation' };
+            const controller = createShutdownController({ shutdownTimeoutMs: 1000, getBackgroundJobCount: () => jobs.getShutdownBlockerCount() });
+            for (const scenario of ['parked', 'workflow', 'admission', 'complete', 'error', 'aborted']) {
+                const id = await jobs.createJob({ ...params,
+                    ...(scenario === 'parked' ? { execution: { version: 1, body: {}, workspaceId: 'drain-workspace', referer: 'https://example.test', apiKeyCiphertext: 'synthetic', clientToolCall: { callId: 'parked' } } } : {}),
+                    ...(scenario === 'workflow' ? { kind: 'workflow', generationId: undefined } : {}),
+                    ...(scenario === 'admission' ? { historyPhase: 'admission_pending' } : {}),
+                });
+                assert((await jobs.getShutdownBlockerCount()) > 0, scenario + ' admission');
+                if (scenario === 'admission') await jobs.abortJob(id, params.userId);
+                if (['complete', 'error', 'aborted'].includes(scenario)) {
+                    await jobs.saveTerminalSnapshot(id, { status: scenario, content: 'saved', reasoning: '', completedAt: Date.now() });
+                }
+                backend.kill(); await backend.exited; backend = start(); await ready();
+                assert((await jobs.getShutdownBlockerCount()) > 0, scenario + ' survives backend restart');
+                assert.deepEqual(await controller.prepare(scenario, 250), { drained: false, reason: 'work_active' });
+                assert.equal(controller.canStartWork(), true);
+                if (['complete', 'error', 'aborted'].includes(scenario)) assert.equal((await jobs.getJob(id, params.userId)).content, 'saved');
+                await jobs.abortJob(id, params.userId);
+                await jobs.setHistoryPhase(id, 'committed');
+                assert.equal(await jobs.getShutdownBlockerCount(), 0, scenario + ' settles');
+            }
+            assert.deepEqual(await controller.prepare('idle', 1000), { drained: true });
+        });
+        await check('bounded drain reads never report idle behind a full history page', async () => {
+            const ids = [];
+            for (let i = 0; i < 110; i++) ids.push(await jobs.createJob({ userId: 'bulk', threadId: 'bulk', messageId: 'bulk-' + i, model: 'fixture', kind: 'workflow', historyPhase: 'finalization_pending' }));
+            assert((await jobs.getShutdownBlockerCount()) > 0);
+            for (const id of ids) { await jobs.abortJob(id, 'bulk'); await jobs.setHistoryPhase(id, 'committed'); }
+            assert.equal(await jobs.getShutdownBlockerCount(), 0);
+        });
+        await check('large pending snapshots cannot exhaust the drain query read budget', async () => {
+            // Real terminal snapshots can each approach Convex's document limit.
+            // Admission stays small, but reading this whole history bucket would
+            // exceed the transaction byte limit and prevent any restart wait.
+            const ids = [];
+            for (let i = 0; i < 24; i++) {
+                const id = await jobs.createJob({ userId: 'large-history', threadId: 'large-history', messageId: String(i), model: 'fixture' });
+                await jobs.saveTerminalSnapshot(id, { status: 'complete', content: 'x'.repeat(800000), reasoning: '', completedAt: Date.now() });
+                ids.push(id);
+                await Bun.sleep(400); // Stay below the disposable backend's write-rate quota.
+            }
+            assert((await jobs.getShutdownBlockerCount()) > 0);
+            const pending = await jobs.getPendingHistoryJobs(100);
+            assert(pending.length > 0 && pending.length <= ids.length);
+            assert(pending.every(job => ids.includes(job.id)));
+            // Maintenance must not prevent delivery of large retained snapshots.
+            await jobs.cleanupExpired();
+            assert((await jobs.getShutdownBlockerCount()) > 0);
+            const delivered = new Set();
+            while (delivered.size < ids.length) {
+                const page = await jobs.getPendingHistoryJobs(100);
+                assert(page.length > 0, 'History batching stopped making progress');
+                for (const job of page) {
+                    assert(ids.includes(job.id) && !delivered.has(job.id));
+                    await jobs.setHistoryPhase(job.id, 'committed');
+                    delivered.add(job.id);
+                    await Bun.sleep(400);
+                }
+            }
+            assert.equal(await jobs.getShutdownBlockerCount(), 0);
+            await jobs.cleanupExpired();
+            assert.equal((await jobs.getJob(ids[0], 'large-history')).content.length, 800000);
+        });
+        if (process.argv[8] === 'dashboard') await check('dashboard waits, cancels and restarts with the real Convex provider', async () => {
+            const logPath = join(evidence, 'dashboard.log');
+            const log = await open(logPath, 'w', 0o600);
+            let code;
+            try {
+                const child = Bun.spawn([process.execPath, 'run', 'test:e2e:server-restarts', '--failure', '--dev', '--https', '--background=convex'], {
+                    cwd: host, env: { ...process.env, OR3_RESTART_E2E_CONVEX_URL: url, OR3_RESTART_E2E_CONVEX_ADMIN_KEY: adminKey },
+                    stdout: log.fd, stderr: log.fd,
+                });
+                code = await child.exited;
+            } finally { await log.close(); }
+            const output = await readFile(logPath, 'utf8');
+            assert(!output.includes(adminKey), 'Dashboard output leaked the disposable backend credential');
+            assert.equal(code, 0, output.slice(-12000));
+        });
+        await check('unavailable backend cancels preparation and retains admission', async () => {
+            backend.kill(); await backend.exited; backend = undefined;
+            const controller = createShutdownController({ shutdownTimeoutMs: 100, getBackgroundJobCount: () => jobs.getShutdownBlockerCount() });
+            assert.deepEqual(await controller.prepare('offline', 100), { drained: false, reason: 'work_active' });
+            assert.equal(controller.canStartWork(), true);
+        });
+        await writeFile(join(evidence, 'drain.json'), JSON.stringify({ passed: true, provider, checks }, null, 2));
+        console.log('Evidence: ' + join(evidence, 'drain.json'));
+    } else if (signupOnly) {
     // Supply only Nuxt configuration; the adapter and Convex transport stay real.
     mock.module(join(provider, 'src/shims/imports.ts'), () => ({
         useRuntimeConfig: () => ({ auth: { provider: 'basic-auth' }, sync: { convexUrl: url, convexAdminKey: adminKey } }),

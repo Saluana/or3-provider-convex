@@ -443,3 +443,20 @@ concurrent durable rate limiting,
 invalid/missing configuration and outages, retained metadata pagination,
 native upload retries, durable connection CAS/evidence, internal-only access,
 and workspace cleanup. It never accepts a production deployment URL.
+
+## Dashboard restart drain accounting
+
+The background provider implements `getShutdownBlockerCount`: streaming jobs
+(including browser-tool handoffs and workflows), pending admission and terminal
+history delivery prevent replacement. Database failures propagate so the host
+cancels preparation and restores admission rather than treating failure as idle.
+Deploy the matching generated backend along with the rebuilt provider. The
+internal query checks indexed bucket existence in one transaction, reading at
+most one record per bucket to avoid large-snapshot read limits; its count may
+be a lower bound, but zero means no blockers. A missing backend function fails
+closed. Dashboard restarts never deploy backend changes.
+
+History delivery and cleanup also stop at a per-bucket byte budget, while keeping
+the existing row caps for small jobs. This prevents large retained snapshots
+from exhausting a maintenance transaction before history can recover. The
+provider requires Convex SDK 1.31.7 or newer for its native size accounting.
