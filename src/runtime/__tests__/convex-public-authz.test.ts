@@ -905,6 +905,13 @@ describe('Convex authorization boundary', () => {
 
 
 describe('signup invitation trusted bridge', () => {
+    it('refuses provider-only code lookup before reading invitation email addresses', async () => {
+        const ctx = makeCtx({ identity: { subject: 'recipient', issuer: 'https://or3.ai/auth/basic-auth', email: 'recipient@example.test' } });
+        await expect(registered(workspaceFunctions.findSignupInviteByTokenHash)._handler(ctx, { token_hash: 'hash' }))
+            .rejects.toThrow('Forbidden');
+        expect(ctx.db.query).not.toHaveBeenCalled();
+    });
+
     it('refuses provider-only callers before any canonical writes', async () => {
         const ctx = makeCtx({ identity: { subject: 'recipient', issuer: 'https://or3.ai/auth/basic-auth', email: 'recipient@example.test' } });
         await expect(registered(workspaceFunctions.acceptSignupInviteAndProvisionUser)._handler(ctx, {

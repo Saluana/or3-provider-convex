@@ -1104,6 +1104,14 @@ export const createSignupInvite = internalMutation({
         return { id: args.id };
     },
 });
+export const findSignupInviteByTokenHash = internalQuery({
+    args: { token_hash: v.string() },
+    handler: async (ctx, args) => {
+        await requireSignupServer(ctx);
+        const row = await ctx.db.query('signup_invites').withIndex('by_token_hash', q => q.eq('token_hash', args.token_hash)).unique();
+        return row?.status === 'pending' ? { id: row.id, email: row.email, expires_at: row.expires_at } : null;
+    },
+});
 export const listSignupInvites = internalMutation({
     args: { limit: v.number(), cursor: v.optional(v.string()) },
     handler: async (ctx, args) => {

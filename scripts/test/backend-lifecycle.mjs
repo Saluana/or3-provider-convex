@@ -90,11 +90,10 @@ try {
     assert.equal(before.length, 1);
     if (signupOnly) {
     // Supply only Nuxt configuration; the adapter and Convex transport stay real.
-    mock.module(join(provider, 'src/shims/imports.ts'), () => ({
-        useRuntimeConfig: () => ({ auth: { provider: 'basic-auth' }, sync: { convexUrl: url, convexAdminKey: adminKey } }),
-    }));
+    const runtimeConfig = { auth: { provider: 'basic-auth' }, sync: { convexUrl: url, convexAdminKey: adminKey } };
+    mock.module(join(provider, 'src/shims/imports.ts'), () => ({ useRuntimeConfig: () => runtimeConfig }));
     const { ConvexAuthWorkspaceStore } = await import(join(provider, 'src/runtime/server/auth/convex-auth-workspace-store.ts'));
-    await check('signup rollback, conflict, recipient-only ownership, active-preserving replay, accept/revoke, bounded retention and pagination', async () => {
+    await check('short-code hash lookup, signup rollback, conflict, recipient-only ownership, active-preserving replay, accept/revoke, bounded retention and pagination', async () => {
         const { ConvexHttpClient } = await import(join(host, 'node_modules/convex/dist/esm/browser/index.js'));
         const client = new ConvexHttpClient(url);
         const subject = 'signup-conflict-recipient', email = 'signup-conflict@example.test';
@@ -107,10 +106,17 @@ try {
         assert.deepEqual(await client.query('upgradeProbe:snapshotSignup', {}),snapshotBefore);
         assert.deepEqual(await client.query('workspaces:validateSignupInvite',{id:rollbackId,email,token_hash:rollbackId}),{ok:true});
         const id = crypto.randomUUID(), hash = crypto.randomUUID();
-        await client.mutation('workspaces:createSignupInvite', { id, email, token_hash: hash, expires_at: Date.now()+3600_000, created_by_admin: 'test-admin' });
+        const expiresAt = Date.now()+3600_000;
+        await client.mutation('workspaces:createSignupInvite', { id, email, token_hash: hash, expires_at: expiresAt, created_by_admin: 'test-admin' });
+        // Wrong hashes, leaked receipts, or unavailable functions must fail at
+        // the deployed backend through the real SSR transport.
+        const lookupStore = new ConvexAuthWorkspaceStore();
+        assert.deepEqual(await lookupStore.findSignupInviteByTokenHash({ token_hash: hash }), { id, email, expires_at: expiresAt });
+        assert.equal(await lookupStore.findSignupInviteByTokenHash({ token_hash: 'incorrect-hash' }), null);
         const args = { invite_id: id, token_hash: hash, email, provider: 'basic-auth', provider_user_id: subject };
         const results = await Promise.all(Array.from({length: 8}, () => client.mutation('workspaces:acceptSignupInviteAndProvisionUser', args)));
         assert.equal(results.filter(r => r.ok && r.created).length, 1);
+        assert.equal(await lookupStore.findSignupInviteByTokenHash({ token_hash: hash }), null);
         assert.equal(new Set(results.map(r => r.workspace_id)).size, 1);
         const rows = JSON.parse((await convexRun('run', 'upgradeProbe:read', '{}')).output.trim());
         const privateRow = rows.find(w => w._id === results[0].workspace_id);
@@ -150,7 +156,7 @@ try {
             // Supply an authorized store without booting Nuxt's admin session;
             // the host route, provider adapter, and backend run unchanged.
             mock.module(join(host, 'server/admin/signup-invites.ts'), () => ({
-                requireSignupInviteStore: async () => ({ store }),
+                requireSignupInviteStore: async () => ({ store, config: runtimeConfig }),
             }));
             const { default: handler } = await import(join(host, 'server/api/admin/signup-invites/list.get.ts'));
             const { createApp, toWebHandler } = await import(join(host, 'node_modules/h3/dist/index.mjs'));

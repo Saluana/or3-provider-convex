@@ -541,6 +541,10 @@ export class ConvexAuthWorkspaceStore implements AuthWorkspaceStore {
         await this.ensureSignupInviteEmails(client);
         return this.runConvexOperation('workspaces.createSignupInvite', () => client.mutation(internalApi.workspaces.createSignupInvite, input));
     }
+    async findSignupInviteByTokenHash(input: { token_hash: string }): Promise<Pick<SignupInviteSummary, 'id' | 'email' | 'expires_at'> | null> {
+        const client = getAdminConvexClient(getConfiguredAuthProvider(), 'signup-invite-preflight');
+        return this.runConvexOperation('workspaces.findSignupInviteByTokenHash', () => client.query(internalApi.workspaces.findSignupInviteByTokenHash, input));
+    }
     async listSignupInvites(input: { limit: number; cursor?: string }): Promise<{ invites: SignupInviteSummary[]; next_cursor: string | null }> {
         const client = getAdminConvexClient(getConfiguredAuthProvider(), 'signup-invite-admin');
         try {
