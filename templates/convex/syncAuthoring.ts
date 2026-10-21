@@ -5,6 +5,7 @@
 import type { MutationCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
 import { recordMaterializedPreimage } from './snapshot';
+import { recordRetainedStorage } from './storageUsage';
 
 const UUID_RE =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -78,6 +79,7 @@ export async function applyServerAuthoredOp(
     const hlc = `${now}:server:${opId.slice(0, 8)}`;
     const serverVersion = await allocateServerVersion(ctx, workspaceId);
     const payload = stripReserved(op.payload ?? {});
+    if (op.table === 'file_meta' && op.operation === 'put') await recordRetainedStorage(ctx, workspaceId, { ...payload, hash: op.pk });
 
     type IndexQueryBuilder = {
         eq: (field: string, value: unknown) => IndexQueryBuilder;

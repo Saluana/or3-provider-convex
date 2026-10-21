@@ -8,7 +8,7 @@
  * after the Convex provider package registers the adapter.
  */
 import type { H3Event } from 'h3';
-import { createError } from 'h3';
+import { createError, setResponseHeader } from 'h3';
 import { z } from 'zod';
 import { useRuntimeConfig } from '#imports';
 import type {
@@ -19,7 +19,7 @@ import type {
     PresignDownloadResponse,
     DeleteObjectRequest,
 } from '~~/server/storage/gateway/types';
-import type { GenericId as Id } from 'convex/values';
+import { ConvexError, type GenericId as Id } from 'convex/values';
 import { convexApi as api, convexInternalApi as internalApi } from '../../utils/convex-api';
 import {
     buildGatewayAdminIdentity,
@@ -98,23 +98,45 @@ async function getStorageGatewayClient(event: H3Event) {
  */
 export class ConvexStorageGatewayAdapter implements StorageGatewayAdapter {
     id = 'convex';
+    readonly atomicUploadQuota = 'retained-v1' as const;
     deletionCoordination = { version: 1 as const, syncProviderId: 'convex' };
 
     async presignUpload(event: H3Event, input: PresignUploadRequest): Promise<PresignUploadResponse> {
         const client = await getStorageGatewayClient(event);
-        const result = await client.mutation(internalApi.storage.generateUploadUrl, {
-            workspace_id: toWorkspaceId(input.workspaceId),
-            hash: input.hash,
-            mime_type: input.mimeType,
-            size_bytes: input.sizeBytes,
-            workspace_quota_bytes: input.workspaceQuotaBytes,
-        });
+        const reserve = async () => {
+            try {
+                return await client.mutation(internalApi.storage.generateUploadUrl, {
+                    workspace_id: toWorkspaceId(input.workspaceId), hash: input.hash,
+                    mime_type: input.mimeType, size_bytes: input.sizeBytes,
+                    workspace_quota_bytes: input.workspaceQuotaBytes,
+                });
+            } catch (error) {
+                if (error instanceof ConvexError && error.data === 'Workspace storage quota exceeded') {
+                    throw createError({ statusCode: 413, statusMessage: 'Workspace storage quota exceeded' });
+                }
+                throw error;
+            }
+        };
+        let result = await reserve();
+
+        // Persist bounded migration pages before retrying. Never issue an
+        // upload authority while existing retained bytes remain unaccounted.
+        for (let page = 1; result.quotaInitializing && page < 8; page++) {
+            result = await reserve();
+        }
+        if (result.quotaInitializing) {
+            setResponseHeader(event, 'Retry-After', 1);
+            throw createError({ statusCode: 503, statusMessage: 'Storage quota upgrade in progress. Retry shortly.' });
+        }
+        if (input.workspaceQuotaBytes !== undefined && result.quotaVersion !== 'retained-v1') {
+            throw createError({ statusCode: 503, statusMessage: 'Update the Convex scaffold to enforce retained storage quotas.' });
+        }
 
         if (typeof result.intentId !== 'string' || !result.intentId) {
             throw createError({ statusCode: 502, statusMessage: 'Convex did not persist an upload intent' });
         }
 
-        const expiresAt = resolvePresignExpiresAt(result, undefined);
+        const expiresAt = resolvePresignExpiresAt(result);
 
         return {
             url: result.uploadUrl,

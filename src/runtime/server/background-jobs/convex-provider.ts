@@ -152,6 +152,12 @@ export const convexJobProvider: BackgroundJobProvider = {
         return job ? toBackgroundJob(job) : null;
     },
 
+    progressWritesCheckAbort: true,
+
+    async getJobControl(jobId: string, userId: string) {
+        return getClient().query(internalApi.backgroundJobs.getControl, { job_id: jobId as Id<'background_jobs'>, user_id: userId });
+    },
+
     async updateJob(jobId: string, update: JobUpdate): Promise<void> {
         const client = getClient();
         const usage = readRequestUsage(update.usage);
@@ -181,6 +187,9 @@ export const convexJobProvider: BackgroundJobProvider = {
             extendedUpdatePayload
         );
         assertLeaseWrite(result, update.leaseOwner);
+        if (result === false) {
+            const error = new Error('Background job stopped'); error.name = 'AbortError'; throw error;
+        }
     },
 
     async completeJob(

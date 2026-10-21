@@ -392,6 +392,14 @@ export default defineSchema({
         workspace_id: v.id('workspaces'), hash: v.string(), deleted_at: v.number(),
     }).index('by_workspace_hash', ['workspace_id', 'hash']),
 
+    retained_storage: defineTable({
+        workspace_id: v.id('workspaces'), hash: v.string(), size_bytes: v.number(),
+        metadata_aliases: v.array(v.string()),
+    }).index('by_workspace_hash', ['workspace_id', 'hash']),
+    storage_usage: defineTable({
+        workspace_id: v.id('workspaces'), used_bytes: v.number(), ready: v.boolean(), cursor: v.optional(v.string()),
+    }).index('by_workspace', ['workspace_id']),
+
     upload_intents: defineTable({
         workspace_id: v.id('workspaces'),
         user_id: v.id('users'),
@@ -412,6 +420,7 @@ export default defineSchema({
         cancelled_at: v.optional(v.number()),
     })
         .index('by_workspace_status', ['workspace_id', 'status'])
+        .index('by_workspace_status_expiry', ['workspace_id', 'status', 'expires_at'])
         .index('by_workspace_hash_status', ['workspace_id', 'hash', 'status'])
         .index('by_workspace_hash_status_expiry', ['workspace_id', 'hash', 'status', 'expires_at'])
         .index('by_expiry', ['expires_at']),
@@ -580,6 +589,12 @@ export default defineSchema({
      * Background jobs - persistent storage for background streaming jobs.
      * Allows jobs to survive server restarts and work across instances.
      */
+    /** Small lifecycle row; large response bodies stay out of control polls. */
+    background_job_controls: defineTable({
+        job_id: v.id('background_jobs'), user_id: v.string(), status: v.union(v.literal('streaming'), v.literal('complete'), v.literal('error'), v.literal('aborted')),
+        revision: v.number(), attempts: v.number(), lease_owner: v.optional(v.string()), workspace_id: v.optional(v.string()),
+    }).index('by_job', ['job_id']),
+
     background_jobs: defineTable({
         user_id: v.string(), // User who created the job
         thread_id: v.string(), // Thread the message belongs to

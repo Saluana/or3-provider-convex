@@ -5,3 +5,8 @@ export class ConvexHttpClient {
   query(..._args: any[]): Promise<any> { return Promise.resolve({}); }
   mutation(..._args: any[]): Promise<any> { return Promise.resolve({}); }
 }
+
+export class ConvexClient extends ConvexHttpClient {
+  onUpdate(..._args: any[]): () => void { return () => {}; }
+  close(): Promise<void> { return Promise.resolve(); }
+}
