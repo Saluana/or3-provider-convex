@@ -6,6 +6,7 @@ type RegisteredFunction = {
 
 type Ctx = {
   db: {
+    query: (table: string) => { withIndex: (...args: unknown[]) => { first: () => Promise<null> } };
     get: (id: string) => Promise<any>;
     patch: (id: string, patch: Record<string, any>) => Promise<void>;
   };
@@ -39,6 +40,8 @@ function makeCtx(job: any): { ctx: Ctx; rows: Map<string, any> } {
   const rows = new Map<string, any>([["job-1", job]]);
   const ctx: Ctx = {
     db: {
+      // Legacy in-flight jobs have no lightweight control record.
+      query: () => ({ withIndex: () => ({ first: async () => null }) }),
       get: async (id: string) => rows.get(id) ?? null,
       patch: async (id: string, patch: Record<string, any>) => {
         const row = rows.get(id);

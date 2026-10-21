@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { defineConfig } from 'vitest/config';
+import templateConfig from './vitest.config';
 
 const hostContractShim = path.resolve(
     __dirname,
@@ -7,6 +8,7 @@ const hostContractShim = path.resolve(
 );
 
 export default defineConfig({
+    plugins: templateConfig.plugins,
     resolve: {
         alias: [
             {
@@ -32,6 +34,7 @@ export default defineConfig({
         globals: true,
         include: [
             'src/runtime/server/background-jobs/__tests__/convex-provider.test.ts',
+            'src/runtime/server/background-jobs/__tests__/convex-claim-fingerprint.test.ts',
         ],
     },
 });
