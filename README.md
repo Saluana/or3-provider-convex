@@ -184,8 +184,7 @@ Applied pre-images keep later pages stable when writes occur after page one;
 incremental replay then starts strictly after the returned watermark.
 
 Gateway storage lifecycle also uses bounded canonical pages over materialized
-`file_meta` and live message/post file-reference edges. Quota and filesystem GC
-never reconstruct state from retained sync logs. Cursor filters are immutable
+`file_meta` and live message/post file-reference edges. Lifecycle queries never reconstruct state from retained sync logs. Cursor filters are immutable
 across pages and each request is capped at 500 records. Active reservations read
 persisted native upload intents and expose one current charge per content hash.
 The expiry index excludes historical expired intents from bounded group reads;
@@ -212,7 +211,7 @@ The `init` command installs the Convex backend into `convex/`:
 ## How it works
 
 - **Sync** — Direct mode: the client sync plugin binds the token-broker JWT to the Convex client and pushes/pulls via Convex functions with reactive subscriptions (`watchChanges`). Gateway mode (SSR auth enabled): the sync gateway adapter resolves the SSR session, mints an identity-bound client, and calls the same functions through the Nuxt server; the browser never talks to Convex directly. Both paths enforce the shared 256 KB serialized payload ceiling per operation.
-- **Storage** — The client uses the host's shared storage gateway (`mode: 'gateway'`) for `/api/storage/*`, including scoped `deleteObject`. It sends the current generic-file capability and mutation-intent headers for upload, download, and commit. Upload quota counts the maximum size of each unexpired active content hash once, promotes remaining intents after cancellation/expiry, and exempts hashes already present in live metadata. Reservation pages expose that same current per-hash charge and fail closed when a group exceeds 500 rows; download URLs use a provider-owned, authenticated streaming route with live canonical `file_meta` and storage identity revalidation (soft-deleted/pending/replaced rows return no bytes); quota and GC read only canonical `file_meta` + message/post `file_hashes` pages.
+- **Storage** — The client uses the host's shared storage gateway (`mode: 'gateway'`) for `/api/storage/*`, including scoped `deleteObject`. It sends the current generic-file capability and mutation-intent headers for upload, download, and commit. Upload quota counts the maximum size of each unexpired active content hash once, promotes remaining intents after cancellation/expiry, and reserves only the increase above a hash’s retained size. Reservation pages expose that same current per-hash charge and fail closed when a group exceeds 500 rows; download URLs use a provider-owned, authenticated streaming route with live canonical `file_meta` and storage identity revalidation (soft-deleted/pending/replaced rows return no bytes); GC reads canonical `file_meta` + message/post `file_hashes` pages; quota uses transactional retained usage and active reservations.
 - **Native storage controls** — `storage:generateUploadUrl`, `storage:commitUpload`, `storage:cancelUploadIntent`, `storage:deleteObject`, and `storage:gcDeletedFiles` are internal mutations. The SSR gateway uses `CONVEX_SELF_HOSTED_ADMIN_KEY` with the verified session's provider identity; browser JWTs cannot invoke these mutations or choose a quota, generic-file policy, or GC retention outside the host's checks. The read-only `storage:deletionCapability` query remains public and requires workspace membership. Deploy the updated `storage.ts` and rebuild the provider together; a host-only update leaves the old public mutation entry points available.
 - **Generic files** — The host admits them only with its explicit `allowAnyFileType` setting and applies the canonical attachment/octet-stream download policy. Gateway clients advertise the typed file-kind `v1` capability; older readers and writers receive an explicit HTTP 426 update boundary before generic metadata or bytes cross the gateway. The Convex download route enforces canonical MIME, sanitized filenames, disposition, `nosniff`, and private/no-store caching. Native Convex URLs stay inside the server-only `storage:getFileUrl` query; redeploy the updated backend to remove its former public entry point. Downloads require the server-only `CONVEX_SELF_HOSTED_ADMIN_KEY` (`runtimeConfig.sync.convexAdminKey`), use user-bound signed URLs (5-minute default, requested TTL capped at 15 minutes), and recheck the current session and workspace membership on retrieval. Bytes stream through the host server; native URL headers and redirects are never forwarded.
 
@@ -502,3 +501,41 @@ History delivery and cleanup also stop at a per-bucket byte budget, while keepin
 the existing row caps for small jobs. This prevents large retained snapshots
 from exhausting a maintenance transaction before history can recover. The
 provider requires Convex SDK 1.31.7 or newer for its native size accounting.
+
+## Cost-conscious storage and sync
+
+Deploy the matching schema and all updated templates together. New tables
+`retained_storage`, `storage_usage` and `background_job_controls`, the upload-intent
+expiry index, `storageUsage.ts`, `sync:watchVersion`, and
+`backgroundJobs:getControl` are required by these runtime optimizations.
+
+Upload admission uses a transactional retained-hash ledger and aggregate usage
+instead of scanning the entire file catalog. Initialization processes 200 rows
+per mutation, with bounded progress per request and retryable 503 while more
+pages remain. A configured quota requires the `retained-v1` backend handshake;
+old templates cannot silently bypass it. Trash and logical metadata deletion
+remain charged. Verified coordinated deletion and GC release the charge only after the last
+metadata alias is removed; restores of the same hash do not double-charge.
+The private ledger records actual metadata keys, including legacy hash casing
+and metadata synced directly into Trash, so alias removal cannot release space early.
+Uploads larger than their retained size reserve the difference. Verified native
+commits replace understated historical sizes with the actual object size.
+Configure the host's `OR3_STORAGE_WORKSPACE_QUOTA_BYTES` explicitly (unlimited by
+default). This bounds admission accounting, not all physical objects or egress.
+
+Optional presign-download `verify_content` uses `_storage`'s actual SHA-256 and
+size to prove redundancy without downloading the original into the browser.
+The ordinary download still verifies received bytes and retains live auth checks.
+
+Gateway sync watches only the workspace version counter through a shared
+server-only Convex reactive client. Content-free hints wake ordinary authorized
+pulls; the host retains its polling fallback and one-minute safety pulls. The
+client closes when its last listener leaves. Hosts billing long HTTP request
+duration should compare SSE duration costs with saved polling invocations.
+
+Background writes maintain small owner-scoped job controls with a monotonic
+progress revision. Local stream viewers and abort checks avoid reading accumulated
+text; remote viewers fetch full snapshots only when the revision changes. The
+existing viewer polling cadence and terminal snapshot recovery remain intact;
+progress mutations already enforce abort and lease ownership atomically. Legacy
+jobs retain the safe full-record fallback.

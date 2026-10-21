@@ -7,6 +7,7 @@
  * DO NOT import this file directly in core. Use getActiveSyncGatewayAdapter()
  * after the Convex provider package registers the adapter.
  */
+import { watchConvexVersion } from '../utils/convex-client';
 import type { H3Event } from 'h3';
 import { createHash } from 'node:crypto';
 import { createError } from 'h3';
@@ -361,6 +362,11 @@ async function getSyncGcAdminClient(event: H3Event) {
  */
 export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
     id = 'convex';
+    async watchVersion(_event: H3Event, scope: { workspaceId: string }, onVersion: (version: number) => void,
+        onError: (error: unknown) => void): Promise<() => void> {
+        return watchConvexVersion(scope.workspaceId, onVersion, onError);
+    }
+
     readonly capabilities = {
         snapshotBootstrap: 'snapshot-v1',
         historyRetention: 'snapshot-v1',

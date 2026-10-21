@@ -2773,3 +2773,15 @@ export const runScheduledGc = internalMutation({
         };
     },
 });
+
+/** Content-free internal notification query. The host authenticates and freshly
+ * authorizes every SSE delivery; data is read through the ordinary sync routes.
+ */
+export const watchVersion = internalQuery({
+    args: { workspace_id: v.id('workspaces') },
+    handler: async (ctx, args) => {
+        const counter = await ctx.db.query('server_version_counter')
+            .withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id)).first();
+        return counter?.value ?? 0;
+    },
+});

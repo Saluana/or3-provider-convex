@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { H3Event } from 'h3';
+import { ConvexError } from 'convex/values';
 import { ConvexStorageGatewayAdapter } from '../../storage/convex-storage-gateway-adapter';
 
 const runtimeConfig = vi.hoisted(() => ({
@@ -181,6 +182,19 @@ describe('ConvexStorageGatewayAdapter', () => {
             workspace_quota_bytes: undefined,
         });
 
+    });
+
+    // A permanent budget rejection must not look like a retryable backend outage.
+    // Other transport failures must retain their original error semantics.
+    it.each([true, false])('preserves permanent quota versus transient failure semantics (%s)', async quota => {
+        const failure = quota ? new ConvexError('Workspace storage quota exceeded') : new Error('Backend unavailable');
+        mutationMock.mockRejectedValueOnce(failure);
+        const result = new ConvexStorageGatewayAdapter().presignUpload(makeEvent(), {
+            workspaceId: 'ws-1', hash: 'sha256:' + 'a'.repeat(64), mimeType: 'image/png', sizeBytes: 100,
+            workspaceQuotaBytes: 100,
+        });
+        if (quota) await expect(result).rejects.toMatchObject({ statusCode: 413 });
+        else await expect(result).rejects.toBe(failure);
     });
 
     it('never exposes the permanent native URL when issuing a bounded download', async () => {

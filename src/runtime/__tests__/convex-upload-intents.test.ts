@@ -7,8 +7,8 @@ vi.mock('../../../templates/convex/_generated/server', () => ({
 }));
 
 import * as syncFunctions from '../../../templates/convex/sync';
+import * as backgroundFunctions from '../../../templates/convex/backgroundJobs';
 import * as storageFunctions from '../../../templates/convex/storage';
-import { verifyStorageReferenceContract } from '~~/shared/testing/contracts/storage';
 
 type Handler = (ctx: any, args: any) => Promise<any>;
 const handler = (fn: unknown): Handler => (fn as { _handler: Handler })._handler;
@@ -43,22 +43,27 @@ function fixture() {
         let rows = [...(tables[table] ?? [])];
         const builder: any = {
           withIndex: (_name: string, constrain: (query: any) => unknown) => {
-            const constraints: Array<[string, unknown]> = [];
+            const constraints: Array<(row: any) => boolean> = [];
             const query = {
+              gt(field: string, value: number) { constraints.push(row => row[field] > value); return query; },
               eq(field: string, value: unknown) {
-                constraints.push([field, value]);
+                constraints.push(row => row[field] === value);
                 return query;
               },
             };
             constrain(query);
             rows = rows.filter((row) =>
-              constraints.every(([field, value]) => row[field] === value)
+              constraints.every(matches => matches(row))
             );
             return builder;
           },
           filter: () => builder,
           first: async () => rows[0] ?? null,
           collect: async () => [...rows],
+          paginate: async ({ cursor, numItems }: any) => {
+            const offset = cursor ? Number(cursor) : 0;
+            return { page: rows.slice(offset, offset + numItems), isDone: offset + numItems >= rows.length, continueCursor: String(offset + numItems) };
+          },
           take: async (limit: number) => rows.slice(0, limit),
         };
         return builder;
@@ -92,6 +97,18 @@ const hashBase64 = Buffer.from(HASH, 'hex').toString('base64');
 describe('Convex persisted upload intents', () => {
   beforeEach(() => vi.useFakeTimers().setSystemTime(new Date('2026-01-01T00:00:00Z')));
   afterEach(() => vi.useRealTimers());
+
+  // Immutable system storage metadata, rather than client file_meta, owns proof.
+  it.each([true, false])('attests only the actual native storage checksum (%s)', async valid => {
+    const f = fixture();
+    f.tables.file_meta.push({ _id: 'proof-file', workspace_id: 'ws-1', hash: `sha256:${HASH}`,
+      deleted: false, storage_id: 'proof-blob', size_bytes: 3 });
+    f.objects.set('proof-blob', { size: 3, sha256: valid ? hashBase64 : 'corrupt-checksum' });
+    const result = await handler(storageFunctions.getFileUrl)(f.ctx, {
+      workspace_id: 'ws-1', hash: `sha256:${HASH}`, verify_content: true,
+    });
+    expect(result.verifiedContent).toEqual(valid ? { hash: `sha256:${HASH}`, sizeBytes: 3 } : undefined);
+  });
 
   it('only returns URLs for live committed metadata', async () => {
     const f = fixture();
@@ -174,30 +191,16 @@ describe('Convex persisted upload intents', () => {
     })).rejects.toThrow('Forbidden');
   });
 
-  it('executes the shared canonical reference contract', async () => {
+  it('keeps referenced content while collecting an older orphan', async () => {
     const f = fixture();
-    const gc = handler(storageFunctions.gcDeletedFiles);
-    const logicalToHash = { live: HASH, orphan: 'b'.repeat(64) } as const;
-    await verifyStorageReferenceContract({
-      name: 'convex',
-      async put(logical) {
-        f.tables.file_meta.push({
-          _id: `file-${logical}`, workspace_id: 'ws-1', hash: logicalToHash[logical as keyof typeof logicalToHash],
-          deleted: true, deleted_at: Math.floor(Date.now() / 1000) - 10_000,
-          storage_id: `blob-${logical}`,
-        });
-      },
-      async reference(logical) {
-        f.tables.messages.push({
-          _id: `message-${logical}`, workspace_id: 'ws-1', deleted: false,
-          file_hashes: JSON.stringify([`sha256:${logicalToHash[logical as keyof typeof logicalToHash]}`]),
-        });
-      },
-      async collect() {
-        await gc(f.ctx, { workspace_id: 'ws-1', retention_seconds: 3600, limit: 10 });
-        return f.deletedObjects.map((id) => id.replace('blob-', ''));
-      },
-    });
+    for (const [logical, hash] of [['live', HASH], ['orphan', 'b'.repeat(64)]]) {
+      f.tables.file_meta.push({ _id: `file-${logical}`, workspace_id: 'ws-1', hash,
+        deleted: true, deleted_at: Math.floor(Date.now() / 1000) - 10_000, storage_id: `blob-${logical}` });
+    }
+    f.tables.messages.push({ _id: 'message-live', workspace_id: 'ws-1', deleted: false,
+      file_hashes: JSON.stringify([`sha256:${HASH}`]) });
+    await handler(storageFunctions.gcDeletedFiles)(f.ctx, { workspace_id: 'ws-1', retention_seconds: 3600, limit: 10 });
+    expect(f.deletedObjects).toEqual(['blob-orphan']);
   });
 
   it.each(['convex', ''])('keeps deletion claims and rejects stale native IDs after re-upload with provider %j', async (storageProviderId) => {
@@ -292,6 +295,54 @@ describe('Convex persisted upload intents', () => {
     expect(f.tables.file_meta).toHaveLength(1);
   });
 
+  // Cancellation/status reads must not deserialize a growing response. The
+  // mirror is written by actual lifecycle mutations and remains owner-scoped.
+  it('reads job controls without loading the response and preserves cancellation', async () => {
+    const f = fixture();
+    const created = await handler(backgroundFunctions.create)(f.ctx, { user_id: 'user-1', thread_id: 't1', message_id: 'm1',
+      model: 'test', max_concurrent_jobs: 5, max_concurrent_jobs_per_user: 2, initial_content: 'x'.repeat(200_000) });
+    const jobId = created.jobId;
+    const get = f.ctx.db.get;
+    f.ctx.db.get = async id => { if (id === jobId) throw new Error('Read growing response'); return get(id); };
+    await expect(handler(backgroundFunctions.getControl)(f.ctx, { job_id: jobId, user_id: 'user-1' }))
+      .resolves.toMatchObject({ status: 'streaming', attempts: 0, revision: 0 });
+    await expect(handler(backgroundFunctions.getControl)(f.ctx, { job_id: jobId, user_id: 'foreign' })).resolves.toBeNull();
+    await expect(handler(backgroundFunctions.checkAborted)(f.ctx, { job_id: jobId })).resolves.toBe(false);
+    f.ctx.db.get = get;
+    await handler(backgroundFunctions.update)(f.ctx, { job_id: jobId, content_chunk: 'new progress', chunks_received: 1 });
+    f.ctx.db.get = async id => { if (id === jobId) throw new Error('Read growing response'); return get(id); };
+    await expect(handler(backgroundFunctions.getControl)(f.ctx, { job_id: jobId, user_id: 'user-1' }))
+      .resolves.toMatchObject({ status: 'streaming', revision: 1 });
+    f.ctx.db.get = get;
+    await handler(backgroundFunctions.abort)(f.ctx, { job_id: jobId, user_id: 'user-1' });
+    f.ctx.db.get = async id => { if (id === jobId) throw new Error('Read growing response'); return get(id); };
+    await expect(handler(backgroundFunctions.getControl)(f.ctx, { job_id: jobId, user_id: 'user-1' })).resolves.toMatchObject({ status: 'aborted' });
+    await expect(handler(backgroundFunctions.checkAborted)(f.ctx, { job_id: jobId })).resolves.toBe(true);
+  });
+
+  // Historical Trash must count, initialization must make bounded progress,
+  // and subsequent uploads must not enumerate the file catalog again.
+  it('backfills retained quota once and admits subsequent uploads without catalog scans', async () => {
+    const f = fixture();
+    for (let index = 0; index < 601; index++) f.tables.file_meta.push({ _id: `old-${index}`,
+      workspace_id: 'ws-1', hash: `sha256:${index.toString(16).padStart(64, '0')}`, deleted: true, size_bytes: 1 });
+    const generate = handler(storageFunctions.generateUploadUrl);
+    const input = { workspace_id: 'ws-1', hash: HASH, mime_type: 'image/png', size_bytes: 1, workspace_quota_bytes: 602 };
+    let result: any;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      result = await generate(f.ctx, input);
+      if (result.uploadUrl) break;
+    }
+    expect(result.uploadUrl).toBe('https://upload.test');
+    const query = f.ctx.db.query.bind(f.ctx.db);
+    f.ctx.db.query = (table: string) => {
+      if (table === 'file_meta') throw new Error('Repeated catalog scan');
+      return query(table);
+    };
+    await expect(generate(f.ctx, { ...input, hash: 'b'.repeat(64) })).rejects.toThrow('quota exceeded');
+    await expect(generate(f.ctx, { ...input, hash: `sha256:${'0'.repeat(64)}` })).resolves.toMatchObject({ uploadUrl: 'https://upload.test' });
+  });
+
   it('atomically reserves quota and ignores expired reservations', async () => {
     const f = fixture();
     const generate = handler(storageFunctions.generateUploadUrl);
@@ -310,6 +361,63 @@ describe('Convex persisted upload intents', () => {
       workspace_id: 'ws-1', hash: 'b'.repeat(64), mime_type: 'image/png', size_bytes: 50,
       workspace_quota_bytes: 100,
     })).resolves.toMatchObject({ uploadUrl: 'https://upload.test' });
+  });
+
+  it('reserves size increases above retained metadata and keeps duplicate holds charged', async () => {
+    const f = fixture();
+    f.tables.file_meta.push({ _id: 'legacy-file', workspace_id: 'ws-1', hash: HASH, size_bytes: 10, deleted: true });
+    const generate = handler(storageFunctions.generateUploadUrl);
+    const input = { workspace_id: 'ws-1', hash: HASH, mime_type: 'image/png', size_bytes: 60, workspace_quota_bytes: 50 };
+    await expect(generate(f.ctx, input)).rejects.toThrow('quota exceeded');
+    await generate(f.ctx, { ...input, workspace_quota_bytes: 100 });
+    await generate(f.ctx, { ...input, workspace_quota_bytes: 100 });
+    await expect(generate(f.ctx, { ...input, hash: 'b'.repeat(64), size_bytes: 41, workspace_quota_bytes: 100 })).rejects.toThrow('quota exceeded');
+  });
+
+  it.each([`sha256:${HASH}`, `SHA256:${HASH.toUpperCase()}`])('releases physically deleted quota only after the last metadata alias is removed: %s', async alias => {
+    const f = fixture();
+    f.tables.file_meta.push(...[HASH, alias].map((hash, index) => ({
+      _id: `old-${index}`, workspace_id: 'ws-1', hash, size_bytes: 60,
+      deleted: true, storage_id: `old-blob-${index}`, deleted_at: 1,
+    })));
+    const generate = handler(storageFunctions.generateUploadUrl);
+    const input = { workspace_id: 'ws-1', hash: 'b'.repeat(64), mime_type: 'image/png', size_bytes: 60, workspace_quota_bytes: 100 };
+    await expect(generate(f.ctx, input)).rejects.toThrow('quota exceeded');
+    const remove = handler(storageFunctions.deleteObject);
+    await remove(f.ctx, { workspace_id: 'ws-1', hash: HASH });
+    await expect(generate(f.ctx, input)).rejects.toThrow('quota exceeded');
+    await remove(f.ctx, { workspace_id: 'ws-1', hash: alias });
+    await expect(generate(f.ctx, input)).resolves.toMatchObject({ uploadUrl: 'https://upload.test' });
+  });
+
+  it('promotes verified upload size into retained quota when historical metadata understated it', async () => {
+    const f = fixture();
+    f.tables.file_meta.push({ _id: 'legacy-file', workspace_id: 'ws-1', hash: HASH, size_bytes: 10,
+      deleted: true, name: 'Original', mime_type: 'image/png', kind: 'image', ref_count: 0 });
+    const generate = handler(storageFunctions.generateUploadUrl);
+    const input = { workspace_id: 'ws-1', hash: HASH, mime_type: 'image/png', size_bytes: 60, workspace_quota_bytes: 100 };
+    const intent = await generate(f.ctx, input);
+    f.objects.set('verified-original', { size: 60, contentType: 'image/png', sha256: hashBase64 });
+    await handler(storageFunctions.commitUpload)(f.ctx, { ...input, intent_id: intent.intentId,
+      storage_id: 'verified-original', storage_provider_id: 'convex', name: 'Original', kind: 'image' });
+    await expect(generate(f.ctx, { ...input, hash: 'b'.repeat(64), size_bytes: 41 })).rejects.toThrow('quota exceeded');
+    expect(f.tables.file_meta[0].size_bytes).toBe(60);
+    await expect(generate(f.ctx, { ...input, hash: 'b'.repeat(64), size_bytes: 40 })).resolves.toMatchObject({ uploadUrl: 'https://upload.test' });
+  });
+
+  it('keeps aliases synced directly into Trash charged after quota initialization', async () => {
+    const f = fixture();
+    const generate = handler(storageFunctions.generateUploadUrl);
+    await generate(f.ctx, { workspace_id: 'ws-1', hash: 'b'.repeat(64), mime_type: 'image/png', size_bytes: 1, workspace_quota_bytes: 100 });
+    const alias = `SHA256:${HASH.toUpperCase()}`;
+    const result = await handler(syncFunctions.push)(f.ctx, { workspace_id: 'ws-1', ops: [{
+      table_name: 'file_meta', operation: 'put', pk: alias, clock: 1, hlc: '1:0:test',
+      device_id: 'test', op_id: crypto.randomUUID(), payload: { hash: alias, name: 'Retained',
+        mime_type: 'image/png', kind: 'image', size_bytes: 60, ref_count: 0, deleted: true, created_at: 1, updated_at: 1 },
+    }] });
+    expect(result.results[0]).toMatchObject({ success: true });
+    await expect(generate(f.ctx, { workspace_id: 'ws-1', hash: 'c'.repeat(64), mime_type: 'image/png',
+      size_bytes: 40, workspace_quota_bytes: 100 })).rejects.toThrow('quota exceeded');
   });
 
   it('accepts zero-byte generic file intents', async () => {

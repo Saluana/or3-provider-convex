@@ -26,6 +26,7 @@ const TokenSchema = z.object({
 });
 type DownloadToken = z.infer<typeof TokenSchema>;
 const NativeFileSchema = z.object({
+    verifiedContent: z.object({ hash: z.string().regex(/^sha256:[a-f0-9]{64}$/), sizeBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).optional(),
     url: z.string().url(),
     storageId: z.string().min(1),
     mimeType: z.string().optional(),
@@ -73,7 +74,7 @@ async function requireSession(event: H3Event) {
     return session as typeof session & { user: { id: string }; provider: string; providerUserId: string };
 }
 
-async function readNativeFile(event: H3Event, session: Awaited<ReturnType<typeof requireSession>>, workspaceId: string, hash: string, backupStorageId?: string) {
+async function readNativeFile(event: H3Event, session: Awaited<ReturnType<typeof requireSession>>, workspaceId: string, hash: string, backupStorageId?: string, verifyContent = false) {
     const client = getConvexAdminGatewayClient(event, getAdminKey(event), buildGatewayAdminIdentity(
         resolveConvexAuthProvider(session.provider), session.providerUserId,
     ));
@@ -81,7 +82,7 @@ async function readNativeFile(event: H3Event, session: Awaited<ReturnType<typeof
     let result: unknown;
     try {
         result = backupStorageId === undefined
-            ? await client.query(convexInternalApi.storage.getFileUrl, { workspace_id: workspaceId, hash })
+            ? await client.query(convexInternalApi.storage.getFileUrl, { workspace_id: workspaceId, hash, ...(verifyContent ? { verify_content: true } : {}) })
             : await client.query(convexInternalApi.storage.getBackupFileUrl, { workspace_id: workspaceId, hash, storage_id: backupStorageId });
     } catch {
         throw createError({ statusCode: 503, statusMessage: 'Convex download authorization unavailable' });
@@ -127,7 +128,7 @@ export async function createConvexDownloadUrl(event: H3Event, input: PresignDown
     const ttl = input.expiresInMs ?? DEFAULT_TTL_MS;
     if (!Number.isSafeInteger(ttl) || ttl < 1) throw createError({ statusCode: 400, statusMessage: 'Invalid download expiry' });
     await requireStorageWorkspaceAccess(event, session, input.workspaceId);
-    const file = await readNativeFile(event, session, input.workspaceId, input.hash);
+    const file = await readNativeFile(event, session, input.workspaceId, input.hash, undefined, input.verifyContent);
     if (input.storageId && input.storageId !== file.storageId) throw createError({ statusCode: 404, statusMessage: 'File not found' });
     await requireStorageWorkspaceAccess(event, session, input.workspaceId);
     const claims = TokenSchema.parse({
@@ -139,7 +140,8 @@ export async function createConvexDownloadUrl(event: H3Event, input: PresignDown
     });
     const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
     const token = `${payload}.${signature(payload, key).toString('base64url')}`;
-    return { url: `/api/storage/convex/download?token=${token}`, expiresAt: claims.expiresAt, method: 'GET' };
+    return { url: `/api/storage/convex/download?token=${token}`, expiresAt: claims.expiresAt, method: 'GET', storageId: file.storageId,
+        ...(file.verifiedContent ? { verifiedContent: file.verifiedContent } : {}) };
 }
 
 export default eventHandler(async event => {

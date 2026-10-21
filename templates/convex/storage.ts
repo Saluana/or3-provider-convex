@@ -21,12 +21,13 @@
  * - Per-file authorization beyond workspace membership
  */
 
-import { v } from 'convex/values';
+import { ConvexError, v } from 'convex/values';
 import { internalMutation, internalQuery, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id } from './_generated/dataModel';
 import { claimStorageDeletion, releaseStorageDeletion } from './storageDeletion';
 import { applyServerAuthoredOp } from './syncAuthoring';
 import { requireActiveWorkspace } from './authz';
+import { prepareStorageUsage, releaseCollectedStorage } from './storageUsage';
 
 // ============================================================
 // CONSTANTS
@@ -194,15 +195,14 @@ export const generateUploadUrl = internalMutation({
             throw new Error('Invalid workspace quota');
         }
         const now = nowSec();
-        const liveFiles = await ctx.db.query('file_meta')
-            .withIndex('by_workspace_deleted', (q: any) =>
-                q.eq('workspace_id', args.workspace_id).eq('deleted', false))
-            .collect();
+        const usage = await prepareStorageUsage(ctx, args.workspace_id);
+        if (!usage.ready) return { quotaInitializing: true as const };
+        const stored = await ctx.db.query('retained_storage').withIndex('by_workspace_hash', q =>
+            q.eq('workspace_id', args.workspace_id).eq('hash', hash)).first();
         const activeIntents = await ctx.db.query('upload_intents')
-            .withIndex('by_workspace_status', (q: any) =>
-                q.eq('workspace_id', args.workspace_id).eq('status', 'active'))
+            .withIndex('by_workspace_status_expiry', (q: any) =>
+                q.eq('workspace_id', args.workspace_id).eq('status', 'active').gt('expires_at', now))
             .collect();
-        const liveHashes = new Set(liveFiles.map((file) => normalizeHash(file.hash)));
         // Charge content once while any unexpired intent can still commit it.
         // A historical per-intent delta cannot survive cancellation/expiry of
         // the first intent, or a later same-hash intent reserving more bytes.
@@ -214,17 +214,21 @@ export const generateUploadUrl = internalMutation({
                 !/^[0-9a-f]{64}$/.test(intent.hash)) {
                 throw new Error('Invalid upload reservation');
             }
-            if (liveHashes.has(intent.hash)) continue;
             reservations.set(intent.hash, Math.max(reservations.get(intent.hash) ?? 0, intent.size_bytes));
         }
-        const reservedBytes = liveHashes.has(hash)
-            ? 0
-            : Math.max(0, args.size_bytes - (reservations.get(hash) ?? 0));
+        // Old metadata can understate a file's size. Reserve the increase
+        // while counting duplicate holds and retained bytes only once.
+        const reservedBytes = Math.max(0, args.size_bytes - Math.max(stored?.size_bytes ?? 0, reservations.get(hash) ?? 0));
         if (args.workspace_quota_bytes !== undefined) {
-            const usedBytes = liveFiles.reduce((total: number, file: any) => total + file.size_bytes, 0);
-            const activeReservedBytes = [...reservations.values()].reduce((total, size) => total + size, 0);
+            const usedBytes = usage.used_bytes;
+            let activeReservedBytes = 0;
+            for (const [digest, size] of reservations) {
+                const retained = digest === hash ? stored : await ctx.db.query('retained_storage')
+                    .withIndex('by_workspace_hash', q => q.eq('workspace_id', args.workspace_id).eq('hash', digest)).first();
+                activeReservedBytes += Math.max(0, size - (retained?.size_bytes ?? 0));
+            }
             if (usedBytes + activeReservedBytes + reservedBytes > args.workspace_quota_bytes) {
-                throw new Error('Workspace storage quota exceeded');
+                throw new ConvexError('Workspace storage quota exceeded');
             }
         }
 
@@ -240,7 +244,7 @@ export const generateUploadUrl = internalMutation({
             status: 'active',
             created_at: now,
         });
-        return { uploadUrl, intentId, expiresAt: (now + UPLOAD_INTENT_TTL_SECONDS) * 1000 };
+        return { quotaVersion: 'retained-v1' as const, uploadUrl, intentId, expiresAt: (now + UPLOAD_INTENT_TTL_SECONDS) * 1000 };
     },
 });
 
@@ -331,7 +335,7 @@ export const commitUpload = internalMutation({
                     name: existing.name,
                     mime_type: existing.mime_type,
                     kind: existing.kind,
-                    size_bytes: existing.size_bytes,
+                    size_bytes: object.size,
                     width: existing.width,
                     height: existing.height,
                     page_count: existing.page_count,
@@ -416,8 +420,9 @@ export const getFileUrl = internalQuery({
     args: {
         workspace_id: v.id('workspaces'),
         hash: v.string(),
+        verify_content: v.optional(v.boolean()),
     },
-    handler: (ctx, args) => readWorkspaceFileUrl(ctx, args.workspace_id, args.hash),
+    handler: (ctx, args) => readWorkspaceFileUrl(ctx, args.workspace_id, args.hash, undefined, args.verify_content),
 });
 
 /** Only the authenticated host archive reader may read retained Trash.
@@ -432,7 +437,7 @@ export const getBackupFileUrl = internalQuery({
     handler: (ctx, args) => readWorkspaceFileUrl(ctx, args.workspace_id, args.hash, args.storage_id),
 });
 
-async function readWorkspaceFileUrl(ctx: QueryCtx, workspaceId: Id<'workspaces'>, hash: string, backupStorageId?: Id<'_storage'>) {
+async function readWorkspaceFileUrl(ctx: QueryCtx, workspaceId: Id<'workspaces'>, hash: string, backupStorageId?: Id<'_storage'>, verifyContent = false) {
     await verifyWorkspaceMembership(ctx, workspaceId);
 
     const normalizedHash = normalizeHash(hash);
@@ -458,10 +463,19 @@ async function readWorkspaceFileUrl(ctx: QueryCtx, workspaceId: Id<'workspaces'>
     if (!file || !file.storage_id || (file.storage_provider_id && file.storage_provider_id !== 'convex')) return null;
     if (backupStorageId === undefined ? file.deleted : file.storage_id !== backupStorageId) return null;
 
+    let verifiedContent: { hash: string; sizeBytes: number } | undefined;
+    if (verifyContent) {
+        const object = await ctx.db.system.get(file.storage_id as Id<'_storage'>);
+        if (object && object.sha256 === hexToBase64(normalizedHash) &&
+            Number.isSafeInteger(object.size) && object.size >= 0) {
+            verifiedContent = { hash: canonicalHash, sizeBytes: object.size };
+        }
+    }
     const url = await ctx.storage.getUrl(file.storage_id as Id<'_storage'>);
     if (!url) return null;
     return {
         url, storageId: file.storage_id,
+        ...(verifiedContent ? { verifiedContent } : {}),
         mimeType: file.mime_type, name: file.name, fileKind: file.kind,
     };
 }
@@ -520,6 +534,7 @@ export const deleteObject = internalMutation({
             },
         });
         await ctx.db.delete(file._id);
+        await releaseCollectedStorage(ctx, args.workspace_id, file.hash);
         return { deleted: true };
     },
 });
@@ -585,6 +600,7 @@ export const gcDeletedFiles = internalMutation({
                 await ctx.storage.delete(file.storage_id as Id<'_storage'>);
             }
             await ctx.db.delete(file._id);
+            await releaseCollectedStorage(ctx, args.workspace_id, file.hash);
             deletedCount += 1;
         }
 
