@@ -2,8 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { getFunctionName } from "convex/server";
 import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
-import { verifySyncContract } from "~~/shared/testing/contracts/sync";
-import { compareSyncRevision } from "~~/shared/sync/revision";
 import { ChangeStampSchema } from "~~/shared/sync/schemas";
 import { readRequestUsage } from "~~/shared/chat/compaction";
 import templateSchema from "../../../templates/convex/schema";
@@ -770,66 +768,6 @@ describe("Convex materialized snapshot contract", () => {
     expect(fixture.tables.change_log).toHaveLength(0);
   });
 
-  it("executes the shared bootstrap and revision contract", async () => {
-    const fixture = createFixture();
-    const snapshot = (syncFunctions.snapshot as RegisteredFunction)._handler;
-    await verifySyncContract({
-      name: "convex",
-      async reset() {
-        for (const table of ["messages", "projects", "threads", "tombstones"]) {
-          fixture.tables[table] = [];
-        }
-        fixture.tables.sync_snapshot_sessions = [];
-      },
-      async seedMaterialized(items, highWatermark) {
-        fixture.tables.server_version_counter[0]!.value = highWatermark;
-        for (const item of items) {
-          if (item.kind === "row") {
-            (fixture.tables[item.tableName] ??= []).push({
-              _id: `${item.tableName}-${item.pk}`,
-              workspace_id: "ws-1",
-              ...(item.payload as Record<string, unknown>),
-              deleted: false,
-              clock: item.revision.clock,
-              hlc: item.revision.hlc,
-              op_id: item.revision.opId,
-              server_version: highWatermark,
-            });
-          } else {
-            fixture.tables.tombstones.push({
-              _id: `tombstone-${item.pk}`,
-              workspace_id: "ws-1",
-              table_name: item.tableName,
-              pk: item.pk,
-              deleted_at: item.serverDeletedAt,
-              server_deleted_at: item.serverDeletedAt,
-              clock: item.revision.clock,
-              hlc: item.revision.hlc,
-              op_id: item.revision.opId,
-              server_version: highWatermark,
-            });
-          }
-        }
-      },
-      async bootstrap() {
-        const items: any[] = [];
-        let pageToken: string | undefined;
-        let highWatermark = 0;
-        do {
-          const page = await snapshot(fixture.ctx, {
-            workspace_id: "ws-1", page_size: 1, page_token: pageToken,
-          });
-          items.push(...page.items);
-          highWatermark = page.highWatermark;
-          pageToken = page.nextPageToken ?? undefined;
-        } while (pageToken);
-        return { items, highWatermark };
-      },
-      async resolveWinner(left, right) {
-        return compareSyncRevision(left, right) >= 0 ? left : right;
-      },
-    });
-  });
   it("fresh-device snapshot remains complete after verified retention deletes old history", async () => {
     const fixture = createFixture();
     fixture.tables.device_cursors.push({

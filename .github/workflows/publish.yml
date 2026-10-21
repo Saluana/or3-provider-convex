@@ -52,13 +52,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Saluana/or3-chat
-          ref: 68bed3fb55703375fd1e28fc436ea7fbb92b013d
+          ref: ab48e24b35abe3e7b62ff1bf1b007c541b44f9bc
           path: qualification-host
       - name: Install canonical host qualification dependencies
         working-directory: qualification-host
         run: bun install --frozen-lockfile
-      - name: Verify startup compatibility guard
-        run: OR3_CANONICAL_HOST_ROOT="$PWD/qualification-host" bun x vitest run src/runtime/server/plugins/__tests__/register.test.ts
+      - name: Verify provider behavior against the canonical host
+        run: OR3_CANONICAL_HOST_ROOT="$PWD/qualification-host" bun run test
       - name: Qualify packaged backend update lifecycle
         run: |
           set -euo pipefail

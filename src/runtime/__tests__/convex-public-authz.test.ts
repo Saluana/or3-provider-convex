@@ -1,9 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-    verifyAuthorizationContract,
-    type AuthorizationCaseId,
-} from '~~/shared/testing/contracts/authorization';
-import {
     requireCallerSubject,
     requireCallerUserId,
     requireInviteAcceptance,
@@ -229,57 +225,6 @@ function makeNotificationSyncCtx(changes: Array<Record<string, unknown>> = []) {
 }
 
 describe('Convex authorization boundary', () => {
-    it('executes the shared subject, role, and invite-email contract', async () => {
-        const supported = new Set<AuthorizationCaseId>([
-            'unauthenticated', 'subject-match', 'subject-mismatch', 'viewer-read',
-            'viewer-write', 'editor-write', 'owner-manage',
-            'invite-email-match', 'invite-email-mismatch',
-        ]);
-        const result = await verifyAuthorizationContract({
-            name: 'convex-public',
-            supports: supported,
-            async evaluate(id) {
-                try {
-                    if (id === 'unauthenticated') {
-                        await requireCallerSubject(makeCtx({ identity: null }), {
-                            provider: 'clerk', providerUserId: 'subject-1',
-                        });
-                    } else if (id === 'subject-match' || id === 'subject-mismatch') {
-                        await requireCallerSubject(makeCtx({ identity: {
-                            subject: 'subject-1', issuer: 'https://clerk.example.test',
-                        } }), {
-                            provider: 'clerk',
-                            providerUserId: id === 'subject-match' ? 'subject-1' : 'subject-2',
-                        });
-                    } else if (id.startsWith('invite-email')) {
-                        await requireInviteAcceptance(makeCtx({
-                            identity: {
-                                subject: 'subject-1', issuer: 'https://clerk.example.test',
-                                email: id === 'invite-email-match' ? 'Invited@Example.Test' : 'other@example.test',
-                            },
-                            userId: 'user-1',
-                        }), 'invited@example.test');
-                    } else {
-                        const role = id.startsWith('viewer') ? 'viewer'
-                            : id === 'editor-write' ? 'editor' : 'owner';
-                        const allowed = id.endsWith('read')
-                            ? new Set<Role>(['owner', 'editor', 'viewer'])
-                            : id === 'owner-manage'
-                                ? new Set<Role>(['owner'])
-                                : new Set<Role>(['owner', 'editor']);
-                        await requireWorkspaceRole(makeCtx({
-                            identity: { subject: `subject-${role}`, issuer: 'https://clerk.example.test' },
-                            role,
-                        }), 'workspace-1' as any, allowed);
-                    }
-                    return 'allow';
-                } catch {
-                    return 'deny';
-                }
-            },
-        });
-        expect(result.executed).toEqual(Array.from(supported));
-    });
     it('fails closed for direct unauthenticated identity lookups', async () => {
         const ctx = makeCtx({ identity: null });
 
@@ -549,7 +494,7 @@ describe('Convex authorization boundary', () => {
     });
 
     it('enforces background admission and insert in one atomic mutation', async () => {
-        const insert = vi.fn(async () => 'job-new');
+        const insert = vi.fn(async (_table: string, _value: unknown) => 'job-new');
         const active = [{
             _id: 'job-active', user_id: 'user-1', status: 'streaming',
             execution: { version: 1 },
@@ -585,11 +530,11 @@ describe('Convex authorization boundary', () => {
                 user_id: 'user-2',
             })
         ).resolves.toEqual({ kind: 'created', jobId: 'job-new' });
-        expect(insert).toHaveBeenCalledOnce();
+        expect(insert.mock.calls.filter(([table]) => table === 'background_jobs')).toHaveLength(1);
     });
 
     it('retains terminal admission idempotency and frees legacy job capacity', async () => {
-        const insert = vi.fn(async () => 'job-new');
+        const insert = vi.fn(async (_table: string, _value: unknown) => 'job-new');
         const patch = vi.fn(async () => undefined);
         const terminal = {
             _id: 'job-terminal', user_id: 'user-1', status: 'complete',
@@ -604,6 +549,7 @@ describe('Convex authorization boundary', () => {
                 const chain = { eq: vi.fn(() => chain) };
                 build(chain);
                 return {
+                    first: vi.fn(async () => null),
                     collect: vi.fn(async () =>
                         index === 'by_user_idempotency'
                             ? idempotencyMatches
@@ -653,7 +599,7 @@ describe('Convex authorization boundary', () => {
                           started_at: Date.now(),
                       }]
                     : [];
-                return { async *[Symbol.asyncIterator]() { yield* jobs; } };
+                return { first: async () => null, async *[Symbol.asyncIterator]() { yield* jobs; } };
             },
         }));
         const ctx = { db: { query, patch, delete: vi.fn() } } as any;

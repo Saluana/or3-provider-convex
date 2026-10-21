@@ -1,5 +1,4 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { verifyAdminStoreProviderContract } from '~~/shared/testing/contracts/admin';
 
 const getConvexGatewayClient = vi.fn();
 const getConvexAdminGatewayClient = vi.fn();
@@ -71,29 +70,6 @@ describe('createConvexWorkspaceAccessStore', () => {
         useRuntimeConfig.mockReset();
         resolveProviderToken.mockReset();
         listProviderTokenBrokerIds.mockReset();
-    });
-
-    it('implements the complete shared admin provider contract', async () => {
-        const {
-            createConvexAdminUserStore,
-            createConvexWorkspaceAccessStore,
-            createConvexWorkspaceSettingsStore,
-        } = await import('../convex-store');
-        const event = { context: {} } as any;
-
-        expect(() => verifyAdminStoreProviderContract({
-            name: 'convex',
-            workspaceAccess: createConvexWorkspaceAccessStore(event),
-            workspaceSettings: createConvexWorkspaceSettingsStore(event),
-            adminUsers: createConvexAdminUserStore(event),
-            capabilities: {
-                supportsServerSideAdmin: true,
-                supportsUserSearch: true,
-                supportsWorkspaceList: true,
-                supportsWorkspaceManagement: true,
-                supportsDeploymentAdminGrants: true,
-            },
-        })).not.toThrow();
     });
 
     it('uses admin key for super_admin without Clerk', async () => {

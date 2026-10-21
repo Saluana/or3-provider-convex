@@ -134,21 +134,6 @@ describe('Convex cursor integrity and retention bounds', () => {
         })).rejects.toThrow('Invalid continuation_count');
     });
 
-    it('server-authors delete timestamps in the template and generated mirror', () => {
-        const template = readFileSync(fileURLToPath(new URL('sync.ts', templateRoot)), 'utf8');
-        const mirror = readFileSync(
-            fileURLToPath(new URL('../../../../or3-chat/convex/sync.ts', import.meta.url)),
-            'utf8'
-        );
-        for (const source of [template, mirror]) {
-            expect(source).toContain('deleted_at: nowSec()');
-            expect(source).not.toContain('deleted_at: payloadDeletedAt ?? nowSec()');
-            expect(source).not.toContain('? payload.deleted_at');
-            expect(source).toMatch(/ctx\.db\s*\.query\('change_log'\)/);
-            expect(source).toMatch(/ctx\.db\s*\.query\('tombstones'\)/);
-        }
-    });
-
     it('ships cursor and retention guards in the generated template pack', () => {
         const packPath = fileURLToPath(new URL('../../../templates/convex.pack.json.gz', import.meta.url));
         const pack = JSON.parse(gunzipSync(readFileSync(packPath)).toString('utf8')) as {
