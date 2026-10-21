@@ -159,4 +159,39 @@ describe('convex register plugin', () => {
         await (await import('../register')).default;
         expect(fetch).not.toHaveBeenCalled();
     });
+
+    it.each(['backgroundJobs', 'limits'])('verifies the backend when Convex is selected only for %s', async (service) => {
+        useRuntimeConfigMock.mockReturnValue({
+            auth: { enabled: true },
+            sync: { enabled: true, provider: 'sqlite', convexUrl: 'https://example.convex.cloud' },
+            storage: { enabled: true, provider: 'fs' },
+            [service]: { enabled: true, storageProvider: 'convex' },
+        });
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+            status: 'success', value: { digest: 'incompatible' },
+        }))));
+        await expect(import('../register')).rejects.toThrow(/backend.*match/i);
+        expect(registerBackgroundJobProviderMock).not.toHaveBeenCalled();
+    });
+
+    it.each(['file:///tmp/convex', 'ftp://example.com', 'https://user:secret@example.com'])('refuses an unusable Convex HTTP endpoint before contacting it: %s', async (convexUrl) => {
+        useRuntimeConfigMock.mockReturnValue({
+            auth: { enabled: true },
+            sync: { enabled: true, provider: 'convex', convexUrl },
+        });
+        await expect(import('../register')).rejects.toThrow(/Convex URL/);
+        expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it('does not require a Convex backend for disabled auxiliary providers', async () => {
+        useRuntimeConfigMock.mockReturnValue({
+            auth: { enabled: true },
+            sync: { provider: 'sqlite' },
+            storage: { enabled: true, provider: 'fs' },
+            limits: { enabled: false, storageProvider: 'convex' },
+            backgroundJobs: { enabled: false, storageProvider: 'convex' },
+        });
+        await expect(import('../register')).resolves.toBeDefined();
+        expect(fetch).not.toHaveBeenCalled();
+    });
 });

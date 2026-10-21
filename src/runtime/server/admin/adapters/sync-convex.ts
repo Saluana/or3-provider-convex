@@ -85,14 +85,14 @@ export const convexSyncAdminAdapter: ProviderAdminAdapter = {
                 ? [
                     {
                         id: 'sync.gc-change-log',
-                        label: 'GC change log',
-                        description: `Prune change-log entries older than ${SYNC_MAINTENANCE_RETENTION_SECONDS / 86400} days and behind every device cursor.`,
+                        label: 'Clear old sync history',
+                        description: `Remove update history older than ${SYNC_MAINTENANCE_RETENTION_SECONDS / 86400} days after all devices are up to date. Current chats and files are kept.`,
                         danger: true,
                     },
                     {
                         id: 'sync.gc-tombstones',
-                        label: 'GC tombstones',
-                        description: `Prune tombstones older than ${SYNC_MAINTENANCE_RETENTION_SECONDS / 86400} days and behind every device cursor.`,
+                        label: 'Clear old deletion history',
+                        description: `Remove records of items deleted more than ${SYNC_MAINTENANCE_RETENTION_SECONDS / 86400} days ago, after all devices are up to date. This does not empty Trash or remove stored files.`,
                         danger: true,
                     },
                 ]

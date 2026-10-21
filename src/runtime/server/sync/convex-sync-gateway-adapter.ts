@@ -7,6 +7,7 @@
  * DO NOT import this file directly in core. Use getActiveSyncGatewayAdapter()
  * after the Convex provider package registers the adapter.
  */
+import { watchConvexVersion } from '../utils/convex-client';
 import type { H3Event } from 'h3';
 import { createHash } from 'node:crypto';
 import { createError } from 'h3';
@@ -361,6 +362,11 @@ async function getSyncGcAdminClient(event: H3Event) {
  */
 export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
     id = 'convex';
+    async watchVersion(_event: H3Event, scope: { workspaceId: string }, onVersion: (version: number) => void,
+        onError: (error: unknown) => void): Promise<() => void> {
+        return watchConvexVersion(scope.workspaceId, onVersion, onError);
+    }
+
     readonly capabilities = {
         snapshotBootstrap: 'snapshot-v1',
         historyRetention: 'snapshot-v1',
@@ -368,6 +374,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         canonicalChatHistory: 'v1',
         projectOwnership: 'v1',
         workspaceItems: 'v1',
+        retainedStorageMetadata: 'v1',
     } as const;
 
     async readChatHistory(actor: CanonicalHistoryActor, query: CanonicalChatQuery, signal?: AbortSignal): Promise<CanonicalChatReadResult> {
@@ -496,6 +503,25 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
             );
         } catch (error) {
             throwAsConvexServiceUnavailable(error, 'Sync backend unavailable');
+        }
+    }
+
+    async backupSnapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
+        // Backups always use a server-authenticated internal mutation. Browser
+        // JWTs cannot select the retained-file snapshot mode.
+        const client = await getSyncGcAdminClient(event);
+        try {
+            return await withConvexTransportRetry('sync.backupSnapshot', () =>
+                client.mutation(internalApi.sync.backupSnapshot, {
+                    workspace_id: toWorkspaceId(input.scope.workspaceId),
+                    workspace_item_capability: input.workspaceItemCapability,
+                    page_size: input.pageSize,
+                    page_token: input.pageToken,
+                    tables: input.tables,
+                })
+            );
+        } catch (error) {
+            throwAsConvexServiceUnavailable(error, 'Convex backup backend unavailable. Update the provider scaffold.');
         }
     }
 

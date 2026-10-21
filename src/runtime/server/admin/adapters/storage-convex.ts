@@ -92,8 +92,8 @@ export const convexStorageAdminAdapter: ProviderAdminAdapter = {
             actions: [
                 {
                     id: 'storage.gc',
-                    label: 'Run Storage GC',
-                    description: 'Delete orphaned blobs from the primary storage backend after the retention window.',
+                    label: 'Remove unused files',
+                    description: 'Permanently remove unused files after the waiting period.',
                     danger: true,
                 },
             ],

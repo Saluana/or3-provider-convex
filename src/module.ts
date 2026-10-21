@@ -1,4 +1,4 @@
-import { defineNuxtModule, installModule, addPlugin, addServerPlugin, createResolver } from '@nuxt/kit';
+import { defineNuxtModule, installModule, addPlugin, addServerPlugin, addServerHandler, createResolver } from '@nuxt/kit';
 
 export default defineNuxtModule({
     meta: { name: 'or3-provider-convex' },
@@ -21,5 +21,9 @@ export default defineNuxtModule({
         addPlugin(resolve('runtime/plugins/convex-sync.client'), { append: true });
         addPlugin(resolve('runtime/plugins/convex-storage.client'), { append: true });
         addServerPlugin(resolve('runtime/server/plugins/register'));
+        addServerHandler({
+            route: '/api/storage/convex/download', method: 'get',
+            handler: resolve('runtime/server/storage/convex-download'),
+        });
     },
 });

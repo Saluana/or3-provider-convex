@@ -2,11 +2,11 @@
  * @module server/utils/rate-limit/providers/convex
  *
  * Purpose:
- * Convex-backed rate limit provider with memory fallback.
+ * Convex-backed deployment-wide rate limit provider.
  *
  * Responsibilities:
  * - Use Convex mutations and queries for persistent rate limits.
- * - Fall back to the in-memory provider on configuration or runtime failures.
+ * - Fail closed on configuration or runtime failures.
  *
  * Non-Goals:
  * - Implement rate limit policy selection.
@@ -21,7 +21,6 @@ import type {
     RateLimitResult,
     RateLimitStats,
 } from '~~/server/utils/rate-limit/types';
-import { memoryRateLimitProvider } from '~~/server/utils/rate-limit/providers/memory';
 import { CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
 import { useRuntimeConfig } from '#imports';
 
@@ -31,18 +30,16 @@ import { useRuntimeConfig } from '#imports';
  *
  * Behavior:
  * - Lazily initializes a Convex client from runtime config.
- * - Falls back to memory when Convex is unavailable or errors.
+ * - Preserves durable enforcement when Convex is unavailable by rejecting calls.
  */
 export class ConvexRateLimitProvider implements RateLimitProvider {
     readonly name = CONVEX_PROVIDER_ID;
     private client: ConvexHttpClient | null = null;
-    private initialized = false;
 
-    private getClient(): ConvexHttpClient | null {
-        if (this.initialized) {
+    private getClient(): ConvexHttpClient {
+        if (this.client) {
             return this.client;
         }
-        this.initialized = true;
 
         const config = useRuntimeConfig();
         const convexUrl =
@@ -52,9 +49,8 @@ export class ConvexRateLimitProvider implements RateLimitProvider {
             config.sync as { convexAdminKey?: string } | undefined
         )?.convexAdminKey?.trim();
 
-        if (!convexUrl || !adminKey) {
-            return null;
-        }
+        if (!convexUrl) throw new Error('Convex URL not configured');
+        if (!adminKey) throw new Error('Convex admin key not configured');
 
         this.client = new ConvexHttpClient(convexUrl);
         const issuer = 'https://or3.ai/internal';
@@ -68,47 +64,29 @@ export class ConvexRateLimitProvider implements RateLimitProvider {
     }
 
     async checkAndRecord(key: string, config: RateLimitConfig): Promise<RateLimitResult> {
+        requireConfig(config);
         const client = this.getClient();
-        if (!client) {
-            // Fall back to memory if Convex not available
-            return memoryRateLimitProvider.checkAndRecord(key, config);
-        }
+        const result = await client.mutation(internalApi.rateLimits.checkAndRecord, {
+            key,
+            windowMs: config.windowMs,
+            maxRequests: config.maxRequests,
+        });
 
-        try {
-            // Atomic check and record
-            const result = await client.mutation(internalApi.rateLimits.checkAndRecord, {
-                key,
-                windowMs: config.windowMs,
-                maxRequests: config.maxRequests,
-            });
-
-            return {
-                allowed: result.allowed,
-                remaining: result.remaining,
-                retryAfterMs: result.retryAfterMs,
-            };
-        } catch (error) {
-            console.warn('[rate-limit] Convex checkAndRecord failed, falling back to memory:', error);
-            return memoryRateLimitProvider.checkAndRecord(key, config);
-        }
+        return {
+            allowed: result.allowed,
+            remaining: result.remaining,
+            retryAfterMs: result.retryAfterMs,
+        };
     }
 
     async getStats(key: string, config: RateLimitConfig): Promise<RateLimitStats | null> {
+        requireConfig(config);
         const client = this.getClient();
-        if (!client) {
-            return memoryRateLimitProvider.getStats(key, config);
-        }
-
-        try {
-            return await client.query(internalApi.rateLimits.getStats, {
-                key,
-                windowMs: config.windowMs,
-                maxRequests: config.maxRequests,
-            });
-        } catch (error) {
-            console.warn('[rate-limit] Convex getStats failed, falling back to memory:', error);
-            return memoryRateLimitProvider.getStats(key, config);
-        }
+        return await client.query(internalApi.rateLimits.getStats, {
+            key,
+            windowMs: config.windowMs,
+            maxRequests: config.maxRequests,
+        });
     }
 }
 
@@ -117,3 +95,10 @@ export class ConvexRateLimitProvider implements RateLimitProvider {
  * Singleton Convex provider instance.
  */
 export const convexRateLimitProvider = new ConvexRateLimitProvider();
+
+function requireConfig(config: RateLimitConfig): void {
+    if (!Number.isSafeInteger(config.windowMs) || config.windowMs <= 0 ||
+        !Number.isSafeInteger(config.maxRequests) || config.maxRequests <= 0) {
+        throw new Error('Invalid Convex rate-limit configuration');
+    }
+}

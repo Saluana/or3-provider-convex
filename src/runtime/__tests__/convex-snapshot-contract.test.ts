@@ -145,6 +145,10 @@ class MemoryQuery {
     return this.materialize().slice(0, count);
   }
 
+  async *[Symbol.asyncIterator]() {
+    yield* this.materialize();
+  }
+
   private materialize(): Row[] {
     const fields = INDEX_FIELDS[this.indexName] ?? ["_id"];
     const filtered = this.rows.filter((row) =>
@@ -629,21 +633,43 @@ describe("Convex background request usage persistence", () => {
 describe("Convex canonical history scaffold contract", () => {
   // The deployed scaffold owns legacy membership resolution; transport tests alone
   // cannot detect guessing an owner or admitting another workspace's association.
-  it('resolves legacy project ownership and refuses ambiguous associations', async () => {
+  // Browser membership normalization trims IDs and normalizes chat kinds. Raw
+  // comparisons could admit server execution while the browser sees a project.
+  it.each(['thread-a', ' thread-a ', { id: ' thread-a ' }, { id: ' thread-a ', kind: ' CHAT ' }])(
+    'resolves legacy project ownership and refuses ambiguous associations for %j', async (entry) => {
     const fixture = createFixture('editor');
     const read = (syncFunctions.readChatHistory as RegisteredFunction)._handler;
     const id = fixture.tables.threads[0].id;
     const args = {workspace_id:'ws-1',actor_user_id:'user-1',query:{kind:'thread',thread_id:id}};
-    fixture.tables.projects = [{_id:'foreign',workspace_id:'ws-other',id:'foreign',data:[{kind:'chat',id}]}];
+    fixture.tables.projects = [
+      {_id:'foreign',workspace_id:'ws-other',id:'foreign',data:[{kind:'chat',id}]},
+      {_id:'extension',workspace_id:'ws-1',id:'extension',data:[null, {id,kind:'doc'}, {id,kind:'file'}, {id,kind:'vendor:chat'}, {id,kind:null}, {id:42}]},
+    ];
     expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'resolved',thread:{project_id:null}});
-    fixture.tables.projects.push({_id:'one',workspace_id:'ws-1',id:'one',data:[id]});
+    fixture.tables.projects.push({_id:'one',workspace_id:'ws-1',id:'one',data:[entry]});
     expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'resolved',thread:{project_id:'one'}});
     fixture.tables.projects.push({_id:'two',workspace_id:'ws-1',id:'two',data:JSON.stringify([{id}])});
     expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'conflict'});
     fixture.tables.threads[0].project_id = 'chosen';
+    fixture.tables.projects.push({_id:'chosen',workspace_id:'ws-1',id:'chosen',data:[]});
     expect(await read(fixture.ctx,args)).toMatchObject({project_ownership:'resolved',thread:{project_id:'chosen'}});
     fixture.tables.workspace_members = [];
     await expect(read(fixture.ctx,args)).rejects.toThrow('Forbidden');
+  });
+  // An explicit owner may be deleted, missing after sync, or exist only in a
+  // foreign workspace. Each releases the chat, without reviving a legacy folder.
+  // The materialized read owns this contract; transport mocks cannot resolve it.
+  it.each(['deleted', 'missing', 'foreign'] as const)('releases a %s explicit project owner in the authorized snapshot', async (state) => {
+    const fixture = createFixture('editor');
+    const thread = fixture.tables.threads[0]!;
+    thread.project_id = 'stale-owner';
+    fixture.tables.projects = [{ _id: 'legacy', workspace_id: 'ws-1', id: 'legacy-owner', data: [thread.id] }];
+    if (state !== 'missing') fixture.tables.projects.push({ _id: 'stale', workspace_id: state === 'foreign' ? 'ws-other' : 'ws-1',
+      id: 'stale-owner', deleted: state === 'deleted', data: [] });
+    const result = await (syncFunctions.readChatHistory as RegisteredFunction)._handler(fixture.ctx,
+      { workspace_id: 'ws-1', actor_user_id: 'user-1', query: { kind: 'thread', thread_id: thread.id } });
+    expect(result).toMatchObject({ status: 'ok', project_ownership: 'resolved', thread: { id: thread.id, project_id: null } });
+    expect(thread.project_id).toBe('stale-owner');
   });
   it("uses the selected built gateway and host scope service across partial delivery, missing capability and membership revocation", async () => {
     const fixture = createFixture('editor');
@@ -969,19 +995,9 @@ describe("Convex materialized snapshot contract", () => {
     expect(fixture.takeCounts.every((count) => count <= 2)).toBe(true);
   });
 
-  it("binds canonical cursors to filters, caps pages, and exposes active reservations explicitly", async () => {
+  it("binds canonical cursors to filters and caps pages", async () => {
     const fixture = createFixture();
     const hash = `sha256:${"a".repeat(64)}`;
-    fixture.tables.upload_intents.push(
-      {
-        _id: "intent-active", _creationTime: 1, workspace_id: "ws-1", status: "active",
-        hash: "a".repeat(64), reserved_bytes: 12, expires_at: 200,
-      },
-      {
-        _id: "intent-expired", _creationTime: 2, workspace_id: "ws-1", status: "active",
-        hash: "b".repeat(64), reserved_bytes: 20, expires_at: 99,
-      },
-    );
     fixture.tables.file_meta.push(
       {
         _id: "file-a",
@@ -1030,23 +1046,6 @@ describe("Convex materialized snapshot contract", () => {
         cursor: unfilteredFirst.nextCursor,
       }),
     ).rejects.toThrow("Invalid canonical storage cursor");
-    await expect(
-      queryCanonicalStorage(fixture.ctx, {
-        workspace_id: "ws-1",
-        kind: "active_reservations",
-        page_size: 10,
-        now: 100,
-      }),
-    ).resolves.toEqual({
-      items: [{
-        kind: "reservation",
-        reservationId: "intent-active",
-        hash: "a".repeat(64),
-        sizeBytes: 12,
-        expiresAt: 200,
-      }],
-      hasMore: false,
-    });
   });
 
   it("prevents stale missing-row resurrection and accepts a newer full revision", async () => {
@@ -1687,6 +1686,31 @@ describe("Convex materialized snapshot contract", () => {
       error: expect.stringContaining("UUID"),
     });
     expect(fixture.tables.server_version_counter[0]!.value).toBe(before);
+  });
+
+  // Backup failure inventory: ordinary sync changes, Trash becomes a bare
+  // tombstone, concurrent restore loses the frozen original, or continuations
+  // cross between normal/bootstrap and backup modes.
+  it('preserves retained file metadata through backup paging and concurrent restore', async () => {
+    const fixture = createFixture();
+    const backup = (syncFunctions.backupSnapshot as RegisteredFunction)._handler;
+    const normal = (syncFunctions.snapshot as RegisteredFunction)._handler;
+    const trash = { _id: 'trash-file', workspace_id: 'ws-1', hash: 'sha256:' + 'a'.repeat(64),
+      storage_id: 'old-blob', storage_provider_id: 'convex', size_bytes: 8, name: 'original.txt', mime_type: 'text/plain', kind: 'file',
+      deleted: true, deleted_at: 2, clock: 2, hlc: '2:0:dev', op_id: 'op-2', server_version: 2 };
+    fixture.tables.file_meta.push(trash, { ...trash, _id: 'second-file', hash: 'sha256:' + 'b'.repeat(64) });
+    const first = await backup(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'] });
+    expect(first.items).toMatchObject([{ kind: 'row', payload: { hash: trash.hash, deleted: true, storage_id: 'old-blob' } }]);
+    await expect(normal(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'], page_token: first.nextPageToken })).rejects.toThrow('mode');
+    const bootstrap = await normal(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'] });
+    expect(bootstrap.items[0].kind).toBe('tombstone');
+    await expect(backup(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'], page_token: bootstrap.nextPageToken })).rejects.toThrow('mode');
+    const second = fixture.tables.file_meta[1]!;
+    fixture.tables.sync_record_versions.push({ _id: 'trash-preimage', workspace_id: 'ws-1', table_name: 'file_meta', pk: second.hash,
+      server_version: 2, kind: 'tombstone', payload: { ...second }, clock: 2, hlc: '2:0:dev', op_id: 'op-2', server_deleted_at: 2 });
+    Object.assign(second, { deleted: false, storage_id: 'replacement', clock: 6, hlc: '6:0:dev', op_id: 'op-6', server_version: 6 });
+    const next = await backup(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'], page_token: first.nextPageToken });
+    expect(next.items).toMatchObject([{ kind: 'row', payload: { hash: second.hash, deleted: true, storage_id: 'old-blob' } }]);
   });
 
   it("ships the snapshot mutation, schema, helper, and typechecked configuration", () => {

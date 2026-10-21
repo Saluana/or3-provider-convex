@@ -4,6 +4,8 @@
  */
 import type { MutationCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
+import { recordMaterializedPreimage } from './snapshot';
+import { recordRetainedStorage } from './storageUsage';
 
 const UUID_RE =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -77,12 +79,14 @@ export async function applyServerAuthoredOp(
     const hlc = `${now}:server:${opId.slice(0, 8)}`;
     const serverVersion = await allocateServerVersion(ctx, workspaceId);
     const payload = stripReserved(op.payload ?? {});
+    if (op.table === 'file_meta' && op.operation === 'put') await recordRetainedStorage(ctx, workspaceId, { ...payload, hash: op.pk });
 
     type IndexQueryBuilder = {
         eq: (field: string, value: unknown) => IndexQueryBuilder;
     };
     type ConvexDoc = {
         _id: Id<TableNames>;
+        clock?: number;
     } & Record<string, unknown>;
     type QueryByIndex = {
         withIndex: (
@@ -96,9 +100,25 @@ export async function applyServerAuthoredOp(
             q.eq('workspace_id', workspaceId).eq(tableInfo.pkField, op.pk)
         )
         .first();
+    const tombstone = await ctx.db
+        .query('tombstones')
+        .withIndex('by_workspace_table_pk', (q) =>
+            q.eq('workspace_id', workspaceId)
+                .eq('table_name', op.table)
+                .eq('pk', op.pk)
+        )
+        .first();
+    // Wall time alone can move backwards relative to synced revisions, or
+    // repeat within a second. Advance the logical record, including deletions.
+    const clock = Math.max(now, (existing?.clock ?? 0) + 1, (tombstone?.clock ?? 0) + 1);
+    if (!Number.isSafeInteger(clock)) throw new Error('Cannot advance record revision');
+
+    // Native uploads and server-authored writes participate in the same frozen
+    // snapshots as client sync pushes. Keep the old state before replacing it.
+    if (existing) await recordMaterializedPreimage(ctx, workspaceId, op.table, op.pk, existing, serverVersion - 1);
 
     const stamps = {
-        clock: now,
+        clock,
         hlc,
         op_id: opId,
         server_version: serverVersion,
@@ -119,24 +139,15 @@ export async function applyServerAuthoredOp(
                 deleted: true,
                 deleted_at: now,
                 created_at: now,
-                ...stamps,
                 ...payload,
+                ...stamps,
             } as never);
         }
-        const tombstone = await ctx.db
-            .query('tombstones')
-            .withIndex('by_workspace_table_pk', (q) =>
-                q
-                    .eq('workspace_id', workspaceId)
-                    .eq('table_name', op.table)
-                    .eq('pk', op.pk)
-            )
-            .first();
         if (tombstone) {
             await ctx.db.patch(tombstone._id, {
                 deleted_at: now,
                 server_deleted_at: now,
-                clock: now,
+                clock,
                 hlc,
                 op_id: opId,
                 server_version: serverVersion,
@@ -148,7 +159,7 @@ export async function applyServerAuthoredOp(
                 pk: op.pk,
                 deleted_at: now,
                 server_deleted_at: now,
-                clock: now,
+                clock,
                 hlc,
                 op_id: opId,
                 server_version: serverVersion,
@@ -180,7 +191,7 @@ export async function applyServerAuthoredOp(
         pk: op.pk,
         op: op.operation,
         payload: op.operation === 'put' ? { ...payload, ...stamps, deleted: false } : undefined,
-        clock: now,
+        clock,
         hlc,
         device_id: 'server',
         op_id: opId,

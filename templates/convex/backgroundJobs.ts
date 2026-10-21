@@ -20,8 +20,9 @@
  * - Rich audit logging for job changes
  */
 
-import { v } from 'convex/values';
-import { internalMutation, internalQuery } from './_generated/server';
+import { getConvexSize, v, type Value } from 'convex/values';
+import { internalMutation, internalQuery, type MutationCtx, type QueryCtx } from './_generated/server';
+import type { Id } from './_generated/dataModel';
 import { readRequestUsage } from './requestUsage';
 
 // ============================================================
@@ -30,6 +31,20 @@ import { readRequestUsage } from './requestUsage';
 
 /** Batch size for job cleanup operations */
 const CLEANUP_BATCH_SIZE = 100;
+
+/** Keep four cleanup buckets below the transaction read limit, even with 1 MiB documents. */
+async function readJobBatch<T extends Value>(query: AsyncIterable<T>, limit: number): Promise<T[]> {
+    const jobs: T[] = [];
+    let bytes = 0;
+    for await (const job of query) {
+        jobs.push(job);
+        bytes += getConvexSize(job);
+        // At most one document can exceed this per-bucket budget. Keep the
+        // count cap for small rows and preserve throughput on ordinary jobs.
+        if (jobs.length >= limit || bytes >= 2 * 1024 * 1024) break;
+    }
+    return jobs;
+}
 
 /**
  * Applies an atomic claim to a job row and returns the public projection.
@@ -156,7 +171,7 @@ export const create = internalMutation({
                     existing.kind !== 'workflow' &&
                     existing.execution === undefined
                 ) {
-                    await ctx.db.patch(existing._id, {
+                    await patchJob(ctx, existing._id, {
                         status: 'error',
                         error:
                             'Background job predates durable recovery. Retry the message.',
@@ -195,7 +210,7 @@ export const create = internalMutation({
         for (const job of active) {
             if (job.kind === 'workflow' || job.execution !== undefined)
                 continue;
-            await ctx.db.patch(job._id, {
+            await patchJob(ctx, job._id, {
                 status: 'error',
                 error:
                     'Background job predates durable recovery. Retry the message.',
@@ -264,6 +279,10 @@ export const create = internalMutation({
             last_activity_at: now
         });
 
+        await ctx.db.insert('background_job_controls', {
+            job_id: jobId, user_id: args.user_id, status: 'streaming', attempts: 0, revision: 0,
+            workspace_id: typeof args.execution?.workspaceId === 'string' ? args.execution.workspaceId : undefined,
+        });
         return { kind: 'created' as const, jobId };
     },
 });
@@ -318,7 +337,7 @@ export const requestAdmissionCancel = internalMutation({
             return { aborted: false, pending: true };
         }
         if (job.status === 'streaming') {
-            await ctx.db.patch(job._id, {
+            await patchJob(ctx, job._id, {
                 status: 'aborted',
                 error: 'Cancelled by user',
                 completed_at: now,
@@ -345,6 +364,17 @@ export const requestAdmissionCancel = internalMutation({
  * Authorization:
  * - The job must belong to the server-resolved `user_id`.
  */
+/** Resolve an admission's durable job ID without crossing its owner boundary. */
+export const findByIdempotencyKey = internalQuery({
+    args: { user_id: v.string(), idempotency_key: v.string() },
+    handler: async (ctx, args) => {
+        const job = await ctx.db.query('background_jobs')
+            .withIndex('by_user_idempotency', q => q.eq('user_id', args.user_id).eq('idempotency_key', args.idempotency_key))
+            .first();
+        return job?._id ?? null;
+    },
+});
+
 export const get = internalQuery({
     args: {
         job_id: v.id('background_jobs'),
@@ -441,7 +471,7 @@ export const update = internalMutation({
         }
 
         if (Object.keys(patch).length > 0) {
-            await ctx.db.patch(args.job_id, patch);
+            await patchJob(ctx, args.job_id, patch);
         }
         return true;
     },
@@ -484,7 +514,7 @@ export const complete = internalMutation({
         if (args.workflow_state !== undefined) {
             patch.workflow_state = args.workflow_state;
         }
-        await ctx.db.patch(args.job_id, patch);
+        await patchJob(ctx, args.job_id, patch);
         return true;
     },
 });
@@ -512,7 +542,7 @@ export const fail = internalMutation({
             return false;
         }
 
-        await ctx.db.patch(args.job_id, {
+        await patchJob(ctx, args.job_id, {
             status: 'error',
             error: args.error,
             completed_at: Date.now(),
@@ -571,7 +601,7 @@ export const saveTerminalSnapshot = internalMutation({
         }
         const usage = readRequestUsage(args.usage);
         if (usage) patch.usage = usage;
-        await ctx.db.patch(args.job_id, patch);
+        await patchJob(ctx, args.job_id, patch);
         return true;
     },
 });
@@ -594,7 +624,7 @@ export const setHistoryPhase = internalMutation({
         if (!job) return false;
         const current = job.history_phase ?? 'ready';
         if (args.from && !args.from.includes(current)) return false;
-        await ctx.db.patch(args.job_id, { history_phase: args.phase });
+        await patchJob(ctx, args.job_id, { history_phase: args.phase });
         return true;
     },
 });
@@ -626,7 +656,7 @@ export const claim = internalMutation({
             leaseExpiresAt,
             now
         );
-        await ctx.db.patch(job._id, patch);
+        await patchJob(ctx, job._id, patch);
         return result;
     },
 });
@@ -660,7 +690,7 @@ export const claimNext = internalMutation({
             leaseExpiresAt,
             now
         );
-        await ctx.db.patch(job._id, patch);
+        await patchJob(ctx, job._id, patch);
         return result;
     },
 });
@@ -683,7 +713,7 @@ export const renewLease = internalMutation({
         ) {
             return false;
         }
-        await ctx.db.patch(job._id, {
+        await patchJob(ctx, job._id, {
             lease_expires_at: now + Math.max(1, args.lease_ms),
             last_activity_at: now
         });
@@ -708,7 +738,7 @@ export const updateExecution = internalMutation({
         ) {
             return false;
         }
-        await ctx.db.patch(job._id, {
+        await patchJob(ctx, job._id, {
             execution: args.execution,
             last_activity_at: Date.now()
         });
@@ -752,7 +782,7 @@ export const claimClientTool = internalMutation({
                 claimFingerprint: pending.argumentFingerprint,
             },
         };
-        await ctx.db.patch(job._id, {
+        await patchJob(ctx, job._id, {
             execution: nextExecution,
             last_activity_at: now,
         });
@@ -805,7 +835,7 @@ export const settleClientTool = internalMutation({
             (pending.claimFingerprint !== undefined &&
                 pending.argumentFingerprint !== pending.claimFingerprint)
         ) return false;
-        await ctx.db.patch(job._id, {
+        await patchJob(ctx, job._id, {
             execution: args.execution,
             tool_calls: args.tool_calls,
             lease_owner: undefined,
@@ -843,7 +873,7 @@ export const abort = internalMutation({
             return false;
         }
 
-        await ctx.db.patch(args.job_id, {
+        await patchJob(ctx, args.job_id, {
             status: 'aborted',
             completed_at: Date.now(),
             last_activity_at: Date.now(),
@@ -872,10 +902,8 @@ export const checkAborted = internalQuery({
         job_id: v.id('background_jobs'),
     },
     handler: async (ctx, args) => {
-        const job = await ctx.db.get(args.job_id);
-        if (!job) return true; // Job doesn't exist, treat as aborted
-
-        return job.status === 'aborted';
+        const control = await readJobControl(ctx, args.job_id);
+        return !control || control.status === 'aborted';
     },
 });
 
@@ -901,15 +929,14 @@ export const cleanup = internalMutation({
         let cleaned = 0;
 
         // Get streaming jobs that have timed out (batched)
-        const streamingJobs = await ctx.db
+        const streamingJobs = await readJobBatch(ctx.db
             .query('background_jobs')
-            .withIndex('by_status', (q) => q.eq('status', 'streaming'))
-            .take(CLEANUP_BATCH_SIZE);
+            .withIndex('by_status', (q) => q.eq('status', 'streaming')), CLEANUP_BATCH_SIZE);
 
         for (const job of streamingJobs) {
             const idleAge = now - (job.last_activity_at ?? job.started_at);
             if (job.kind !== 'workflow' && job.execution === undefined) {
-                await ctx.db.patch(job._id, {
+                await patchJob(ctx, job._id, {
                     status: 'error',
                     error:
                         'Background job predates durable recovery. Retry the message.',
@@ -922,7 +949,7 @@ export const cleanup = internalMutation({
                 });
                 cleaned++;
             } else if (idleAge > timeoutMs) {
-                await ctx.db.patch(job._id, {
+                await patchJob(ctx, job._id, {
                     status: 'error',
                     error: 'Job timed out',
                     completed_at: now,
@@ -938,10 +965,9 @@ export const cleanup = internalMutation({
 
         // Get completed jobs that are stale (batched)
         for (const status of ['complete', 'error', 'aborted'] as const) {
-            const jobs = await ctx.db
+            const jobs = await readJobBatch(ctx.db
                 .query('background_jobs')
-                .withIndex('by_status', (q) => q.eq('status', status))
-                .take(CLEANUP_BATCH_SIZE);
+                .withIndex('by_status', (q) => q.eq('status', status)), CLEANUP_BATCH_SIZE);
 
             for (const job of jobs) {
                 const completedAge = now - (job.completed_at ?? job.started_at);
@@ -951,6 +977,8 @@ export const cleanup = internalMutation({
                     historyPhase === 'committed' ||
                     historyPhase === 'superseded';
                 if (completedAge > retentionMs && historySettled) {
+                    const control = await findJobControl(ctx, job._id);
+                    if (control) await ctx.db.delete(control._id);
                     await ctx.db.delete(job._id);
                     cleaned++;
                 }
@@ -979,6 +1007,26 @@ export const getActiveCount = internalQuery({
     },
 });
 
+/**
+ * Restart blockers across the durable store, including parked tools/workflows
+ * and terminal jobs with unsettled admission/history. Return a lower-bound
+ * count (0 or 1): loading pages of large snapshots can exceed Convex's byte
+ * budget even with few records. Indexed existence checks in one transaction
+ * give a consistent snapshot with at most one document read per bucket.
+ */
+export const getShutdownBlockerCount = internalQuery({
+    args: {},
+    handler: async (ctx) => {
+        if (await ctx.db.query('background_jobs')
+            .withIndex('by_status', (q) => q.eq('status', 'streaming')).first()) return 1;
+        for (const phase of ['admission_pending', 'finalization_pending']) {
+            if (await ctx.db.query('background_jobs')
+                .withIndex('by_history_phase', (q) => q.eq('history_phase', phase)).first()) return 1;
+        }
+        return 0;
+    },
+});
+
 /** Return a bounded page of canonical-history deliveries awaiting retry. */
 export const listPendingHistory = internalQuery({
     args: { limit: v.number() },
@@ -986,14 +1034,14 @@ export const listPendingHistory = internalQuery({
         const limit = Math.max(1, Math.min(100, Math.floor(args.limit)));
         const jobs = (
             await Promise.all([
-                ctx.db.query('background_jobs')
+                readJobBatch(ctx.db.query('background_jobs')
                     .withIndex('by_history_phase', (q) =>
                         q.eq('history_phase', 'admission_pending')
-                    ).take(limit),
-                ctx.db.query('background_jobs')
+                    ), limit),
+                readJobBatch(ctx.db.query('background_jobs')
                     .withIndex('by_history_phase', (q) =>
                         q.eq('history_phase', 'finalization_pending')
-                    ).take(limit),
+                    ), limit),
             ])
         ).flat();
         return jobs
@@ -1025,5 +1073,47 @@ export const listPendingHistory = internalQuery({
                 leaseExpiresAt: job.lease_expires_at,
                 attempts: job.attempts,
             }));
+    },
+});
+
+async function findJobControl(ctx: QueryCtx | MutationCtx, jobId: Id<'background_jobs'>) {
+    return ctx.db.query('background_job_controls').withIndex('by_job', q => q.eq('job_id', jobId)).first();
+}
+
+async function readJobControl(ctx: QueryCtx | MutationCtx, jobId: Id<'background_jobs'>) {
+    const control = await findJobControl(ctx, jobId);
+    if (control) return control;
+    // Existing in-flight jobs finish normally across a scaffold upgrade.
+    const job = await ctx.db.get(jobId);
+    return job ? { user_id: job.user_id, status: job.status, attempts: job.attempts ?? 0,
+        lease_owner: job.lease_owner, workspace_id: job.execution?.workspaceId, revision: undefined } : null;
+}
+
+/** Small monotonic revision lets remote viewers skip unchanged large snapshots.
+ * Lifecycle, output, tool state and usage changes advance it in the same mutation.
+ */
+async function patchJob(ctx: MutationCtx, jobId: Id<'background_jobs'>, patch: Record<string, any>) {
+    await ctx.db.patch(jobId, patch);
+    if (!['status', 'attempts', 'lease_owner', 'execution', 'content', 'reasoning', 'tool_calls',
+        'workflow_state', 'usage', 'chunks_received'].some(key => key in patch)) return;
+    const control = await findJobControl(ctx, jobId);
+    if (!control) return; // Legacy jobs use the safe full-record read fallback.
+    await ctx.db.patch(control._id, {
+        revision: control.revision + 1,
+        ...('status' in patch ? { status: patch.status } : {}),
+        ...('attempts' in patch ? { attempts: patch.attempts } : {}),
+        ...('lease_owner' in patch ? { lease_owner: patch.lease_owner } : {}),
+        ...('execution' in patch ? { workspace_id: patch.execution?.workspaceId } : {}),
+    });
+}
+
+export const getControl = internalQuery({
+    args: { job_id: v.id('background_jobs'), user_id: v.string() },
+    handler: async (ctx, args) => {
+        const control = await readJobControl(ctx, args.job_id);
+        if (!control || control.user_id !== args.user_id) return null;
+        return { status: control.status, attempts: control.attempts,
+            revision: control.revision,
+            leaseOwner: control.lease_owner, workspaceId: control.workspace_id };
     },
 });

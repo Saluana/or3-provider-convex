@@ -32,11 +32,14 @@ export default defineSchema({
      */
     users: defineTable({
         email: v.optional(v.string()),
+        // Absent only on pre-migration rows; an empty string represents no email.
+        normalized_email: v.optional(v.string()),
         display_name: v.optional(v.string()),
         active_workspace_id: v.optional(v.id('workspaces')),
         created_at: v.number(),
     })
         .index('by_email', ['email'])
+        .index('by_normalized_email', ['normalized_email'])
         .index('by_display_name', ['display_name']),
 
 
@@ -81,6 +84,17 @@ export default defineSchema({
     /**
      * Workspace invites - invite-only onboarding records.
      */
+    signup_invites: defineTable({
+        id: v.string(), email: v.string(), token_hash: v.string(),
+        status: v.union(v.literal('pending'), v.literal('accepted'), v.literal('revoked')),
+        expires_at: v.number(), created_at: v.number(), created_by_admin: v.string(),
+        revoked_at: v.optional(v.number()), accepted_at: v.optional(v.number()),
+        user_id: v.optional(v.id('users')), workspace_id: v.optional(v.id('workspaces')),
+        accepted_provider: v.optional(v.string()), accepted_provider_user_id: v.optional(v.string()),
+        retain_until: v.number(),
+    }).index('by_invite_id', ['id']).index('by_token_hash', ['token_hash'])
+        .index('by_created', ['created_at', 'id']).index('by_retention', ['retain_until']),
+
     auth_invites: defineTable({
         workspace_id: v.id('workspaces'),
         email: v.string(),
@@ -201,6 +215,7 @@ export default defineSchema({
         user_id: v.string(),
         high_watermark: v.number(),
         tables: v.array(v.string()),
+        retained_files: v.optional(v.boolean()),
         created_at: v.number(),
         expires_at: v.number(),
     })
@@ -377,6 +392,14 @@ export default defineSchema({
         workspace_id: v.id('workspaces'), hash: v.string(), deleted_at: v.number(),
     }).index('by_workspace_hash', ['workspace_id', 'hash']),
 
+    retained_storage: defineTable({
+        workspace_id: v.id('workspaces'), hash: v.string(), size_bytes: v.number(),
+        metadata_aliases: v.array(v.string()),
+    }).index('by_workspace_hash', ['workspace_id', 'hash']),
+    storage_usage: defineTable({
+        workspace_id: v.id('workspaces'), used_bytes: v.number(), ready: v.boolean(), cursor: v.optional(v.string()),
+    }).index('by_workspace', ['workspace_id']),
+
     upload_intents: defineTable({
         workspace_id: v.id('workspaces'),
         user_id: v.id('users'),
@@ -391,12 +414,15 @@ export default defineSchema({
             v.literal('cancelled')
         ),
         storage_id: v.optional(v.id('_storage')),
+        storage_provider_id: v.optional(v.string()),
         created_at: v.number(),
         consumed_at: v.optional(v.number()),
         cancelled_at: v.optional(v.number()),
     })
         .index('by_workspace_status', ['workspace_id', 'status'])
+        .index('by_workspace_status_expiry', ['workspace_id', 'status', 'expires_at'])
         .index('by_workspace_hash_status', ['workspace_id', 'hash', 'status'])
+        .index('by_workspace_hash_status_expiry', ['workspace_id', 'hash', 'status', 'expires_at'])
         .index('by_expiry', ['expires_at']),
 
     /**
@@ -436,6 +462,20 @@ export default defineSchema({
         value: v.string(),
         updated_at: v.number(),
     }).index('by_workspace_key', ['workspace_id', 'key']),
+
+    // Private encrypted plugin credentials and revision-bound test evidence.
+    // These tables must never enter sync, snapshots or change_log.
+    plugin_connections: defineTable({
+        id: v.string(), ownerUserId: v.string(), workspace_id: v.id('workspaces'),
+        pluginId: v.string(), providerId: v.string(), slotId: v.optional(v.string()),
+        label: v.string(), scopes: v.array(v.string()), revision: v.number(),
+        secretCiphertext: v.string(), createdAt: v.number(), updatedAt: v.number(),
+    }).index('by_connection_id', ['id']).index('by_workspace_owner', ['workspace_id', 'ownerUserId']),
+    plugin_connection_tests: defineTable({
+        workspace_id: v.id('workspaces'), connectionId: v.string(), revision: v.number(),
+        operationId: v.string(), ok: v.boolean(), code: v.optional(v.string()),
+        checkedAt: v.number(), detail: v.optional(v.string()),
+    }).index('by_connection', ['connectionId']).index('by_workspace', ['workspace_id']),
 
     /**
      * Notifications - user notification center entries
@@ -549,6 +589,12 @@ export default defineSchema({
      * Background jobs - persistent storage for background streaming jobs.
      * Allows jobs to survive server restarts and work across instances.
      */
+    /** Small lifecycle row; large response bodies stay out of control polls. */
+    background_job_controls: defineTable({
+        job_id: v.id('background_jobs'), user_id: v.string(), status: v.union(v.literal('streaming'), v.literal('complete'), v.literal('error'), v.literal('aborted')),
+        revision: v.number(), attempts: v.number(), lease_owner: v.optional(v.string()), workspace_id: v.optional(v.string()),
+    }).index('by_job', ['job_id']),
+
     background_jobs: defineTable({
         user_id: v.string(), // User who created the job
         thread_id: v.string(), // Thread the message belongs to

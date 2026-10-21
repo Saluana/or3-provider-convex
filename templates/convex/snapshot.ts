@@ -1,4 +1,8 @@
-/** Pure helpers shared by the Convex snapshot mutation and contract fixtures. */
+/** Snapshot candidates, revision ordering and preimages shared by all sync writers. */
+import type { MutationCtx } from './_generated/server';
+import type { Id, TableNames } from './_generated/dataModel';
+import { getPkField } from './tableMetadata';
+const nowSec = (): number => Math.floor(Date.now() / 1000);
 
 export type SnapshotRevision = {
     clock: number;
@@ -21,6 +25,8 @@ export type SnapshotCandidate =
           pk: string;
           revision: SnapshotRevision;
           serverDeletedAt: number;
+          /** Retained file metadata for server archives; never sync wire data. */
+          payload?: unknown;
           serverVersion?: number;
       };
 
@@ -105,4 +111,124 @@ export function decodeSnapshotCursor(value: string): SnapshotCursorToken {
     } catch {
         throw new Error('Invalid snapshot page token');
     }
+}
+
+
+export type MaterializedDoc = {
+    _id: Id<TableNames>;
+    _creationTime?: number;
+    id?: string;
+    hash?: string;
+    deleted?: boolean;
+    deleted_at?: number;
+    clock?: number;
+    hlc?: string;
+    op_id?: string;
+    server_version?: number;
+} & Record<string, unknown>;
+
+
+export function legacySnapshotRevision(
+    tableName: string,
+    pk: string,
+    value: { clock?: number; hlc?: string; op_id?: string }
+): SnapshotRevision {
+    const clock = Number.isInteger(value.clock) && (value.clock as number) >= 0
+        ? (value.clock as number)
+        : 0;
+    const hlc = typeof value.hlc === 'string' && value.hlc.length > 0
+        ? value.hlc
+        : `legacy-${clock}`;
+    const opId = typeof value.op_id === 'string' && value.op_id.length > 0
+        ? value.op_id
+        : `legacy:${tableName}:${pk}:${clock}:${hlc}`;
+    return { clock, hlc, opId };
+}
+
+function snapshotPayloadFromDoc(
+    doc: MaterializedDoc,
+    pkField: string,
+    pk: string,
+    revision: SnapshotRevision
+): Record<string, unknown> {
+    const {
+        _id,
+        _creationTime,
+        workspace_id,
+        server_version,
+        op_id,
+        ...payload
+    } = doc;
+    void _id;
+    void _creationTime;
+    void workspace_id;
+    void server_version;
+    void op_id;
+    return {
+        ...payload,
+        [pkField]: pk,
+        clock: revision.clock,
+        hlc: revision.hlc,
+    };
+}
+
+export function materializedSnapshotCandidate(
+    tableName: string,
+    pk: string,
+    doc: MaterializedDoc,
+    serverVersionOverride?: number
+): SnapshotCandidate {
+    const revision = legacySnapshotRevision(tableName, pk, doc);
+    const serverVersion = serverVersionOverride ?? doc.server_version;
+    if (doc.deleted === true) {
+        return {
+            kind: 'tombstone',
+            tableName,
+            pk,
+            revision,
+            ...(tableName === 'file_meta' ? { payload: snapshotPayloadFromDoc(doc, getPkField(tableName), pk, revision) } : {}),
+            serverDeletedAt:
+                typeof doc.deleted_at === 'number' && doc.deleted_at >= 0
+                    ? Math.floor(doc.deleted_at)
+                    : nowSec(),
+            serverVersion,
+        };
+    }
+    return {
+        kind: 'row',
+        tableName,
+        pk,
+        payload: snapshotPayloadFromDoc(doc, getPkField(tableName), pk, revision),
+        revision,
+        serverVersion,
+    };
+}
+
+export async function recordMaterializedPreimage(
+    ctx: MutationCtx,
+    workspaceId: Id<'workspaces'>,
+    tableName: string,
+    pk: string,
+    doc: MaterializedDoc,
+    fallbackServerVersion: number
+): Promise<void> {
+    const candidate = materializedSnapshotCandidate(
+        tableName,
+        pk,
+        doc,
+        doc.server_version ?? fallbackServerVersion
+    );
+    await ctx.db.insert('sync_record_versions', {
+        workspace_id: workspaceId,
+        table_name: tableName,
+        pk,
+        server_version: candidate.serverVersion ?? fallbackServerVersion,
+        kind: candidate.kind,
+        payload: candidate.kind === 'row' || tableName === 'file_meta' ? candidate.payload : undefined,
+        clock: candidate.revision.clock,
+        hlc: candidate.revision.hlc,
+        op_id: candidate.revision.opId,
+        server_deleted_at:
+            candidate.kind === 'tombstone' ? candidate.serverDeletedAt : undefined,
+    });
 }

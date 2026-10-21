@@ -639,18 +639,21 @@ describe('Convex authorization boundary', () => {
 
     it('terminalizes legacy streaming jobs during startup cleanup', async () => {
         const patch = vi.fn(async () => undefined);
-        let queryCount = 0;
         const query = vi.fn(() => ({
             withIndex: (_index: string, build: (q: any) => unknown) => {
-                const chain = { eq: vi.fn(() => chain) };
+                let status: string | undefined;
+                const chain = { eq: (field: string, value: string) => {
+                    if (field === 'status') status = value;
+                    return chain;
+                } };
                 build(chain);
-                const jobs = queryCount++ === 0
+                const jobs = status === 'streaming'
                     ? [{
                           _id: 'job-legacy', status: 'streaming',
                           started_at: Date.now(),
                       }]
                     : [];
-                return { take: vi.fn(async () => jobs) };
+                return { async *[Symbol.asyncIterator]() { yield* jobs; } };
             },
         }));
         const ctx = { db: { query, patch, delete: vi.fn() } } as any;
@@ -901,4 +904,29 @@ describe('Convex authorization boundary', () => {
         }
     });
 
+});
+
+
+describe('signup invitation trusted bridge', () => {
+    it('refuses provider-only code lookup before reading invitation email addresses', async () => {
+        const ctx = makeCtx({ identity: { subject: 'recipient', issuer: 'https://or3.ai/auth/basic-auth', email: 'recipient@example.test' } });
+        await expect(registered(workspaceFunctions.findSignupInviteByTokenHash)._handler(ctx, { token_hash: 'hash' }))
+            .rejects.toThrow('Forbidden');
+        expect(ctx.db.query).not.toHaveBeenCalled();
+    });
+
+    it('refuses provider-only callers before any canonical writes', async () => {
+        const ctx = makeCtx({ identity: { subject: 'recipient', issuer: 'https://or3.ai/auth/basic-auth', email: 'recipient@example.test' } });
+        await expect(registered(workspaceFunctions.acceptSignupInviteAndProvisionUser)._handler(ctx, {
+            provider: 'basic-auth', provider_user_id: 'recipient', email: 'recipient@example.test', invite_id: 'invite', token_hash: 'hash',
+        })).rejects.toThrow('Forbidden');
+        expect(ctx.db.query).not.toHaveBeenCalled();
+    });
+    it('refuses a trusted bridge with a mismatched subject', async () => {
+        const ctx = makeCtx({ identity: { subject: 'other', issuer: 'https://or3.ai/auth/basic-auth', or3_server: true, email: 'recipient@example.test' } });
+        await expect(registered(workspaceFunctions.acceptSignupInviteAndProvisionUser)._handler(ctx, {
+            provider: 'basic-auth', provider_user_id: 'recipient', email: 'recipient@example.test', invite_id: 'invite', token_hash: 'hash',
+        })).rejects.toThrow('Forbidden');
+        expect(ctx.db.query).not.toHaveBeenCalled();
+    });
 });

@@ -138,6 +138,26 @@ export const convexJobProvider: BackgroundJobProvider = {
         return toBackgroundJob(job);
     },
 
+    async findJobByIdempotencyKey(idempotencyKey, userId) {
+        const client = getClient();
+        const jobId = await client.query(internalApi.backgroundJobs.findByIdempotencyKey, {
+            user_id: userId,
+            idempotency_key: idempotencyKey,
+        });
+        if (!jobId) return null;
+        const job = await client.query(internalApi.backgroundJobs.get, {
+            job_id: jobId,
+            user_id: userId,
+        });
+        return job ? toBackgroundJob(job) : null;
+    },
+
+    progressWritesCheckAbort: true,
+
+    async getJobControl(jobId: string, userId: string) {
+        return getClient().query(internalApi.backgroundJobs.getControl, { job_id: jobId as Id<'background_jobs'>, user_id: userId });
+    },
+
     async updateJob(jobId: string, update: JobUpdate): Promise<void> {
         const client = getClient();
         const usage = readRequestUsage(update.usage);
@@ -167,6 +187,9 @@ export const convexJobProvider: BackgroundJobProvider = {
             extendedUpdatePayload
         );
         assertLeaseWrite(result, update.leaseOwner);
+        if (result === false) {
+            const error = new Error('Background job stopped'); error.name = 'AbortError'; throw error;
+        }
     },
 
     async completeJob(
@@ -382,5 +405,13 @@ export const convexJobProvider: BackgroundJobProvider = {
     async getActiveJobCount(): Promise<number> {
         const client = getClient();
         return await client.query(internalApi.backgroundJobs.getActiveCount, {});
+    },
+
+    async getShutdownBlockerCount(): Promise<number> {
+        // Missing backend functions and transport failures must propagate. An
+        // unavailable count never grants permission to replace the server.
+        return await getClient().query(
+            internalApi.backgroundJobs.getShutdownBlockerCount, {}
+        );
     },
 };

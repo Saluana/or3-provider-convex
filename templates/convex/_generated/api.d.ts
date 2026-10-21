@@ -5,6 +5,7 @@ import type * as backgroundJobs from '../backgroundJobs';
 import type * as connect from '../connect';
 import type * as hostSettings from '../hostSettings';
 import type * as notifications from '../notifications';
+import type * as pluginConnections from '../pluginConnections';
 import type * as rateLimits from '../rateLimits';
 import type * as storage from '../storage';
 import type * as sync from '../sync';
@@ -18,6 +19,7 @@ declare const fullApi: ApiFromModules<{
     connect: typeof connect;
     hostSettings: typeof hostSettings;
     notifications: typeof notifications;
+    pluginConnections: typeof pluginConnections;
     rateLimits: typeof rateLimits;
     storage: typeof storage;
     sync: typeof sync;
