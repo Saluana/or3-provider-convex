@@ -5,6 +5,8 @@
  * persistence, auth and quotas have their own stronger provider tests.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createApp, eventHandler, readBody, toWebHandler } from 'h3';
 import { requireFileKindCapability } from '~~/server/utils/storage/file-kind-capability';
 import { createConvexStorageProvider } from '../convex-storage-provider';
@@ -13,7 +15,7 @@ vi.mock('#imports', () => ({ useRuntimeConfig: () => ({ security: { proxy: {}, a
 // Load the real host guard at runtime, like the backend-template fixtures. Its
 // Nuxt application's generated config types are outside this package's shim.
 const { requireCloudMutation } = await import(
-    /* @vite-ignore */ new URL('../../../../../../or3-chat/server/utils/security/cloud-mutation.ts', import.meta.url).href
+    /* @vite-ignore */ pathToFileURL(resolve(process.env.OR3_CANONICAL_HOST_ROOT || '../or3-chat', 'server/utils/security/cloud-mutation.ts')).href
 );
 const hash = 'sha256:' + 'a'.repeat(64);
 
