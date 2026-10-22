@@ -541,3 +541,25 @@ text; remote viewers fetch full snapshots only when the revision changes. The
 existing viewer polling cadence and terminal snapshot recovery remain intact;
 progress mutations already enforce abort and lease ownership atomically. Legacy
 jobs retain the safe full-record fallback.
+
+## Enrollment and native object ownership
+
+The host admits new canonical accounts after enforcing registration policy.
+Public `workspaces.ensure` may maintain an already admitted account, but only
+the trusted server bridge can create its user/auth-account mapping and supply
+its verified email. Public `workspaces.create` requires an existing mapping.
+A direct Convex identity token alone cannot enroll a new account.
+
+Native object ownership comes from the persisted consumed upload receipt,
+scoped to the workspace and normalized content hash. Sync cannot introduce
+another workspace's native storage ID, including in deleted metadata. Commit
+refuses an ID already owned or referenced by another workspace. Physical
+single-object deletion and GC require that same receipt; expired authorization
+windows do not erase ownership. Legacy originals without a receipt remain
+readable but cannot be physically collected or republished through sync with
+that ID; re-upload through the normal host gateway to establish a verified
+receipt. No automatic metadata-based ownership backfill is performed.
+
+Deploy the matching backend templates, including the storage-ID indexes on
+`file_meta` and `upload_intents`, with the rebuilt provider. Host-only changes
+do not secure the public functions of an older deployed backend.

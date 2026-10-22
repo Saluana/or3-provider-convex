@@ -57,7 +57,11 @@ function fixture() {
             );
             return builder;
           },
-          filter: () => builder,
+          filter: (build: (q: any) => (row: any) => boolean) => {
+            const predicate = build({ field: (key: string) => (row: any) => row[key],
+              neq: (field: (row: any) => unknown, value: unknown) => (row: any) => field(row) !== value });
+            rows = rows.filter(predicate); return builder;
+          },
           first: async () => rows[0] ?? null,
           collect: async () => [...rows],
           paginate: async ({ cursor, numItems }: any) => {
@@ -94,9 +98,69 @@ function fixture() {
 const HASH = 'a'.repeat(64);
 const hashBase64 = Buffer.from(HASH, 'hex').toString('base64');
 
+// Collection scenarios start with originals committed by the production
+// upload handlers, including their ownership receipt, rather than treating
+// client-authored metadata as proof that bytes belong to the workspace.
+async function commitFixtureOriginal(f: ReturnType<typeof fixture>, row: any) {
+  const deleted = row.deleted; const deletedAt = row.deleted_at;
+  row.size_bytes ??= 1; row.mime_type ??= 'text/plain'; row.name ??= 'Original';
+  row.kind ??= 'file'; row.ref_count ??= 0;
+  const digest = row.hash.replace(/^sha256:/i, '').toLowerCase();
+  f.objects.set(row.storage_id, { size: row.size_bytes, contentType: row.mime_type,
+    sha256: Buffer.from(digest, 'hex').toString('base64') });
+  const input = { workspace_id: row.workspace_id, hash: row.hash, mime_type: row.mime_type, size_bytes: row.size_bytes };
+  const grant = await handler(storageFunctions.generateUploadUrl)(f.ctx, input);
+  await handler(storageFunctions.commitUpload)(f.ctx, { ...input, intent_id: grant.intentId,
+    storage_id: row.storage_id, storage_provider_id: row.storage_provider_id ?? 'convex', name: row.name, kind: row.kind });
+  await f.ctx.db.patch(row._id, { deleted, ...(deletedAt !== undefined ? { deleted_at: deletedAt } : {}) });
+}
+
 describe('Convex persisted upload intents', () => {
   beforeEach(() => vi.useFakeTimers().setSystemTime(new Date('2026-01-01T00:00:00Z')));
   afterEach(() => vi.useRealTimers());
+
+  // Exercise receipt creation at its real owner, then attack through each
+  // metadata/commit/deletion boundary. The storage stub only records effects.
+  it('binds native objects to their committed workspace across sync, commit, delete and GC', async () => {
+    const f = fixture();
+    const hash = `sha256:${HASH}`;
+    f.objects.set('owned-blob', { size: 3, sha256: hashBase64, contentType: 'text/plain' });
+    const grant = await handler(storageFunctions.generateUploadUrl)(f.ctx, {
+      workspace_id: 'ws-1', hash, mime_type: 'text/plain', size_bytes: 3,
+    });
+    const commit = { workspace_id: 'ws-1', hash, intent_id: grant.intentId, storage_id: 'owned-blob',
+      storage_provider_id: 'convex', name: 'Original', mime_type: 'text/plain', size_bytes: 3, kind: 'file' };
+    await handler(storageFunctions.commitUpload)(f.ctx, commit);
+    await handler(storageFunctions.commitUpload)(f.ctx, commit);
+    const original = f.tables.file_meta[0];
+    f.tables.workspace_members[0].role = 'viewer';
+    f.tables.workspaces.push({ _id: 'ws-2', deleted: false });
+    f.tables.workspace_members.push({ _id: 'member-2', workspace_id: 'ws-2', user_id: 'user-1', role: 'owner' });
+    const alias = { hash, name: 'Alias', mime_type: 'text/plain', kind: 'file', size_bytes: 3,
+      storage_id: 'owned-blob', storage_provider_id: 'convex', deleted: true };
+    const pushed = await handler(syncFunctions.push)(f.ctx, { workspace_id: 'ws-2', ops: [{
+      op_id: crypto.randomUUID(), table_name: 'file_meta', pk: hash, operation: 'put', payload: alias,
+      clock: 2_000_000_000, hlc: '2000000000:0:alias', device_id: 'alias-device',
+    }] });
+    expect(pushed.results[0]).toMatchObject({ success: false });
+    const otherGrant = await handler(storageFunctions.generateUploadUrl)(f.ctx, {
+      workspace_id: 'ws-2', hash, mime_type: 'text/plain', size_bytes: 3,
+    });
+    await expect(handler(storageFunctions.commitUpload)(f.ctx, { ...commit,
+      workspace_id: 'ws-2', intent_id: otherGrant.intentId })).rejects.toThrow(/ownership|another workspace|committed/i);
+    // Even poisoned metadata already persisted before an upgrade cannot grant deletion.
+    f.tables.file_meta.push({ ...original, ...alias, _id: 'poisoned-alias', workspace_id: 'ws-2', deleted_at: 1 });
+    await expect(handler(storageFunctions.deleteObject)(f.ctx, { workspace_id: 'ws-2', hash }))
+      .rejects.toThrow(/ownership|another workspace|committed/i);
+    await expect(handler(storageFunctions.gcDeletedFiles)(f.ctx, { workspace_id: 'ws-2', retention_seconds: 0 }))
+      .resolves.toMatchObject({ deletedCount: 0 });
+    expect(f.deletedObjects).toEqual([]);
+    expect(f.objects.has('owned-blob')).toBe(true);
+    f.tables.workspace_members[0].role = 'editor'; original.deleted = true;
+    await expect(handler(storageFunctions.deleteObject)(f.ctx, { workspace_id: 'ws-1', hash }))
+      .resolves.toEqual({ deleted: true });
+    expect(f.deletedObjects).toEqual(['owned-blob']);
+  });
 
   // Immutable system storage metadata, rather than client file_meta, owns proof.
   it.each([true, false])('attests only the actual native storage checksum (%s)', async valid => {
@@ -197,6 +261,7 @@ describe('Convex persisted upload intents', () => {
       f.tables.file_meta.push({ _id: `file-${logical}`, workspace_id: 'ws-1', hash,
         deleted: true, deleted_at: Math.floor(Date.now() / 1000) - 10_000, storage_id: `blob-${logical}` });
     }
+    for (const row of [...f.tables.file_meta]) await commitFixtureOriginal(f, row);
     f.tables.messages.push({ _id: 'message-live', workspace_id: 'ws-1', deleted: false,
       file_hashes: JSON.stringify([`sha256:${HASH}`]) });
     await handler(storageFunctions.gcDeletedFiles)(f.ctx, { workspace_id: 'ws-1', retention_seconds: 3600, limit: 10 });
@@ -209,6 +274,7 @@ describe('Convex persisted upload intents', () => {
     f.tables.file_meta.push({ _id: 'removed-original', workspace_id: 'ws-1', hash, name: 'Original', kind: 'file',
       mime_type: 'text/plain', size_bytes: 1, ref_count: 0, clock: 1, deleted: true, storage_provider_id: storageProviderId, storage_id: 'old-blob' });
     f.objects.set('old-blob', { size: 1, sha256: hashBase64, contentType: 'text/plain' });
+    for (const row of [...f.tables.file_meta]) await commitFixtureOriginal(f, row);
     await handler(storageFunctions.deleteObject)(f.ctx, { workspace_id: 'ws-1', hash });
     expect(f.tables.storage_deletion_claims).toContainEqual(expect.objectContaining({ hash: HASH, workspace_id: 'ws-1' }));
     const push = handler(syncFunctions.push);
@@ -249,6 +315,8 @@ describe('Convex persisted upload intents', () => {
       deleted: true, deleted_at: Math.floor(Date.now() / 1000) - 10_000,
       storage_id: 'blob-delete',
     });
+    for (const row of [...f.tables.file_meta]) await commitFixtureOriginal(f, row);
+    f.tables.change_log.length = 0;
     const remove = handler(storageFunctions.deleteObject);
 
     await expect(remove(f.ctx, {
@@ -380,6 +448,7 @@ describe('Convex persisted upload intents', () => {
       _id: `old-${index}`, workspace_id: 'ws-1', hash, size_bytes: 60,
       deleted: true, storage_id: `old-blob-${index}`, deleted_at: 1,
     })));
+    for (const row of [...f.tables.file_meta]) await commitFixtureOriginal(f, row);
     const generate = handler(storageFunctions.generateUploadUrl);
     const input = { workspace_id: 'ws-1', hash: 'b'.repeat(64), mime_type: 'image/png', size_bytes: 60, workspace_quota_bytes: 100 };
     await expect(generate(f.ctx, input)).rejects.toThrow('quota exceeded');
@@ -538,6 +607,7 @@ describe('Convex persisted upload intents', () => {
         deleted: true, deleted_at: deletedAt, ref_count: 999, storage_id: 'blob-orphan',
       },
     );
+    for (const row of [...f.tables.file_meta]) await commitFixtureOriginal(f, row);
     f.tables.messages.push({
       _id: 'message-1', workspace_id: 'ws-1', deleted: false,
       file_hashes: JSON.stringify([`sha256:${HASH}`]),

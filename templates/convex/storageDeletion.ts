@@ -3,6 +3,19 @@ import type { MutationCtx } from './_generated/server';
 import type { Id } from './_generated/dataModel';
 
 const normalizeHash = (hash: string) => hash.replace(/^sha256:/i, '').trim().toLowerCase();
+/** A verified, consumed upload is authority; sync metadata is not. Receipts
+ * remain persisted after expiry, so collecting bytes never depends on a live
+ * authorization window or a caller-authored storage alias.
+ */
+export async function getNativeStorageReceipt(ctx: MutationCtx, workspaceId: Id<'workspaces'>,
+    hash: string, storageId: string) {
+    const receipt = await ctx.db.query('upload_intents').withIndex('by_storage_id', (q: any) =>
+        q.eq('storage_id', storageId as Id<'_storage'>)).first();
+    return receipt?.status === 'consumed' && receipt.workspace_id === workspaceId
+        && normalizeHash(receipt.hash) === normalizeHash(hash)
+        && (!receipt.storage_provider_id || receipt.storage_provider_id === 'convex') ? receipt : null;
+}
+
 async function claim(ctx: MutationCtx, workspaceId: Id<'workspaces'>, hash: string) {
     return ctx.db.query('storage_deletion_claims').withIndex('by_workspace_hash', q =>
         q.eq('workspace_id', workspaceId).eq('hash', normalizeHash(hash))).first();
@@ -19,6 +32,13 @@ export async function releaseStorageDeletion(ctx: MutationCtx, workspaceId: Id<'
 }
 export async function assertStorageNotDeleted(ctx: MutationCtx, workspaceId: Id<'workspaces'>,
     table: string, row: Record<string, unknown>) {
+    if (table === 'file_meta' && (!row.storage_provider_id || row.storage_provider_id === 'convex')
+        && typeof row.storage_id === 'string') {
+        const receipt = await getNativeStorageReceipt(ctx, workspaceId, String(row.hash ?? ''), row.storage_id);
+        if (!receipt || receipt.size_bytes !== row.size_bytes) {
+            throw new Error('Storage ownership requires a matching committed upload');
+        }
+    }
     if (row.deleted === true || !['file_meta', 'messages', 'posts'].includes(table)) {
         if (table === 'file_meta') await recordRetainedStorage(ctx, workspaceId, row);
         return;
