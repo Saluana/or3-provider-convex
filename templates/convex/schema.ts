@@ -383,6 +383,7 @@ export default defineSchema({
         server_version: v.optional(v.number()),
     })
         .index('by_workspace_hash', ['workspace_id', 'hash'])
+        .index('by_storage_id', ['storage_id'])
         .index('by_workspace_deleted', ['workspace_id', 'deleted']),
 
     /** Persisted, expiring, one-time upload intents and quota reservations. */
@@ -423,7 +424,8 @@ export default defineSchema({
         .index('by_workspace_status_expiry', ['workspace_id', 'status', 'expires_at'])
         .index('by_workspace_hash_status', ['workspace_id', 'hash', 'status'])
         .index('by_workspace_hash_status_expiry', ['workspace_id', 'hash', 'status', 'expires_at'])
-        .index('by_expiry', ['expires_at']),
+        .index('by_expiry', ['expires_at'])
+        .index('by_storage_id', ['storage_id']),
 
     /**
      * KV store - key-value pairs for user preferences

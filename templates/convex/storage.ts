@@ -24,7 +24,7 @@
 import { ConvexError, v } from 'convex/values';
 import { internalMutation, internalQuery, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id } from './_generated/dataModel';
-import { claimStorageDeletion, releaseStorageDeletion } from './storageDeletion';
+import { getNativeStorageReceipt, claimStorageDeletion, releaseStorageDeletion } from './storageDeletion';
 import { applyServerAuthoredOp } from './syncAuthoring';
 import { requireActiveWorkspace } from './authz';
 import { prepareStorageUsage, releaseCollectedStorage } from './storageUsage';
@@ -317,6 +317,26 @@ export const commitUpload = internalMutation({
             throw new Error('Uploaded object digest does not match intent');
         }
 
+        if (args.storage_provider_id && args.storage_provider_id !== 'convex') {
+            throw new Error('Native storage cannot commit another storage provider');
+        }
+        const owner = await ctx.db.query('upload_intents').withIndex('by_storage_id', (q: any) =>
+            q.eq('storage_id', args.storage_id)).first();
+        if (owner && !await getNativeStorageReceipt(ctx, args.workspace_id, args.hash, args.storage_id)) {
+            throw new Error('Storage object is committed to another workspace or hash');
+        }
+        // Pre-receipt originals cannot be claimed from another workspace's
+        // metadata. This check only refuses a claim; metadata never grants one.
+        const foreign = await ctx.db.query('file_meta').withIndex('by_storage_id', (q: any) =>
+            q.eq('storage_id', args.storage_id))
+            .filter((q: any) => q.neq(q.field('workspace_id'), args.workspace_id)).first();
+        if (foreign) throw new Error('Storage object belongs to another workspace');
+        // Receipt and canonical metadata commit atomically. Admission below
+        // verifies this binding even for server-authored sync operations.
+        await ctx.db.patch(intent._id, {
+            status: 'consumed', storage_id: args.storage_id,
+            storage_provider_id: args.storage_provider_id, consumed_at: nowSec(),
+        });
         await releaseStorageDeletion(ctx, args.workspace_id, args.hash);
         const existing = await ctx.db
             .query('file_meta')
@@ -344,10 +364,6 @@ export const commitUpload = internalMutation({
                     storage_provider_id: args.storage_provider_id,
                     deleted: false,
                 },
-            });
-            await ctx.db.patch(intent._id, {
-                status: 'consumed', storage_id: args.storage_id,
-                storage_provider_id: args.storage_provider_id, consumed_at: nowSec(),
             });
             return;
         }
@@ -399,10 +415,7 @@ export const commitUpload = internalMutation({
                 });
             }
         }
-        await ctx.db.patch(intent._id, {
-            status: 'consumed', storage_id: args.storage_id,
-            storage_provider_id: args.storage_provider_id, consumed_at: nowSec(),
-        });
+
     },
 });
 
@@ -515,6 +528,9 @@ export const deleteObject = internalMutation({
         }
 
         if (!file.deleted) throw new Error('Cannot delete retained live metadata');
+        if (file.storage_id && !await getNativeStorageReceipt(ctx, args.workspace_id, file.hash, file.storage_id)) {
+            throw new Error('Storage ownership requires a matching committed upload');
+        }
         await claimStorageDeletion(ctx, args.workspace_id, file.hash);
         if (file.storage_id) {
             await ctx.storage.delete(file.storage_id as Id<'_storage'>);
@@ -595,6 +611,7 @@ export const gcDeletedFiles = internalMutation({
             // live blob or allocate an unbounded result set.
             if (referencedHashes.has(normalizeHash(file.hash))) continue;
 
+            if (file.storage_id && !await getNativeStorageReceipt(ctx, args.workspace_id, file.hash, file.storage_id)) continue;
             await claimStorageDeletion(ctx, args.workspace_id, file.hash);
             if (file.storage_id) {
                 await ctx.storage.delete(file.storage_id as Id<'_storage'>);

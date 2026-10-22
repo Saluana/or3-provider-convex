@@ -357,7 +357,7 @@ export const listMyWorkspaces = query({
  * Creates a workspace and grants the current user owner membership.
  *
  * Behavior:
- * - Creates a user record and auth account mapping if missing
+ * - Requires a user already admitted by the host
  * - Initializes `server_version_counter` for sync
  */
 export const create = mutation({
@@ -366,42 +366,10 @@ export const create = mutation({
         description: v.optional(v.string()),
     },
     handler: async (ctx, args) => {
-        const identity = await ctx.auth.getUserIdentity();
-        if (!identity) {
-            throw new Error('Not authenticated');
-        }
-        const provider = inferProviderFromIssuer(identity.issuer);
-
+        // Enrollment is owned by the host registration policy. A public token
+        // may create workspaces only after that canonical mapping exists.
+        const { userId } = await getAuthAccount(ctx);
         const now = Date.now();
-
-        // Find or create user
-        let authAccount = await ctx.db
-            .query('auth_accounts')
-            .withIndex('by_provider', (q) =>
-                q.eq('provider', provider).eq('provider_user_id', identity.subject)
-            )
-            .first();
-
-        let userId;
-        if (!authAccount) {
-            // Create user first
-            userId = await ctx.db.insert('users', {
-                email: identity.email ?? undefined,
-                normalized_email: normalizeEmail(identity.email ?? ''),
-                display_name: identity.name ?? undefined,
-                created_at: now,
-            });
-
-            // Link auth account
-            await ctx.db.insert('auth_accounts', {
-                user_id: userId,
-                provider,
-                provider_user_id: identity.subject,
-                created_at: now,
-            });
-        } else {
-            userId = authAccount.user_id;
-        }
 
         // Create workspace
         const workspaceId = await ctx.db.insert('workspaces', {
@@ -540,7 +508,7 @@ export const remove = mutation({
  * Ensures a user and a default workspace exist on first login.
  *
  * Behavior:
- * - Validates provider and JWT subject
+ * - Validates provider and JWT subject; first enrollment requires the trusted host
  * - Creates a personal workspace if none exists
  * - Sets active workspace for the user
  */
@@ -575,6 +543,12 @@ export const ensure = mutation({
 
         let userId: Id<'users'>;
         if (!authAccount) {
+            if (!isTrustedServerIdentity(identity)) {
+                throw new Error('Host admission is required before provisioning an account');
+            }
+            // Only the trusted host supplies canonical, verified profile data.
+            // Public ensure calls may maintain an admitted user's workspace,
+            // but cannot invent an email identity or skip registration policy.
             userId = await ctx.db.insert('users', {
                 email: args.email,
                 normalized_email: normalizeEmail(args.email ?? ''),

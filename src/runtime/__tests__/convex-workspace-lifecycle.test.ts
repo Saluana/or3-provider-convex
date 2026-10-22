@@ -154,6 +154,31 @@ function makeFixture(options: {
 }
 
 describe('Convex workspace lifecycle authorization', () => {
+    // Public identity ownership is not instance admission; no canonical account
+    // or membership may be created before the host checks registration policy.
+    it.each(['ensure', 'create'] as const)('refuses direct %s provisioning before host admission', async operation => {
+        const { ctx, tables } = makeFixture();
+        tables.auth_accounts = [];
+        tables.users = [];
+        const before = JSON.stringify(tables);
+        const args = operation === 'ensure'
+            ? { provider: 'clerk', provider_user_id: 'subject-1', email: 'victim@example.test', name: 'Attacker' }
+            : { name: 'Unadmitted workspace' };
+        await expect(handler(workspaceFunctions[operation])(ctx, args)).rejects.toThrow(/host|provision|admission|User not found/i);
+        expect(JSON.stringify(tables)).toBe(before);
+    });
+
+    it('allows trusted host provisioning and never rewrites an admitted user from public email arguments', async () => {
+        const { ctx, tables } = makeFixture();
+        tables.auth_accounts = []; tables.users = []; tables.workspace_members = [];
+        ctx.auth.getUserIdentity = async () => ({ issuer: 'https://or3.ai/auth/clerk', subject: 'subject-1', or3_server: true });
+        await handler(workspaceFunctions.ensure)(ctx, { provider: 'clerk', provider_user_id: 'subject-1', email: 'verified@example.test' });
+        expect(tables.users).toHaveLength(1);
+        expect(tables.users[0].email).toBe('verified@example.test');
+        ctx.auth.getUserIdentity = async () => ({ issuer: 'https://clerk.example.test', subject: 'subject-1', email: 'verified@example.test' });
+        await handler(workspaceFunctions.ensure)(ctx, { provider: 'clerk', provider_user_id: 'subject-1', email: 'victim@example.test' });
+        expect(tables.users[0].email).toBe('verified@example.test');
+    });
     it('deletes canonical history revisions only for the removed workspace', async () => {
         const fixture = makeFixture({ includeActiveWorkspace: true });
         fixture.tables.chat_history_revisions = [
