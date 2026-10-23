@@ -1,6 +1,6 @@
 {
     "name": "or3-provider-convex",
-    "version": "0.0.21",
+    "version": "0.0.22",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/Saluana/or3-provider-convex.git"
@@ -59,7 +59,7 @@
         "provenance": true
     },
     "dependencies": {
-        "convex": "^1.31.7",
+        "convex": "^1.48.0",
         "convex-nuxt": "0.1.5",
         "convex-vue": "^0.1.4"
     },
@@ -71,9 +71,9 @@
     "devDependencies": {
         "@nuxt/module-builder": "^1.0.2",
         "@types/node": "^24.10.1",
-        "h3": "^1.15.4",
+        "h3": "^1.15.11",
         "pathe": "^2.0.0",
         "typescript": "^5.9.3",
-        "vitest": "^4.0.18"
+        "vitest": "^4.1.12"
     }
 }

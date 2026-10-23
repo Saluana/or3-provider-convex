@@ -419,7 +419,7 @@ describe("Convex background request usage persistence", () => {
     const field = (templateSchema.tables.background_jobs as any).export().documentType.value.usage;
     expect(field?.optional).toBe(true);
     expect(field?.fieldType.type).toBe("object");
-    expect(Object.keys(field?.fieldType.value ?? {}).sort()).toEqual(Object.keys(measuredUsage()).sort());
+    expect(Object.keys(field?.fieldType.value ?? {}).sort()).toEqual([...Object.keys(measuredUsage()), "cost", "cached_tokens", "reasoning_tokens", "totals"].sort());
     for (const [key, value] of Object.entries(measuredUsage())) {
       expect(field.fieldType.value[key]).toEqual({ fieldType: { type: typeof value === "number" ? "number" : "string" }, optional: false });
     }
@@ -428,6 +428,10 @@ describe("Convex background request usage persistence", () => {
   it("matches the host normalizer for valid, missing, malformed and extra-field measurements", async () => {
     const helper = await import(/* @vite-ignore */ new URL("../../../templates/convex/requestUsage.ts", import.meta.url).href);
     for (const value of [undefined, null, {}, [], measuredUsage(), { ...measuredUsage(), extra: "discard" },
+      { ...measuredUsage(), cost: 0.25, cached_tokens: 12, reasoning_tokens: 8,
+        totals: { requests: 2, prompt_tokens: 400, completion_tokens: 50, cost: 0.5, cached_tokens: 20, reasoning_tokens: 10 } },
+      { ...measuredUsage(), cost: -1, cached_tokens: 1.5, reasoning_tokens: Infinity, totals: { requests: -1 } },
+      { ...measuredUsage(), totals: { requests: 2, prompt_tokens: 400, completion_tokens: 50, cost: -1, cached_tokens: -1, reasoning_tokens: NaN } },
       ...["prompt_tokens", "completion_tokens", "iteration", "measured_at", "prefix_message_count", "input_estimate_tokens"]
         .flatMap((key) => [-1, NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1, "4", undefined]
           .map((invalid) => ({ ...measuredUsage(), [key]: invalid }))),

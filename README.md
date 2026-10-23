@@ -563,3 +563,7 @@ receipt. No automatic metadata-based ownership backfill is performed.
 Deploy the matching backend templates, including the storage-ID indexes on
 `file_meta` and `upload_intents`, with the rebuilt provider. Host-only changes
 do not secure the public functions of an older deployed backend.
+
+Background request-usage measurements preserve optional cost, cached and reasoning
+token counts, and running totals from the host. Malformed optional fields are
+discarded without rejecting an otherwise complete measurement.
