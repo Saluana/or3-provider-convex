@@ -4,6 +4,10 @@ Convex sync, storage, and backend provider for OR3 Chat. Provides real-time sync
 
 Requires **Node.js 24.22.1 or newer on the 24.x line**, matching OR3 Chat. Development and CI pin **24.22.1** in `.node-version`.
 
+As of **0.0.23**, chat and document sync preserves the optional `title_source` field, including
+manual names and generated-title states. Deploy the matching backend templates
+when updating the provider so naming a chat or document does not block sync.
+
 ## Atomic webhook registration quotas
 
 The webhook store advertises `registrationLimit: 'atomic-v1'` and passes the optional `createWebhook(input, limit)` argument to its backend mutation. The indexed scope check and insertion run in one Convex mutation; exhaustion throws `WEBHOOK_LIMIT_EXCEEDED` at the store boundary. Deploy the matching backend templates as well as updating the provider package before integrating the coordinated OR3 Chat registration change. Old backends reject the new argument rather than bypassing the quota.

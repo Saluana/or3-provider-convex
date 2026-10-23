@@ -22,6 +22,11 @@ import { defineSchema, defineTable } from 'convex/server';
 import { v } from 'convex/values';
 import { requestUsageValidator } from './requestUsage';
 
+const titleSource = v.optional(v.union(
+    v.literal('temporary'), v.literal('generating'), v.literal('generated'),
+    v.literal('heading'), v.literal('manual'), v.literal('failed'),
+));
+
 export default defineSchema({
     // ============================================================
     // AUTH TABLES
@@ -259,6 +264,7 @@ export default defineSchema({
         workspace_id: v.id('workspaces'),
         id: v.string(), // Dexie ID (client-generated)
         title: v.optional(v.nullable(v.string())),
+        title_source: titleSource,
         status: v.string(),
         deleted: v.boolean(),
         deleted_at: v.optional(v.number()),
@@ -342,6 +348,7 @@ export default defineSchema({
         id: v.string(),
         title: v.string(),
         content: v.string(),
+        title_source: titleSource,
         post_type: v.string(),
         meta: v.optional(v.any()), // Post metadata/frontmatter. Intentionally flexible for different post types.
         file_hashes: v.optional(v.nullable(v.string())),
