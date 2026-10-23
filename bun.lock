@@ -5,7 +5,7 @@
     "": {
       "name": "or3-provider-convex",
       "dependencies": {
-        "convex": "^1.31.7",
+        "convex": "^1.48.0",
         "convex-nuxt": "0.1.5",
         "convex-vue": "^0.1.4",
       },
