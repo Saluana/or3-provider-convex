@@ -71,9 +71,9 @@
     "devDependencies": {
         "@nuxt/module-builder": "^1.0.2",
         "@types/node": "^24.10.1",
-        "h3": "^1.15.4",
+        "h3": "^1.15.11",
         "pathe": "^2.0.0",
         "typescript": "^5.9.3",
-        "vitest": "^4.0.18"
+        "vitest": "^4.1.12"
     }
 }
