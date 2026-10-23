@@ -47,7 +47,7 @@ export const rollbackSignup = internalMutation({args:{input:v.any()},handler:asy
 export const snapshotSignup = internalQuery({args:{},handler:async(ctx)=>({users:await ctx.db.query('users').collect(), accounts:await ctx.db.query('auth_accounts').collect(),members:await ctx.db.query('workspace_members').collect()})});
 export const expireSignupHistory = internalMutation({args:{},handler:async(ctx)=>{for(const row of await ctx.db.query('signup_invites').take(200)) await ctx.db.patch(row._id,{expires_at:1,retain_until:1});}});` : ''}
 ${signupOnly ? `export const seedLegacyUsers = internalMutation({args:{offset:v.number(),count:v.number()},handler:async(ctx,args)=>{for(let i=args.offset;i<args.offset+args.count;i++) await ctx.db.insert('users',{email:' Legacy-'+i+'@Example.Test ',created_at:1});}});` : ''}
-export const put = internalMutation({args:{},handler:async(ctx)=>{const owner=await ctx.db.insert('users',{created_at:1});return ctx.db.insert('workspaces',{name:'Upgrade persistence probe',owner_user_id:owner,created_at:1});}});
+export const put = internalMutation({args:{},handler:async(ctx)=>{const owner=await ctx.db.insert('users',{created_at:1});const workspace=await ctx.db.insert('workspaces',{name:'Upgrade persistence probe',owner_user_id:owner,created_at:1});await ctx.db.insert('workspace_members',{workspace_id:workspace,user_id:owner,role:'owner',created_at:1});return workspace;}});
 export const read = internalQuery({args:{},handler:async(ctx)=>ctx.db.query('workspaces').collect()});
 `);
 const instance = 'or3-upgrade-' + randomBytes(8).toString('hex');
@@ -424,6 +424,51 @@ try {
         assert.deepEqual(JSON.parse((await convexRun('run', 'or3Backend:version', '{}')).output.trim()), marker);
         assert.deepEqual(JSON.parse((await convexRun('run', 'upgradeProbe:read', '{}')).output.trim()), before);
         const result = await run([cli, 'deploy']); assert.equal(result.code, 0, result.output); assert.match(result.output, /already|matches/i);
+    });
+    await check('background assistant without an order key admits, replays and completes through indexed history after upgrade', async () => {
+        // Pending assistant rows bypass the foreground sync hook that supplies order_key.
+        // Exercise real schema validation, indexed history reads and terminal persistence:
+        // missing keys must be derived from the admitted HLC; existing keys must survive.
+        const { ConvexHttpClient } = await import(join(host, 'node_modules/convex/dist/esm/browser/index.js'));
+        const internalAdmin = new ConvexHttpClient(url);
+        internalAdmin.setAdminAuth(adminKey);
+        const workspace_id = before[0]._id;
+        const workspace = { user_id: before[0].owner_user_id };
+        const common = { clock: 1, created_at: 1, updated_at: 1, deleted: false };
+        const generationId = crypto.randomUUID();
+        const backgroundThread = 'background-' + generationId;
+        const assistantId = 'assistant-' + generationId;
+        const admission = {
+            workspace_id, actor_user_id: workspace.user_id, generation_id: generationId,
+            message_id: assistantId, kind: 'new-turn', fingerprint: generationId,
+            device_id: 'background:' + generationId,
+            records: [
+                { table_name: 'threads', record: { ...common, id: backgroundThread, title: 'Background ordering regression', status: 'ready', pinned: false, forked: false } },
+                { table_name: 'messages', record: { ...common, id: 'user-' + generationId, thread_id: backgroundThread, role: 'user', index: 0, order_key: 'preserved-user-order', data: { content: 'Synthetic request' } } },
+                { table_name: 'messages', record: { ...common, id: assistantId, thread_id: backgroundThread, role: 'assistant', index: 1, pending: true, data: { content: '', generation_id: generationId, generation_state: 'streaming' } } },
+            ].map(entry => ({ ...entry, op_id: crypto.randomUUID() })),
+        };
+        const admitted = await internalAdmin.mutation('sync:admitChatGeneration', admission);
+        assert.equal(admitted.status, 'admitted');
+        const admissionReplay = await internalAdmin.mutation('sync:admitChatGeneration', admission);
+        assert.equal(admissionReplay.replayed, true);
+        assert.equal(admissionReplay.serverVersion, admitted.serverVersion);
+        const historyQuery = { workspace_id, actor_user_id: workspace.user_id, query: { kind: 'thread_page', thread_id: backgroundThread, limit: 10 } };
+        const pendingHistory = await internalAdmin.query('sync:readChatHistory', historyQuery);
+        assert.deepEqual(pendingHistory.messages.map((row) => row.id), ['user-' + generationId, assistantId]);
+        assert.equal(pendingHistory.messages[0].order_key, 'preserved-user-order');
+        assert.equal(typeof pendingHistory.messages[1].order_key, 'string');
+        assert(pendingHistory.messages[1].order_key.length > 0);
+        assert.equal(pendingHistory.messages[1].order_key, pendingHistory.messages[1].hlc);
+        const terminal = { workspace_id, actor_user_id: workspace.user_id, generation_id: generationId, message_id: assistantId,
+            admission_clock: common.clock, fingerprint: 'terminal-' + generationId, device_id: 'background:' + generationId,
+            op_id: crypto.randomUUID(), snapshot: { status: 'complete', content: 'Synthetic background reply completed.', reasoning: '', completedAt: Date.now() } };
+        assert.equal((await internalAdmin.mutation('sync:finalizeChatGeneration', terminal)).status, 'committed');
+        assert.equal((await internalAdmin.mutation('sync:finalizeChatGeneration', terminal)).replayed, true);
+        const terminalHistory = await internalAdmin.query('sync:readChatHistory', historyQuery);
+        assert.equal(terminalHistory.messages[1].pending, false);
+        assert.equal(terminalHistory.messages[1].data.content, terminal.snapshot.content);
+        assert.equal(terminalHistory.messages[1].order_key, pendingHistory.messages[1].order_key);
     });
     await check('older source refuses a newer incompatible backend', async () => {
         const markerPath = join(root, 'convex/or3Backend.ts');

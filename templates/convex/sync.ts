@@ -1560,7 +1560,12 @@ export const admitChatGeneration = internalMutation({
             const hlc = typeof record.hlc === 'string' && record.hlc
                 ? record.hlc
                 : `${Date.now().toString(36).padStart(9, '0')}:000:background`;
-            const payload = { ...record, hlc, op_id: entry.op_id };
+            const payload: Record<string, unknown> = { ...record, hlc, op_id: entry.op_id };
+            // Pending assistants bypass the foreground sync hook that derives
+            // message ordering. Use the same HLC key before materializing them.
+            if (entry.table_name === 'messages' && !payload.order_key) {
+                payload.order_key = hlc;
+            }
             const encoded = JSON.stringify(payload);
             if (new TextEncoder().encode(encoded).byteLength > MAX_PAYLOAD_SIZE_BYTES) {
                 throw new Error('Invalid background history payload size');
