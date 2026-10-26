@@ -22,9 +22,12 @@ import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './wor
  *
  * Non-Goals:
  * - Per-table cursors or server-side merge strategies beyond LWW
- * - Schema enforcement beyond lightweight validation in `validatePayload`
+ * - Server-side merge strategies beyond complete-record LWW
  */
 import { v } from 'convex/values';
+import { makeFunctionReference } from 'convex/server';
+import schema from './schema';
+import { recordRetainedStorage } from './storageUsage';
 import { mutation, query, internalMutation, internalQuery, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
 import { getPkField } from './tableMetadata';
@@ -34,6 +37,7 @@ import {
     legacySnapshotRevision,
     materializedSnapshotCandidate,
     recordMaterializedPreimage,
+    SNAPSHOT_TTL_SECONDS,
     type MaterializedDoc,
     decodeSnapshotCursor,
     encodeSnapshotCursor,
@@ -105,9 +109,6 @@ const MAX_SNAPSHOT_PAGE_SIZE = 1000;
 
 /** Hard bound for canonical storage metadata/reference pages. */
 const MAX_CANONICAL_STORAGE_PAGE_SIZE = 500;
-
-/** Snapshot page chains expire after one hour. */
-const SNAPSHOT_TTL_SECONDS = 60 * 60;
 
 /** Maximum payload size in bytes (256KB) */
 const MAX_PAYLOAD_SIZE_BYTES = 256 * 1024;
@@ -550,6 +551,7 @@ async function upsertTombstone(
             table_name: op.table_name,
             pk: op.pk,
             server_version: existing.server_version ?? preimageVersion,
+            retain_until: nowSec() + SNAPSHOT_TTL_SECONDS,
             kind: 'tombstone',
             clock: previousRevision.clock,
             hlc: previousRevision.hlc,
@@ -597,6 +599,7 @@ function sanitizePayload(
     // zero maintains backwards-compatible row shape while canonical reference
     // queries remain the only source used by quota/GC.
     if (tableName === 'file_meta') delete safe.ref_count;
+    if (tableName === 'kv' && safe.value === null) delete safe.value;
     return safe;
 }
 
@@ -615,6 +618,28 @@ function validatePayload(
         throw new Error(
             `Invalid payload for ${tableName}: 'deleted' must be boolean`
         );
+    }
+}
+
+/** Reuse the deployed table validators so admission cannot drift from writes. */
+function matchesDocumentValidator(definition: any, value: unknown): boolean {
+    switch (definition.type) {
+        case 'any': return true;
+        case 'null': return value === null;
+        case 'string': case 'boolean': return typeof value === definition.type;
+        case 'number': return typeof value === 'number' && Number.isFinite(value);
+        case 'id': return typeof value === 'string' && value.length > 0;
+        case 'literal': return value === definition.value;
+        case 'union': return definition.value.some((member: any) => matchesDocumentValidator(member, value));
+        case 'array': return Array.isArray(value) && value.every(item => matchesDocumentValidator(definition.value, item));
+        case 'object': {
+            if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+            const record = value as Record<string, unknown>;
+            return Object.keys(record).every(key => key in definition.value) &&
+                Object.entries(definition.value).every(([key, field]: [string, any]) =>
+                    record[key] === undefined ? field.optional : matchesDocumentValidator(field.fieldType, record[key]));
+        }
+        default: return false;
     }
 }
 
@@ -660,6 +685,10 @@ function validateSyncOperation(
         return `op_id must be a UUID`;
     }
     if (!TABLE_INDEX_MAP[op.table_name]) return `Invalid table: ${op.table_name}`;
+    if (!Number.isSafeInteger(op.clock) || op.clock < 0) return 'Invalid clock';
+    for (const [name, value, maximum] of [['hlc', op.hlc, 512], ['device_id', op.device_id, 256], ['pk', op.pk, 1024]] as const) {
+        if (!value.trim() || value.length > maximum) return `Invalid ${name}`;
+    }
     const reservedKey = reservedKvSettingKey(op);
     if (reservedKey) {
         return `Reserved host setting key: ${reservedKey}`;
@@ -689,6 +718,7 @@ function validateSyncOperation(
     } catch (error) {
         return error instanceof Error ? error.message : String(error);
     }
+    if (!payload && op.operation === 'put') return `Invalid payload for ${op.table_name}: put requires a complete record`;
     if (!payload) return undefined;
     if ('_id' in payload) return `Invalid payload for ${op.table_name}: '_id' is immutable`;
     if ('workspace_id' in payload && String(payload.workspace_id) !== String(workspaceId)) {
@@ -698,7 +728,50 @@ function validateSyncOperation(
     if (pkField in payload && payload[pkField] !== op.pk) {
         return `Invalid payload for ${op.table_name}: '${pkField}' must match operation pk`;
     }
+    const tables = schema.tables as unknown as Record<string, { validator: { json: any } }>;
+    if (op.operation === 'put') {
+        if (op.table_name === 'file_meta' && (!Number.isSafeInteger(payload.size_bytes) || (payload.size_bytes as number) < 0)) {
+            return 'Invalid payload for file_meta: size_bytes must be a nonnegative integer';
+        }
+        const canonical = {
+            ...sanitizePayload(op.table_name, payload),
+            ...(op.table_name === 'file_meta' ? { ref_count: 0 } : {}),
+            workspace_id: workspaceId,
+            [pkField]: op.pk,
+            clock: op.clock,
+            hlc: op.hlc,
+            op_id: op.op_id,
+        };
+        if (!matchesDocumentValidator(tables[op.table_name]!.validator.json, canonical)) {
+            return `Invalid payload for ${op.table_name}: record does not match the canonical schema`;
+        }
+    } else {
+        const definition = tables[op.table_name]!.validator.json;
+        const fields = Object.fromEntries(Object.entries(definition.value).map(([key, field]: [string, any]) =>
+            [key, { ...field, optional: true }]));
+        if (!matchesDocumentValidator({ type: 'object', value: fields }, sanitizePayload(op.table_name, payload))) {
+            return `Invalid payload for ${op.table_name}: delete fields do not match the canonical schema`;
+        }
+    }
     return undefined;
+}
+
+type CurrentWinner = { kind: 'put'; payload: unknown; revision: SnapshotRevision } |
+    { kind: 'delete'; revision: SnapshotRevision; serverDeletedAt: number };
+
+async function currentWinner(ctx: MutationCtx, workspaceId: Id<'workspaces'>, tableName: string, pk: string): Promise<CurrentWinner | undefined> {
+    const table = TABLE_INDEX_MAP[tableName]!;
+    const row = await (ctx.db.query(table.table as TableNames) as any)
+        .withIndex(table.indexName, (q: any) => q.eq('workspace_id', workspaceId).eq(getPkField(tableName), pk)).first();
+    const tombstone = await ctx.db.query('tombstones').withIndex('by_workspace_table_pk', q =>
+        q.eq('workspace_id', workspaceId).eq('table_name', tableName).eq('pk', pk)).first();
+    const candidates: SnapshotCandidate[] = [];
+    if (row) candidates.push(materializedSnapshotCandidate(tableName, pk, row));
+    if (tombstone) candidates.push(tombstoneSnapshotCandidate(tableName, pk, tombstone));
+    const winner = resolveSnapshotWinner(candidates, Number.MAX_SAFE_INTEGER);
+    if (!winner) return undefined;
+    return winner.kind === 'row' ? { kind: 'put', payload: winner.payload, revision: winner.revision } :
+        { kind: 'delete', revision: winner.revision, serverDeletedAt: winner.serverDeletedAt };
 }
 
 /**
@@ -840,7 +913,8 @@ async function applyOpToTable(
             const shouldApply = incomingWinsStoredRevision(
                 { clock: op.clock, hlc: op.hlc, opId: op.op_id },
                 existing
-            );
+            ) && (!existingTombstone || incomingWinsStoredRevision(
+                { clock: op.clock, hlc: op.hlc, opId: op.op_id }, existingTombstone));
             // LWW with deterministic HLC tie-break on equal clocks.
             if (shouldApply) {
                 await assertStorageNotDeleted(ctx, workspaceId, table, { ...existing, ...(payload ?? {}) });
@@ -861,19 +935,17 @@ async function applyOpToTable(
                     existing,
                     preimageVersion
                 );
-                await ctx.db.patch(existing._id, {
+                await ctx.db.replace(existing._id, {
                     ...(payload ?? {}),
-                    ...(op.table_name === 'messages' &&
-                    payload &&
-                    !Object.prototype.hasOwnProperty.call(payload, 'error')
-                        ? { error: undefined }
-                        : {}),
+                    workspace_id: workspaceId,
+                    [pkField]: op.pk,
+                    ...(table === 'file_meta' ? { ref_count: 0 } : {}),
                     clock: op.clock,
                     hlc: op.hlc,
                     op_id: op.op_id,
                     server_version: serverVersion,
                     updated_at: payloadUpdatedAt ?? nowSec(),
-                });
+                } as any);
                 applied = true;
             } else {
                 console.debug('[sync] apply put skipped', {
@@ -920,6 +992,9 @@ async function applyOpToTable(
         }
     }
 
+    if (applied && op.table_name === 'file_meta' && op.operation === 'put') {
+        await recordRetainedStorage(ctx, workspaceId, { ...payload, hash: op.pk });
+    }
     if (applied && (op.table_name === 'threads' || op.table_name === 'messages')) {
         const threadIds = op.table_name === 'threads' ? [op.pk] : [existing?.thread_id, payload?.thread_id];
         for (const threadId of new Set(threadIds)) if (typeof threadId === 'string') {
@@ -1151,6 +1226,8 @@ export const push = mutation({
             payload?: unknown;
             wasExisting?: boolean;
             applied?: boolean;
+            replayed?: boolean;
+            winner?: CurrentWinner;
         };
 
         const results: Array<Result | undefined> = new Array(args.ops.length);
@@ -1205,11 +1282,6 @@ export const push = mutation({
                 );
                 continue;
             }
-            const validationError = validateSyncOperation(args.workspace_id, group.op);
-            if (validationError) {
-                failGroup(group.indices, group.op, validationError);
-                continue;
-            }
             try {
                 const scopedOp = await scopeNotificationWrite(
                     ctx,
@@ -1217,6 +1289,11 @@ export const push = mutation({
                     callerUserId,
                     group.op
                 );
+                const validationError = validateSyncOperation(args.workspace_id, scopedOp);
+                if (validationError) {
+                    failGroup(group.indices, group.op, validationError);
+                    continue;
+                }
                 candidates.push({ op: scopedOp, indices: group.indices });
             } catch (error) {
                 failGroup(
@@ -1235,16 +1312,16 @@ export const push = mutation({
                     .first()
             )
         );
-        const newOps: typeof candidates = [];
-        candidates.forEach((candidate, index) => {
+        const unprocessedOps: typeof candidates = [];
+        for (const [index, candidate] of candidates.entries()) {
             const existing = existingLogs[index];
             if (!existing) {
-                newOps.push(candidate);
-                return;
+                unprocessedOps.push(candidate);
+                continue;
             }
             if (
                 String(existing.workspace_id) !== String(args.workspace_id) ||
-                changeLogFingerprint(existing) !== operationFingerprint(candidate.op)
+                (existing.request_fingerprint ?? changeLogFingerprint(existing)) !== operationFingerprint(candidate.op)
             ) {
                 failGroup(
                     candidate.indices,
@@ -1252,19 +1329,38 @@ export const push = mutation({
                     `Conflicting operation reuses processed op_id ${candidate.op.op_id}`,
                     'CONFLICT'
                 );
-                return;
+                continue;
             }
             latestVersion = Math.max(latestVersion, existing.server_version);
+            const winner = await currentWinner(ctx, args.workspace_id, candidate.op.table_name, candidate.op.pk);
             for (const resultIndex of candidate.indices) {
                 results[resultIndex] = {
                     opId: candidate.op.op_id,
                     success: true,
                     serverVersion: existing.server_version,
                     wasExisting: true,
-                    applied: true,
+                    applied: false,
+                    replayed: true,
+                    ...(winner ? { winner } : {}),
                 };
             }
-        });
+        }
+
+        // Exact receipts remain valid after ownership/lifecycle state changes.
+        // Only new operations need dynamic storage admission before allocation.
+        const newOps: typeof candidates = [];
+        for (const candidate of unprocessedOps) {
+            const { op, indices } = candidate;
+            try {
+                if (op.operation === 'put') await assertStorageNotDeleted(ctx, args.workspace_id, op.table_name, {
+                    ...sanitizePayload(op.table_name, op.payload as Record<string, unknown>),
+                    [getPkField(op.table_name)]: op.pk,
+                });
+                newOps.push(candidate);
+            } catch (error) {
+                failGroup(indices, op, error instanceof Error ? error.message : String(error));
+            }
+        }
 
         if (newOps.length > 0) {
             const startVersion = await allocateServerVersions(ctx, args.workspace_id, newOps.length);
@@ -1275,66 +1371,71 @@ export const push = mutation({
             for (let offset = 0; offset < newOps.length; offset += 1) {
                 const { op, indices } = newOps[offset]!;
                 const serverVersion = startVersion + offset;
-                try {
-                    console.debug('[sync] push apply', {
-                        table: op.table_name,
-                        pk: op.pk,
-                        op: op.operation,
-                        clock: op.clock,
-                        opId: op.op_id,
-                        serverVersion,
-                    });
-                    const applyResult = await applyOpToTable(
+                console.debug('[sync] push apply', {
+                    table: op.table_name,
+                    pk: op.pk,
+                    op: op.operation,
+                    clock: op.clock,
+                    opId: op.op_id,
+                    serverVersion,
+                });
+                const applyResult = await applyOpToTable(
+                    ctx,
+                    args.workspace_id,
+                    op,
+                    serverVersion,
+                    batchPreimageVersion
+                );
+
+                const submittedPayload =
+                    typeof op.payload === 'object' && op.payload !== null
+                        ? (op.payload as Record<string, unknown>)
+                        : undefined;
+                const winner = await currentWinner(ctx, args.workspace_id, op.table_name, op.pk);
+                const opPayload = applyResult.applied && op.operation === 'put' && winner?.kind === 'put'
+                    ? winner.payload : submittedPayload;
+                await ctx.db.insert('change_log', {
+                    workspace_id: args.workspace_id,
+                    server_version: serverVersion,
+                    table_name: op.table_name,
+                    pk: op.pk,
+                    op: op.operation,
+                    payload: opPayload,
+                    clock: op.clock,
+                    hlc: op.hlc,
+                    device_id: op.device_id,
+                    op_id: op.op_id,
+                    created_at: nowSec(),
+                    request_fingerprint: operationFingerprint(op),
+                });
+
+                if (op.operation === 'delete') {
+                    await upsertTombstone(
                         ctx,
                         args.workspace_id,
                         op,
                         serverVersion,
+                        nowSec(),
                         batchPreimageVersion
                     );
-
-                    const opPayload =
-                        typeof op.payload === 'object' && op.payload !== null
-                            ? (op.payload as Record<string, unknown>)
-                            : undefined;
-                    await ctx.db.insert('change_log', {
-                        workspace_id: args.workspace_id,
-                        server_version: serverVersion,
-                        table_name: op.table_name,
-                        pk: op.pk,
-                        op: op.operation,
-                        payload: opPayload,
-                        clock: op.clock,
-                        hlc: op.hlc,
-                        device_id: op.device_id,
-                        op_id: op.op_id,
-                        created_at: nowSec(),
-                    });
-
-                    if (op.operation === 'delete') {
-                        await upsertTombstone(
-                            ctx,
-                            args.workspace_id,
-                            op,
-                            serverVersion,
-                            nowSec(),
-                            batchPreimageVersion
-                        );
-                    }
-
-                    const success: Result = {
-                        opId: op.op_id,
-                        serverVersion,
-                        success: true,
-                        tableName: op.table_name,
-                        operation: op.operation,
-                        payload: opPayload,
-                        wasExisting: applyResult.wasExisting,
-                        applied: applyResult.applied,
-                    };
-                    for (const resultIndex of indices) results[resultIndex] = success;
-                } catch (error) {
-                    failGroup(indices, op, String(error), 'SERVER_ERROR');
                 }
+
+                const finalWinner = op.operation === 'delete'
+                    ? await currentWinner(ctx, args.workspace_id, op.table_name, op.pk) : winner;
+                const success: Result = {
+                    opId: op.op_id,
+                    serverVersion,
+                    success: true,
+                    tableName: op.table_name,
+                    operation: op.operation,
+                    payload: opPayload,
+                    wasExisting: applyResult.wasExisting,
+                    applied: applyResult.applied,
+                    ...(finalWinner ? { winner: finalWinner } : {}),
+                };
+                for (const resultIndex of indices) results[resultIndex] = success;
+                // Unexpected failures deliberately escape: Convex rolls back the
+                // counter, canonical rows, pre-images and log as one mutation.
             }
         }
 
@@ -1868,15 +1969,12 @@ export const updateDeviceCursor = mutation({
 
         const existing = await ctx.db
             .query('device_cursors')
-            .withIndex('by_workspace_device', (q) =>
-                q.eq('workspace_id', args.workspace_id).eq('device_id', deviceId)
+            .withIndex('by_workspace_user_device', (q) =>
+                q.eq('workspace_id', args.workspace_id).eq('owner_user_id', callerUserId).eq('device_id', deviceId)
             )
             .first();
 
         if (existing) {
-            if (existing.owner_user_id && existing.owner_user_id !== callerUserId) {
-                throw new Error('Device cursor belongs to another user');
-            }
             if (args.last_seen_version < existing.last_seen_version) {
                 throw new Error('Device cursor cannot regress');
             }
@@ -2595,6 +2693,41 @@ export const getServerVersion = query({
  * - Is unavailable to public Convex callers
  * - Scans and deletes at most `batch_size` records
  */
+/** Bounded maintenance. A pre-image can only serve snapshots begun before its
+ * write, so its one-hour lease outlives every session that could need it. */
+async function collectSyncState(ctx: MutationCtx, workspaceId: Id<'workspaces'>, retentionSeconds: number, batchSize: number) {
+    const now = nowSec();
+    const expiredDevices = await ctx.db.query('device_cursors').withIndex('by_workspace_updated', q =>
+        q.eq('workspace_id', workspaceId).lt('updated_at', now - retentionSeconds)).take(batchSize + 1);
+    const expiredSessions = await ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace_expiry', q =>
+        q.eq('workspace_id', workspaceId).lte('expires_at', now)).take(batchSize + 1);
+    for (const row of [...expiredDevices.slice(0, batchSize), ...expiredSessions.slice(0, batchSize)]) await ctx.db.delete(row._id);
+
+    const active = await ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace_expiry', q =>
+        q.eq('workspace_id', workspaceId).gt('expires_at', now)).first();
+    let legacyHasMore = false;
+    if (active) {
+        // Add leases to pre-upgrade history in bounded pages. Extending a legacy
+        // lease for one hour is conservative and needs no destructive migration.
+        const legacy = await ctx.db.query('sync_record_versions').withIndex('by_workspace_expiry', q =>
+            q.eq('workspace_id', workspaceId).eq('retain_until', undefined)).take(batchSize + 1);
+        for (const row of legacy.slice(0, batchSize)) await ctx.db.patch(row._id, { retain_until: now + SNAPSHOT_TTL_SECONDS });
+        legacyHasMore = legacy.length > batchSize;
+    }
+    const history = active
+        ? await ctx.db.query('sync_record_versions').withIndex('by_workspace_expiry', q =>
+            q.eq('workspace_id', workspaceId).gt('retain_until', 0).lte('retain_until', now)).take(batchSize + 1)
+        : await ctx.db.query('sync_record_versions').withIndex('by_workspace_version', q =>
+            q.eq('workspace_id', workspaceId)).take(batchSize + 1);
+    for (const row of history.slice(0, batchSize)) await ctx.db.delete(row._id);
+    const minimum = await ctx.db.query('device_cursors').withIndex('by_workspace_version', q =>
+        q.eq('workspace_id', workspaceId)).order('asc').first();
+    const counter = minimum ? null : await ctx.db.query('server_version_counter').withIndex('by_workspace', q =>
+        q.eq('workspace_id', workspaceId)).first();
+    return { minimumVersion: minimum?.last_seen_version ?? counter?.value ?? 0,
+        hasMore: expiredDevices.length > batchSize || expiredSessions.length > batchSize || history.length > batchSize || legacyHasMore };
+}
+
 export const gcTombstones = internalMutation({
     args: {
         workspace_id: v.id('workspaces'),
@@ -2609,10 +2742,7 @@ export const gcTombstones = internalMutation({
             return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: true, reason: SYNC_HISTORY_GC_POLICY.reason };
         }
         const batchSize = args.batch_size ?? 100;
-        const minCursor = await ctx.db.query('device_cursors')
-            .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id))
-            .order('asc').first();
-        if (!minCursor) return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: false };
+        const state = await collectSyncState(ctx, args.workspace_id, args.retention_seconds, batchSize);
         const page = await ctx.db.query('tombstones')
             .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id).gt('server_version', startCursor))
             .order('asc').take(batchSize + 1);
@@ -2620,12 +2750,12 @@ export const gcTombstones = internalMutation({
         const cutoff = nowSec() - args.retention_seconds;
         let purged = 0;
         for (const tombstone of scanned) {
-            if (tombstone.server_version <= minCursor.last_seen_version && typeof tombstone.server_deleted_at === 'number' && tombstone.server_deleted_at < cutoff) {
+            if (tombstone.server_version <= state.minimumVersion && typeof tombstone.server_deleted_at === 'number' && tombstone.server_deleted_at < cutoff) {
                 await ctx.db.delete(tombstone._id);
                 purged += 1;
             }
         }
-        return { purged, hasMore: page.length > batchSize, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
+        return { purged, hasMore: page.length > batchSize || state.hasMore, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
     },
 });
 
@@ -2654,10 +2784,7 @@ export const gcChangeLog = internalMutation({
             return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: true, reason: SYNC_HISTORY_GC_POLICY.reason };
         }
         const batchSize = args.batch_size ?? 100;
-        const minCursor = await ctx.db.query('device_cursors')
-            .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id))
-            .order('asc').first();
-        if (!minCursor) return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: false };
+        const state = await collectSyncState(ctx, args.workspace_id, args.retention_seconds, batchSize);
         const page = await ctx.db.query('change_log')
             .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id).gt('server_version', startCursor))
             .order('asc').take(batchSize + 1);
@@ -2665,12 +2792,12 @@ export const gcChangeLog = internalMutation({
         const cutoff = nowSec() - args.retention_seconds;
         let purged = 0;
         for (const change of scanned) {
-            if (change.server_version <= minCursor.last_seen_version && change.created_at < cutoff) {
+            if (change.server_version <= state.minimumVersion && change.created_at < cutoff) {
                 await ctx.db.delete(change._id);
                 purged += 1;
             }
         }
-        return { purged, hasMore: page.length > batchSize, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
+        return { purged, hasMore: page.length > batchSize || state.hasMore, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
     },
 });
 
@@ -2682,8 +2809,7 @@ export const gcChangeLog = internalMutation({
  * `sync.runWorkspaceGc` (internal mutation)
  *
  * Purpose:
- * Compatibility entry point for deployments that still have a scheduled call.
- * It performs no queries, deletes, or continuation scheduling.
+ * Collects one bounded workspace page and schedules continuation separately.
  */
 export const runWorkspaceGc = internalMutation({
     args: {
@@ -2713,7 +2839,7 @@ export const runWorkspaceGc = internalMutation({
         let purged = 0;
         let continuation = args.continuation_count ?? 0;
         let hasMore = true;
-        while (hasMore && continuation < MAX_SYNC_GC_CONTINUATIONS) {
+        if (continuation < MAX_SYNC_GC_CONTINUATIONS) {
             const tomb = await (gcTombstones as unknown as {
                 _handler: (ctx: MutationCtx, args: Record<string, unknown>) => Promise<{
                     purged: number; hasMore: boolean; nextCursor: number;
@@ -2721,6 +2847,7 @@ export const runWorkspaceGc = internalMutation({
             })._handler(ctx, {
                 workspace_id: args.workspace_id,
                 retention_seconds: args.retention_seconds ?? MIN_SYNC_RETENTION_SECONDS,
+                batch_size: args.batch_size,
                 cursor: tombstoneCursor,
             });
             const log = await (gcChangeLog as unknown as {
@@ -2730,6 +2857,7 @@ export const runWorkspaceGc = internalMutation({
             })._handler(ctx, {
                 workspace_id: args.workspace_id,
                 retention_seconds: args.retention_seconds ?? MIN_SYNC_RETENTION_SECONDS,
+                batch_size: args.batch_size,
                 cursor: changelogCursor,
             });
             purged += tomb.purged + log.purged;
@@ -2737,7 +2865,16 @@ export const runWorkspaceGc = internalMutation({
             changelogCursor = log.nextCursor;
             hasMore = tomb.hasMore || log.hasMore;
             continuation += 1;
-            if (!hasMore) break;
+        }
+        if (hasMore && continuation < MAX_SYNC_GC_CONTINUATIONS) {
+            await ctx.scheduler.runAfter(0, makeFunctionReference<'mutation'>('sync:runWorkspaceGc'), {
+                workspace_id: args.workspace_id,
+                retention_seconds: args.retention_seconds,
+                batch_size: args.batch_size,
+                tombstone_cursor: tombstoneCursor,
+                changelog_cursor: changelogCursor,
+                continuation_count: continuation,
+            });
         }
         return {
             purged,
@@ -2753,12 +2890,11 @@ export const runWorkspaceGc = internalMutation({
  * `sync.runScheduledGc` (internal mutation)
  *
  * Purpose:
- * Compatibility entry point for existing deployments. It does not inspect
- * workspaces or schedule collection while snapshot bootstrap is unavailable.
+ * Schedules bounded collection for every workspace using paginated enumeration.
  */
 export const runScheduledGc = internalMutation({
-    args: {},
-    handler: async (ctx) => {
+    args: { cursor: v.optional(v.string()) },
+    handler: async (ctx, args) => {
         if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
             return {
                 workspacesScheduled: 0,
@@ -2766,14 +2902,15 @@ export const runScheduledGc = internalMutation({
                 reason: SYNC_HISTORY_GC_POLICY.reason,
             };
         }
-        const workspaces = await ctx.db.query('workspaces').take(100);
-        for (const workspace of workspaces) {
-            await (runWorkspaceGc as unknown as {
-                _handler: (ctx: MutationCtx, args: { workspace_id: Id<'workspaces'> }) => Promise<unknown>;
-            })._handler(ctx, { workspace_id: workspace._id });
+        const workspaces = await ctx.db.query('workspaces').paginate({ numItems: 100, cursor: args.cursor ?? null });
+        for (const workspace of workspaces.page) {
+            await ctx.scheduler.runAfter(0, makeFunctionReference<'mutation'>('sync:runWorkspaceGc'), { workspace_id: workspace._id });
+        }
+        if (!workspaces.isDone) {
+            await ctx.scheduler.runAfter(0, makeFunctionReference<'mutation'>('sync:runScheduledGc'), { cursor: workspaces.continueCursor });
         }
         return {
-            workspacesScheduled: workspaces.length,
+            workspacesScheduled: workspaces.page.length,
             disabled: false,
         };
     },

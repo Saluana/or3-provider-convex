@@ -331,6 +331,11 @@ export const commitUpload = internalMutation({
             q.eq('storage_id', args.storage_id))
             .filter((q: any) => q.neq(q.field('workspace_id'), args.workspace_id)).first();
         if (foreign) throw new Error('Storage object belongs to another workspace');
+        const existing = await ctx.db.query('file_meta')
+            .withIndex('by_workspace_hash', (q: any) =>
+                q.eq('workspace_id', args.workspace_id).eq('hash', args.hash)).first();
+        // syncAuthoring preserves a winning deletion while publishing verified
+        // replacement bytes. Only an explicit canonical restore makes it live.
         // Receipt and canonical metadata commit atomically. Admission below
         // verifies this binding even for server-authored sync operations.
         await ctx.db.patch(intent._id, {
@@ -338,13 +343,6 @@ export const commitUpload = internalMutation({
             storage_provider_id: args.storage_provider_id, consumed_at: nowSec(),
         });
         await releaseStorageDeletion(ctx, args.workspace_id, args.hash);
-        const existing = await ctx.db
-            .query('file_meta')
-            .withIndex('by_workspace_hash', (q: any) =>
-                q.eq('workspace_id', args.workspace_id).eq('hash', args.hash)
-            )
-            .first();
-
         if (existing) {
             await applyServerAuthoredOp(ctx, args.workspace_id, {
                 table: 'file_meta',

@@ -213,6 +213,7 @@ export type SyncScope<T = any, U = any, V = any, W = any, X = any> = any;
 export const SyncScope: any = undefined;
 export type SyncSubscribeOptions<T = any, U = any, V = any, W = any, X = any> = any;
 export const SyncSubscribeOptions: any = undefined;
+export type SyncRequestOptions = { signal?: AbortSignal };
 export type TerminalGenerationSnapshot<T = any, U = any, V = any, W = any, X = any> = any;
 export const TerminalGenerationSnapshot: any = undefined;
 export type useAuthTokenBroker<T = any, U = any, V = any, W = any, X = any> = any;

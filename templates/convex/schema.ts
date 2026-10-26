@@ -171,6 +171,7 @@ export default defineSchema({
         device_id: v.string(),
         op_id: v.string(), // UUID for idempotency
         created_at: v.number(),
+        request_fingerprint: v.optional(v.string()),
     })
         .index('by_workspace_version', ['workspace_id', 'server_version'])
         .index('by_op_id', ['op_id']),
@@ -194,6 +195,8 @@ export default defineSchema({
         updated_at: v.number(),
     })
         .index('by_workspace_device', ['workspace_id', 'device_id'])
+        .index('by_workspace_user_device', ['workspace_id', 'owner_user_id', 'device_id'])
+        .index('by_workspace_updated', ['workspace_id', 'updated_at'])
         .index('by_workspace_version', ['workspace_id', 'last_seen_version']),
 
     /**
@@ -225,6 +228,7 @@ export default defineSchema({
         expires_at: v.number(),
     })
         .index('by_workspace', ['workspace_id'])
+        .index('by_workspace_expiry', ['workspace_id', 'expires_at'])
         .index('by_expires_at', ['expires_at']),
 
     /**
@@ -242,7 +246,8 @@ export default defineSchema({
         hlc: v.string(),
         op_id: v.string(),
         server_deleted_at: v.optional(v.number()),
-    }).index('by_workspace_table_pk_version', [
+        retain_until: v.optional(v.number()),
+    }).index('by_workspace_expiry', ['workspace_id', 'retain_until']).index('by_workspace_version', ['workspace_id', 'server_version']).index('by_workspace_table_pk_version', [
         'workspace_id',
         'table_name',
         'pk',

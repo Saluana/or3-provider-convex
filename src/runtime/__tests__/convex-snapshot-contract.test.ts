@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getFunctionName } from "convex/server";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import { ChangeStampSchema } from "~~/shared/sync/schemas";
 import { readRequestUsage } from "~~/shared/chat/compaction";
@@ -70,6 +72,9 @@ function uuidOp(label: string): string {
 const INDEX_FIELDS: Record<string, string[]> = {
   by_provider: ["provider", "provider_user_id"],
   by_workspace_user: ["workspace_id", "user_id"],
+  by_workspace_user_device: ["workspace_id", "owner_user_id", "device_id"],
+  by_workspace_updated: ["workspace_id", "updated_at"],
+  by_workspace_expiry: ["workspace_id", "expires_at", "retain_until"],
   by_workspace: ["workspace_id"],
   by_workspace_id: ["workspace_id", "id"],
   by_workspace_hash: ["workspace_id", "hash"],
@@ -296,6 +301,13 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
         .find((candidate) => candidate._id === id);
       if (!row) throw new Error(`Missing row: ${id}`);
       Object.assign(row, value);
+    },
+    replace: async (id: string, value: Record<string, unknown>) => {
+      for (const rows of Object.values(tables)) {
+        const index = rows.findIndex((candidate) => candidate._id === id);
+        if (index >= 0) { rows[index] = { _id: id, ...value }; return; }
+      }
+      throw new Error(`Missing row: ${id}`);
     },
     delete: async (id: string) => {
       for (const rows of Object.values(tables)) {
@@ -1019,6 +1031,7 @@ describe("Convex materialized snapshot contract", () => {
             thread_id: "thread-a",
             role: "user",
             index: 1,
+            order_key: "1", created_at: 1, updated_at: 1,
             deleted: false,
           },
           clock: 5,
@@ -1044,6 +1057,7 @@ describe("Convex materialized snapshot contract", () => {
             thread_id: "thread-a",
             role: "user",
             index: 1,
+            order_key: "1", created_at: 1, updated_at: 1,
             deleted: false,
           },
           clock: 5,
@@ -1082,6 +1096,7 @@ describe("Convex materialized snapshot contract", () => {
           size_bytes: 10,
           ref_count: 999_999,
           deleted: false,
+          created_at: 1, updated_at: 1,
         },
         clock: 1,
         hlc: "1:0:device-a",
@@ -1099,7 +1114,7 @@ describe("Convex materialized snapshot contract", () => {
         table_name: "file_meta",
         operation: "put",
         pk: hash,
-        payload: { hash, name: "renamed.png", ref_count: -123 },
+        payload: { hash, name: "renamed.png", ref_count: -123, mime_type: "image/png", kind: "image", size_bytes: 10, deleted: false, created_at: 1, updated_at: 2 },
         clock: 2,
         hlc: "2:0:device-a",
         device_id: "device-a",
@@ -1148,7 +1163,7 @@ describe("Convex materialized snapshot contract", () => {
       table_name: "threads",
       operation: "put",
       pk: "thread-identical",
-      payload: { id: "thread-identical", title: "one write" },
+      payload: { id: "thread-identical", title: "one write", status: "active", deleted: false, pinned: false, forked: false, created_at: 1, updated_at: 1 },
       clock: 6,
       hlc: "6:0:device-a",
       device_id: "device-a",
@@ -1158,7 +1173,7 @@ describe("Convex materialized snapshot contract", () => {
       workspace_id: "ws-1",
       ops: [
         op,
-        { ...op, payload: { title: "one write", id: "thread-identical" } },
+        { ...op, payload: { ...op.payload, title: "one write", id: "thread-identical" } },
       ],
     });
 
@@ -1262,7 +1277,7 @@ describe("Convex materialized snapshot contract", () => {
           table_name: "threads",
           operation: "put",
           pk: "thread-valid",
-          payload: { id: "thread-valid", title: "valid" },
+          payload: { id: "thread-valid", title: "valid", status: "active", deleted: false, pinned: false, forked: false, created_at: 1, updated_at: 1 },
           clock: 6,
           hlc: "6:0:device-a",
           device_id: "device-a",
@@ -1655,7 +1670,8 @@ describe("Convex materialized snapshot contract", () => {
     expect(next.items).toMatchObject([{ kind: 'row', payload: { hash: second.hash, deleted: true, storage_id: 'old-blob' } }]);
   });
 
-  it("ships the snapshot mutation, schema, helper, and typechecked configuration", () => {
+  it("ships every tested template source without omissions or stale bytes", () => {
+    const templateRoot = new URL("../../../templates/convex/", import.meta.url);
     const packPath = new URL(
       "../../../templates/convex.pack.json.gz",
       import.meta.url,
@@ -1663,33 +1679,15 @@ describe("Convex materialized snapshot contract", () => {
     const packed = JSON.parse(
       gunzipSync(readFileSync(packPath)).toString("utf8"),
     ) as { files: Record<string, string> };
-    expect(packed.files["sync.ts"]).toContain(
-      "export const snapshot = mutation",
-    );
-    expect(packed.files["sync.ts"]).toContain(
-      "export const queryCanonicalStorage = query",
-    );
-    expect(packed.files["sync.ts"]).toContain(
-      "Conflicting operations reuse op_id",
-    );
-    expect(packed.files["sync.ts"]).toContain(
-      "must match operation pk",
-    );
-    expect(packed.files["sync.ts"]).toContain(
-      "const shouldApplyDelete = incomingWinsStoredRevision",
-    );
-    expect(packed.files["sync.ts"]).toContain(
-      "from './tableMetadata'",
-    );
-    expect(packed.files["tableMetadata.ts"]).toContain(
-      "export function getPkField",
-    );
-    expect(packed.files["schema.ts"]).toContain(
-      "sync_snapshot_sessions: defineTable",
-    );
-    expect(packed.files["snapshot.ts"]).toContain("resolveSnapshotWinner");
-    expect(packed.files["tsconfig.json"]).toContain('"strict": true');
-    expect(packed.files["tsconfig.json"]).toContain('"noEmit": true');
-
+    const root = fileURLToPath(templateRoot);
+    const files = readdirSync(root, { recursive: true, withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name !== '.DS_Store')
+      .map(entry => relative(root, join(entry.parentPath, entry.name)).split(sep).join('/'))
+      .sort();
+    expect(files.length).toBeGreaterThan(0);
+    expect(Object.keys(packed.files).sort()).toEqual(files);
+    for (const name of files) {
+      expect(packed.files[name], name).toBe(readFileSync(new URL(name, templateRoot), 'utf8'));
+    }
   });
 });

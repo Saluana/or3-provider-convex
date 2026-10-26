@@ -281,9 +281,9 @@ describe('Convex persisted upload intents', () => {
     const operation = (table_name: string, pk: string, payload: any) => ({ op_id: crypto.randomUUID(), table_name, pk, payload,
       operation: 'put', clock: 2_000_000_000, hlc: '2000000000:0:stale', device_id: 'stale-device' });
     const reference = () => operation('posts', 'stale-document', { id: 'stale-document', post_type: 'doc', title: 'Stale reference',
-      content: '{}', file_hashes: JSON.stringify([hash]), deleted: false });
+      content: '{}', file_hashes: JSON.stringify([hash]), deleted: false, created_at: 1, updated_at: 1 });
     const metadata = () => operation('file_meta', hash, { hash, name: 'Stale original', mime_type: 'text/plain', kind: 'file', size_bytes: 1,
-      storage_id: 'old-blob', storage_provider_id: storageProviderId, deleted: false });
+      storage_id: 'old-blob', storage_provider_id: storageProviderId, deleted: false, created_at: 1, updated_at: 1 });
     for (const op of [reference(), metadata()]) {
       const receipt = await push(f.ctx, { workspace_id: 'ws-1', workspace_item_capability: 'v1', ops: [op] });
       expect(receipt.results[0]).toMatchObject({ success: false });

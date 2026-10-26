@@ -1,5 +1,53 @@
 # or3-provider-convex
 
+## Sync recovery and retention
+
+Deploy the rebuilt runtime and all matching Convex templates together. Public
+`sync.push` validates complete canonical put records and revision stamps before
+allocating versions. A put replaces the record, including clearing omitted
+optional fields. Invalid operations receive validation results; unexpected write
+failures abort the whole Convex transaction so retries cannot observe partial
+canonical writes or version gaps. Exact retries return `replayed: true`,
+`applied: false`, and the current canonical `winner`; losing writes also return
+the live or deleted winner. Server-authored events preserve canonical creation
+timestamps and emit complete payloads.
+
+Snapshots admit versionless legacy rows at baseline version zero and preserve
+that baseline in pre-images. No destructive backfill is required. Snapshot
+sessions expire after one hour. Pre-images carry a lease lasting at least as long
+as every session which can need them; bounded GC removes expired sessions and
+history and conservatively leases pre-upgrade history. Cursor ownership uses
+workspace, authenticated user, and device. Devices inactive longer than the
+configured history retention window retire; a returning device whose history
+was collected must bootstrap from a snapshot. Scheduled GC yields between
+bounded workspace transactions and paginates all workspaces.
+
+Native upload completion can replace verified bytes while retaining deleted
+file metadata and publishing that deleted state to peers. Restore the canonical
+file explicitly afterward to make it live. An already consumed
+upload receipt remains an acknowledgment and cannot rewrite a later deletion.
+Byte completion preserves the base semantic clock (zero for new metadata) and
+advances its bounded HLC, so a queued delete or restore from that base wins even
+when the storage commit arrives first.
+Direct sync methods enforce a 30-second deadline and accept optional cancellation signals; cancellation fences
+the caller's wait, while a transmitted mutation may still commit and must be
+retried using the same operation ID. Reactive delivery waits for the host's page
+acknowledgment before advancing; failed application leaves the cursor available
+for redelivery.
+
+Real backend recovery qualification (official cached binary; loopback only):
+
+```sh
+bun run test:sync-hardening /absolute/path/to/.cache/convex/binaries/<build>/convex-local-backend /tmp/or3-sync-evidence
+```
+
+The command creates an isolated backend, checks real Convex schema validation,
+native storage, rollback, snapshot retention, concurrent writes, outage recovery,
+and process crash/restart. It writes `sync-hardening.json` in the evidence folder
+and stops the backend; no deployed URL or operator environment file is accepted.
+The provider qualification workflow runs this lane with its checksum-verified
+local backend binary after the packaged lifecycle checks.
+
 Convex sync, storage, and backend provider for OR3 Chat. Provides real-time sync, cloud file storage, rate limiting, background jobs, and workspace management via Convex.
 
 Requires **Node.js 24.22.1 or newer on the 24.x line**, matching OR3 Chat. Development and CI pin **24.22.1** in `.node-version`.

@@ -688,6 +688,7 @@ describe('Convex authorization boundary', () => {
                     payload: {
                         id: 'notification-cross-user',
                         user_id: 'user-2',
+                        type: 'test', title: 'Foreign', deleted: false, created_at: 1, updated_at: 1,
                     },
                     clock: 1,
                     hlc: '1:device',
@@ -720,6 +721,7 @@ describe('Convex authorization boundary', () => {
                             type: 'test',
                             title: 'Own notification',
                             deleted: false,
+                            created_at: 1, updated_at: 1,
                         },
                         clock: 1,
                         hlc: '1:device',
