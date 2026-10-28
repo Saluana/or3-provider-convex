@@ -431,7 +431,13 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         }) as AdmitChatGenerationResult & { hookRows?: Array<{ tableName: 'threads' | 'messages'; payload: Record<string, unknown>; wasExisting: boolean; applied: boolean }> };
         for (const row of result.hookRows ?? []) {
             if (result.replayed || row.wasExisting || !row.applied) continue;
-            const op = { tableName: row.tableName, operation: 'put', pk: row.payload.id, payload: row.payload } as PendingOp;
+            const op: PendingOp = {
+                id: String(row.payload.id), tableName: row.tableName, operation: 'put',
+                pk: String(row.payload.id), payload: row.payload,
+                stamp: { opId: String(row.payload.op_id), deviceId: backgroundHistoryDeviceId(admission.generationId),
+                    hlc: String(row.payload.hlc), clock: Number(row.payload.clock) },
+                createdAt: nowEpoch(), attempts: 0, status: 'pending',
+            };
             const emission = resolveHookEmission({ op, workspaceId: admission.workspaceId, now: nowEpoch(), userId: actor.userId, wasExisting: row.wasExisting, applied: row.applied });
             if (emission) {
                 try {
