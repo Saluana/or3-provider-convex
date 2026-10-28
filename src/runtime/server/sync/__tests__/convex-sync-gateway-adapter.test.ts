@@ -39,6 +39,8 @@ vi.mock('~~/server/utils/webhooks/runtime', () => ({
     emitWebhookSystemHook: (...args: unknown[]) => emitWebhookSystemHookMock(...args),
 }));
 
+vi.mock('../../utils/convex-client', () => ({ getConvexClient: () => ({ mutation: (...args: unknown[]) => mutationMock(...args) }) }));
+
 const queryMock = vi.hoisted(() => vi.fn());
 const mutationMock = vi.hoisted(() => vi.fn());
 const getConvexAdminGatewayClientMock = vi.hoisted(() => vi.fn(() => ({
@@ -341,6 +343,38 @@ describe('ConvexSyncGatewayAdapter', () => {
             expect(call[1]).toEqual({ providerId: 'convex', template: 'convex' });
         }
         expect(resolveProviderTokenMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('emits admitted creates once and skips an existing thread', async () => {
+        const adapter = new ConvexSyncGatewayAdapter();
+        const actor = { userId: 'user-1', workspaceId: 'ws-1' };
+        const admission = { version: 1 as const, kind: 'new-turn' as const, admissionId: 'admission-1', generationId: 'generation-1', workspaceId: 'ws-1', threadId: 'thread-1', messageId: 'assistant-1',
+            thread: { id: 'thread-1', clock: 1, title: 'Chat' },
+            userMessage: { id: 'message-1', thread_id: 'thread-1', role: 'user', clock: 1 },
+            assistantMessage: { id: 'assistant-1', thread_id: 'thread-1', role: 'assistant', clock: 1, data: { generation_id: 'generation-1' } },
+        };
+        const rows = [
+            { tableName: 'threads', payload: admission.thread, wasExisting: false, applied: true },
+            { tableName: 'messages', payload: admission.userMessage, wasExisting: false, applied: true },
+        ];
+        mutationMock.mockResolvedValueOnce({ status: 'admitted', replayed: false, serverVersion: 3, hookRows: rows })
+            .mockResolvedValueOnce({ status: 'admitted', replayed: true, serverVersion: 3 })
+            .mockResolvedValueOnce({ status: 'admitted', replayed: false, serverVersion: 6, hookRows: [{ ...rows[0], wasExisting: true }] });
+        await adapter.admitChatGeneration(actor, admission);
+        expect(emitWebhookSystemHookMock.mock.calls.map((call) => call[0])).toEqual(['db.threads.create:action:after', 'db.messages.create:action:after']);
+        expect(emitWebhookSystemHookMock).toHaveBeenCalledWith('db.messages.create:action:after', expect.objectContaining({ id: 'message-1', workspace_id: 'ws-1', user_id: 'user-1' }));
+        emitWebhookSystemHookMock.mockClear();
+        await adapter.admitChatGeneration(actor, admission);
+        expect(emitWebhookSystemHookMock).not.toHaveBeenCalled();
+        await adapter.admitChatGeneration(actor, admission);
+        expect(emitWebhookSystemHookMock.mock.calls.map((call) => call[0])).not.toContain('db.threads.create:action:after');
+        mutationMock.mockResolvedValueOnce({ status: 'admitted', replayed: false, serverVersion: 9, hookRows: rows });
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+        emitWebhookSystemHookMock.mockRejectedValueOnce(new Error('hook failed'));
+        try {
+            await expect(adapter.admitChatGeneration(actor, admission)).resolves.toMatchObject({ status: 'admitted' });
+            expect(emitWebhookSystemHookMock).toHaveBeenLastCalledWith('db.messages.create:action:after', expect.objectContaining({ id: 'message-1' }));
+        } finally { errorLog.mockRestore(); }
     });
 
     it('emits webhook runtime hooks for successful push operations', async () => {

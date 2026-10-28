@@ -417,7 +417,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                 ),
             };
         });
-        return await getConvexClient().mutation(internalApi.sync.admitChatGeneration, {
+        const result = await getConvexClient().mutation(internalApi.sync.admitChatGeneration, {
             workspace_id: toWorkspaceId(admission.workspaceId),
             actor_user_id: actor.userId as Id<'users'>,
             generation_id: admission.generationId,
@@ -428,7 +428,21 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
             fingerprint: fingerprint(admission),
             device_id: backgroundHistoryDeviceId(admission.generationId),
             records,
-        }) as AdmitChatGenerationResult;
+        }) as AdmitChatGenerationResult & { hookRows?: Array<{ tableName: 'threads' | 'messages'; payload: Record<string, unknown>; wasExisting: boolean; applied: boolean }> };
+        for (const row of result.hookRows ?? []) {
+            if (result.replayed || row.wasExisting || !row.applied) continue;
+            const op = { tableName: row.tableName, operation: 'put', pk: row.payload.id, payload: row.payload } as PendingOp;
+            const emission = resolveHookEmission({ op, workspaceId: admission.workspaceId, now: nowEpoch(), userId: actor.userId, wasExisting: row.wasExisting, applied: row.applied });
+            if (emission) {
+                try {
+                    await emitWebhookSystemHook(emission.hookName, emission.payload);
+                } catch (error) {
+                    console.error('[or3-convex] Background admission hook failed', error);
+                }
+            }
+        }
+        const { hookRows: _hookRows, ...admitted } = result;
+        return admitted;
     }
 
     async finalizeChatGeneration(

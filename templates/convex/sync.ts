@@ -1650,6 +1650,7 @@ export const admitChatGeneration = internalMutation({
             args.records.length
         );
         const preimageVersion = startVersion - 1;
+        const hookRows: Array<{ tableName: 'threads' | 'messages'; payload: Record<string, unknown>; wasExisting: boolean; applied: boolean }> = [];
         for (let offset = 0; offset < args.records.length; offset += 1) {
             const entry = args.records[offset]!;
             const record = entry.record as Record<string, unknown>;
@@ -1672,7 +1673,7 @@ export const admitChatGeneration = internalMutation({
                 throw new Error('Invalid background history payload size');
             }
             const serverVersion = startVersion + offset;
-            await applyOpToTable(ctx, args.workspace_id, {
+            const applyResult = await applyOpToTable(ctx, args.workspace_id, {
                 table_name: entry.table_name,
                 operation: 'put',
                 pk,
@@ -1681,6 +1682,9 @@ export const admitChatGeneration = internalMutation({
                 hlc,
                 op_id: entry.op_id,
             }, serverVersion, preimageVersion);
+            if (entry.table_name === 'threads' || pk !== args.message_id) {
+                hookRows.push({ tableName: entry.table_name, payload, ...applyResult });
+            }
             await ctx.db.insert('change_log', {
                 workspace_id: args.workspace_id,
                 server_version: serverVersion,
@@ -1720,7 +1724,7 @@ export const admitChatGeneration = internalMutation({
             server_version: serverVersion,
             created_at: nowSec(),
         });
-        return { status: 'admitted' as const, replayed: false, serverVersion };
+        return { status: 'admitted' as const, replayed: false, serverVersion, hookRows };
     },
 });
 
