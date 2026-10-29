@@ -38,11 +38,11 @@ import type {
     PushResult,
     PendingOp,
     SyncSubscribeOptions,
+    SyncRequestOptions,
 } from '~~/shared/sync/types';
 import {
     PullResponseSchema,
     SnapshotResponseSchema,
-    SyncChangesSchema,
     PushResultSchema,
 } from '~~/shared/sync/schemas';
 import type { GenericId as Id } from 'convex/values';
@@ -53,6 +53,19 @@ const SYNCED_TABLES = ['threads', 'messages', 'projects', 'posts', 'kv', 'file_m
 
 /** Type for the Convex client */
 type ConvexClient = ReturnType<typeof useConvexClient>;
+
+function requestWithSignal<T>(request: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) return Promise.reject(new DOMException('Sync request aborted', 'AbortError'));
+    return new Promise<T>((resolve, reject) => {
+        const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); };
+        const abort = () => { cleanup(); reject(new DOMException('Sync request aborted', 'AbortError')); };
+        const timer = setTimeout(() => { cleanup(); reject(new DOMException('Sync request timed out', 'TimeoutError')); }, 30_000);
+        signal?.addEventListener('abort', abort, { once: true });
+        try {
+            request().then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+        } catch (error) { cleanup(); reject(error); }
+    });
+}
 
 /**
  * Purpose:
@@ -79,6 +92,7 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         },
         capabilities: {
             snapshotBootstrap: 'snapshot-v1',
+            subscriptionPages: 'v1',
         },
 
         async subscribe(
@@ -93,62 +107,63 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             const limit = options?.limit ?? 200;
             let unwatch: (() => void) | undefined;
 
-            const startWatch = () => {
-                return client.onUpdate(
-                    api.sync.watchChanges,
-                    {
-                        workspace_id: scope.workspaceId as Id<'workspaces'>,
-                        workspace_item_capability: 'v1',
-                        cursor: currentCursor,
-                        limit,
-                    },
-                    (result) => {
-                        if (disposed) return;
-
-                        try {
-                            const safeChanges = SyncChangesSchema.safeParse(
-                                result.changes
-                            );
-                            if (!safeChanges.success) {
-                                console.error('[convex-sync] Invalid watch changes:', safeChanges.error);
-                                return;
+            let generation = 0;
+            let delivering = false;
+            let pending: unknown;
+            const startWatch = (): (() => void) => {
+                const watchGeneration = ++generation;
+                const fromCursor = currentCursor;
+                const deliver = async () => {
+                    if (delivering) return;
+                    delivering = true;
+                    let restart = false;
+                    try {
+                        while (pending !== undefined && !disposed && generation === watchGeneration) {
+                            const result = pending;
+                            pending = undefined;
+                            const page = PullResponseSchema.parse(result);
+                            if (page.nextCursor < fromCursor || page.changes.some(change => change.serverVersion <= fromCursor)) {
+                                throw new Error('Watch page does not follow its requested cursor');
                             }
-
-                            const changes = safeChanges.data;
                             const filtered = tables.length > 0
-                                ? changes.filter((c) => tables.includes(c.tableName))
-                                : changes;
-                            onChanges(filtered);
-
-                            const latestVersion = Number(result.latestVersion);
-                            if (
-                                Number.isFinite(latestVersion) &&
-                                latestVersion > currentCursor
-                            ) {
-                                currentCursor = latestVersion;
-                                if (typeof unwatch === 'function') {
-                                    try {
-                                        unwatch();
-                                    } catch {
-                                        // Watcher may already be torn down.
-                                    }
-                                }
-                                if (!disposed) {
-                                    unwatch = startWatch();
-                                }
+                                ? { ...page, changes: page.changes.filter(change => tables.includes(change.tableName)) }
+                                : page;
+                            if (options?.onPage) await options.onPage(fromCursor, filtered);
+                            else await onChanges(filtered.changes);
+                            if (disposed || generation !== watchGeneration) return;
+                            if (page.requiresSnapshot) return;
+                            if (page.nextCursor > currentCursor) {
+                                currentCursor = page.nextCursor;
+                                pending = undefined;
+                                try { unwatch?.(); } catch { /* Already torn down. */ }
+                                restart = true;
+                                break;
                             }
-                        } catch (error) {
-                            console.error('[convex-sync] onChanges error:', error);
                         }
-                    }
-                );
+                    } catch (error) {
+                        pending = undefined;
+                        console.error('[convex-sync] Watch page was not acknowledged:', error);
+                    } finally { delivering = false; }
+                    if (restart && !disposed && generation === watchGeneration) unwatch = startWatch();
+                };
+                return client.onUpdate(api.sync.pull, {
+                    workspace_id: scope.workspaceId as Id<'workspaces'>,
+                    workspace_item_capability: 'v1', cursor: fromCursor, limit,
+                    tables: tables.length > 0 ? tables : undefined,
+                }, result => {
+                    if (disposed || generation !== watchGeneration) return;
+                    pending = result;
+                    void deliver();
+                });
             };
 
             unwatch = startWatch();
 
             const key = `${scope.workspaceId}:${tablesToWatch.join(',')}:${options?.cursor ?? 0}:${limit}`;
             const cleanup = () => {
+                if (disposed) return;
                 disposed = true;
+                if (subscriptions.get(key) === cleanup) subscriptions.delete(key);
                 if (typeof unwatch === 'function') {
                 try {
                     unwatch();
@@ -166,19 +181,20 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
                 }
                 }
             };
+            subscriptions.get(key)?.();
             subscriptions.set(key, cleanup);
 
             return cleanup;
         },
 
-        async pull(request: PullRequest): Promise<PullResponse> {
-            const result = await client.query(api.sync.pull, {
+        async pull(request: PullRequest, options?: SyncRequestOptions): Promise<PullResponse> {
+            const result = await requestWithSignal(() => client.query(api.sync.pull, {
                 workspace_id: request.scope.workspaceId as Id<'workspaces'>,
                 workspace_item_capability: 'v1',
                 cursor: request.cursor,
                 limit: request.limit,
                 tables: request.tables,
-            });
+            }), options?.signal);
 
             // Validate response to catch malformed server data
             const parsed = PullResponseSchema.safeParse({
@@ -197,14 +213,14 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             return parsed.data;
         },
 
-        async snapshot(request: SnapshotRequest): Promise<SnapshotResponse> {
-            const result = await client.mutation(api.sync.snapshot, {
+        async snapshot(request: SnapshotRequest, options?: SyncRequestOptions): Promise<SnapshotResponse> {
+            const result = await requestWithSignal(() => client.mutation(api.sync.snapshot, {
                 workspace_id: request.scope.workspaceId as Id<'workspaces'>,
                 workspace_item_capability: 'v1',
                 page_size: request.pageSize,
                 page_token: request.pageToken,
                 tables: request.tables,
-            });
+            }), options?.signal);
 
             const parsed = SnapshotResponseSchema.safeParse(result);
             if (!parsed.success) {
@@ -215,8 +231,8 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             return parsed.data;
         },
 
-        async push(batch: PushBatch): Promise<PushResult> {
-            const result = await client.mutation(api.sync.push, {
+        async push(batch: PushBatch, options?: SyncRequestOptions): Promise<PushResult> {
+            const result = await requestWithSignal(() => client.mutation(api.sync.push, {
                 workspace_id: batch.scope.workspaceId as Id<'workspaces'>,
                 workspace_item_capability: 'v1',
                 ops: batch.ops.map((op: PendingOp) => ({
@@ -229,7 +245,7 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
                     hlc: op.stamp.hlc,
                     device_id: op.stamp.deviceId,
                 })),
-            });
+            }), options?.signal);
 
             // Validate response for consistency with pull()
             const parsed = PushResultSchema.safeParse({
@@ -245,12 +261,12 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             return parsed.data;
         },
 
-        async updateCursor(scope: SyncScope, deviceId: string, version: number): Promise<void> {
-            await client.mutation(api.sync.updateDeviceCursor, {
+        async updateCursor(scope: SyncScope, deviceId: string, version: number, options?: SyncRequestOptions): Promise<void> {
+            await requestWithSignal(() => client.mutation(api.sync.updateDeviceCursor, {
                 workspace_id: scope.workspaceId as Id<'workspaces'>,
                 device_id: deviceId,
                 last_seen_version: version,
-            });
+            }), options?.signal);
         },
 
         async dispose(): Promise<void> {

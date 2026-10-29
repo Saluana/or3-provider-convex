@@ -1,4 +1,3 @@
-import { recordRetainedStorage } from './storageUsage';
 import type { MutationCtx } from './_generated/server';
 import type { Id } from './_generated/dataModel';
 
@@ -40,7 +39,6 @@ export async function assertStorageNotDeleted(ctx: MutationCtx, workspaceId: Id<
         }
     }
     if (row.deleted === true || !['file_meta', 'messages', 'posts'].includes(table)) {
-        if (table === 'file_meta') await recordRetainedStorage(ctx, workspaceId, row);
         return;
     }
     let hashes: string[] = [];
@@ -64,5 +62,4 @@ export async function assertStorageNotDeleted(ctx: MutationCtx, workspaceId: Id<
             throw new Error('Storage object no longer matches this file. Re-upload the original.');
         }
     }
-    if (table === 'file_meta') await recordRetainedStorage(ctx, workspaceId, row);
 }

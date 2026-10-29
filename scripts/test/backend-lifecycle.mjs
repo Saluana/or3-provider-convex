@@ -450,8 +450,13 @@ try {
         };
         const admitted = await internalAdmin.mutation('sync:admitChatGeneration', admission);
         assert.equal(admitted.status, 'admitted');
+        assert.deepEqual(admitted.hookRows.map(({ tableName, wasExisting, applied }) => ({ tableName, wasExisting, applied })), [
+            { tableName: 'threads', wasExisting: false, applied: true },
+            { tableName: 'messages', wasExisting: false, applied: true },
+        ]);
         const admissionReplay = await internalAdmin.mutation('sync:admitChatGeneration', admission);
         assert.equal(admissionReplay.replayed, true);
+        assert.equal(admissionReplay.hookRows, undefined);
         assert.equal(admissionReplay.serverVersion, admitted.serverVersion);
         const historyQuery = { workspace_id, actor_user_id: workspace.user_id, query: { kind: 'thread_page', thread_id: backgroundThread, limit: 10 } };
         const pendingHistory = await internalAdmin.query('sync:readChatHistory', historyQuery);

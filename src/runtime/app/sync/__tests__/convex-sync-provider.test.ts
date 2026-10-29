@@ -47,7 +47,7 @@ describe('createConvexSyncProvider', () => {
         const provider = createConvexSyncProvider(client as any);
         const onChanges = vi.fn();
 
-        let callback: ((result: { changes: unknown }) => void) | undefined;
+        let callback: ((result: { changes: unknown; nextCursor: number; hasMore: boolean; oldestRetainedVersion: number; requiresSnapshot: boolean }) => void) | undefined;
         onUpdateMock.mockImplementation((_query, _args, cb) => {
             callback = cb;
             return vi.fn();
@@ -56,6 +56,7 @@ describe('createConvexSyncProvider', () => {
         await provider.subscribe({ workspaceId: 'ws-1' }, ['messages'], onChanges);
 
         callback?.({
+            nextCursor: 2, hasMore: false, oldestRetainedVersion: 1, requiresSnapshot: false,
             changes: [
                 {
                     serverVersion: 1,
@@ -80,9 +81,10 @@ describe('createConvexSyncProvider', () => {
         expect(onChanges.mock.calls[0]?.[0]).toEqual([
             expect.objectContaining({ tableName: 'messages' }),
         ]);
+        await vi.waitFor(() => expect(onUpdateMock).toHaveBeenCalledTimes(2));
 
         const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        callback?.({ changes: [{ bad: 'shape' }] });
+        callback?.({ changes: [{ bad: 'shape' }], nextCursor: 2, hasMore: false, oldestRetainedVersion: 1, requiresSnapshot: false });
         expect(onChanges).toHaveBeenCalledTimes(1);
         expect(errorSpy).toHaveBeenCalled();
     });
@@ -93,6 +95,10 @@ describe('createConvexSyncProvider', () => {
         const callbacks: Array<(result: {
             changes: unknown[];
             latestVersion?: number;
+            nextCursor: number;
+            hasMore: boolean;
+            oldestRetainedVersion: number;
+            requiresSnapshot: boolean;
         }) => void> = [];
         onUpdateMock.mockImplementation((_query, args, cb) => {
             callbacks.push(cb);
@@ -121,10 +127,11 @@ describe('createConvexSyncProvider', () => {
                 },
             }],
             latestVersion: 4,
+            nextCursor: 4, hasMore: false, oldestRetainedVersion: 1, requiresSnapshot: false,
         });
 
         expect(onChanges).toHaveBeenCalledWith([]);
-        expect(onUpdateMock).toHaveBeenCalledTimes(2);
+        await vi.waitFor(() => expect(onUpdateMock).toHaveBeenCalledTimes(2));
         expect(onUpdateMock.mock.calls[1]?.[1]).toMatchObject({ cursor: 4 });
     });
 
@@ -143,6 +150,21 @@ describe('createConvexSyncProvider', () => {
         expect(warnSpy).not.toHaveBeenCalled();
     });
 
+    it('releases each watch once when completed subscriptions are later disposed', async () => {
+        // An unmounted client must release its callback and not retain an old
+        // watch until global disposal. Reusing the same scope must remain safe.
+        const stops = Array.from({ length: 3 }, () => vi.fn());
+        stops.forEach((stop) => onUpdateMock.mockReturnValueOnce(stop));
+        const provider = createConvexSyncProvider(client as any);
+        for (let cursor = 0; cursor < 3; cursor += 1) {
+            const stop = await provider.subscribe({ workspaceId: 'ws-1' }, ['messages'], vi.fn(), { cursor });
+            stop();
+            stop();
+        }
+        await provider.dispose?.();
+        stops.forEach((stop) => expect(stop).toHaveBeenCalledTimes(1));
+    });
+
     it('throws when pull response fails schema validation', async () => {
         const provider = createConvexSyncProvider(client as any);
         queryMock.mockResolvedValue({ changes: 'invalid', nextCursor: 1, hasMore: false });
@@ -150,6 +172,53 @@ describe('createConvexSyncProvider', () => {
         await expect(
             provider.pull({ scope: { workspaceId: 'ws-1' }, cursor: 0, limit: 10 })
         ).rejects.toThrow('Invalid pull response');
+    });
+
+    it('fences a cancelled direct request while its transport finishes later', async () => {
+        let finish!: (value: unknown) => void;
+        queryMock.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+        const provider = createConvexSyncProvider(client as any);
+        const controller = new AbortController();
+        const request = provider.pull({ scope: { workspaceId: 'ws-1' }, cursor: 0, limit: 10 }, { signal: controller.signal });
+        controller.abort();
+        await expect(request).rejects.toMatchObject({ name: 'AbortError' });
+        finish({ changes: [], nextCursor: 3, hasMore: false });
+        await expect(provider.pull({ scope: { workspaceId: 'ws-1' }, cursor: 0, limit: 10 }, { signal: controller.signal }))
+            .rejects.toMatchObject({ name: 'AbortError' });
+        expect(queryMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('times out an offline direct query and permits a later recovery request', async () => {
+        vi.useFakeTimers();
+        try {
+            queryMock.mockReturnValueOnce(new Promise(() => {}));
+            const provider = createConvexSyncProvider(client as any);
+            const waiting = provider.pull({ scope: { workspaceId: 'ws-1' }, cursor: 0, limit: 10 });
+            const rejected = expect(waiting).rejects.toMatchObject({ name: 'TimeoutError' });
+            await vi.advanceTimersByTimeAsync(30_000);
+            await rejected;
+            queryMock.mockResolvedValueOnce({ changes: [], nextCursor: 0, hasMore: false, oldestRetainedVersion: 1, requiresSnapshot: false });
+            await expect(provider.pull({ scope: { workspaceId: 'ws-1' }, cursor: 0, limit: 10 })).resolves.toMatchObject({ nextCursor: 0 });
+        } finally { vi.useRealTimers(); }
+    });
+
+    it('retains the cursor after a rejected page and advances only after successful redelivery', async () => {
+        const callbacks: Array<(value: unknown) => void> = [];
+        onUpdateMock.mockImplementation((_query, _args, callback) => { callbacks.push(callback); return vi.fn(); });
+        const provider = createConvexSyncProvider(client as any);
+        const onPage = vi.fn().mockRejectedValueOnce(new Error('Injected local apply failure')).mockResolvedValue(undefined);
+        const stop = await provider.subscribe({ workspaceId: 'ws-1' }, ['messages'], vi.fn(), { cursor: 0, onPage });
+        const page = { changes: [], nextCursor: 4, latestVersion: 4, hasMore: false, oldestRetainedVersion: 1, requiresSnapshot: false };
+        callbacks[0]?.(page);
+        await vi.waitFor(() => expect(onPage).toHaveBeenCalledTimes(1));
+        expect(onUpdateMock).toHaveBeenCalledTimes(1);
+        callbacks[0]?.(page);
+        callbacks[0]?.(page);
+        await vi.waitFor(() => expect(onUpdateMock).toHaveBeenCalledTimes(2));
+        expect(onPage).toHaveBeenCalledTimes(2);
+        expect(onPage).toHaveBeenLastCalledWith(0, expect.objectContaining({ nextCursor: 4 }));
+        expect(onUpdateMock.mock.calls[1]?.[1]).toMatchObject({ cursor: 4 });
+        stop();
     });
 
     it('throws when push response fails schema validation', async () => {

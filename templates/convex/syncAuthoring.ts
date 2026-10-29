@@ -4,7 +4,7 @@
  */
 import type { MutationCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
-import { recordMaterializedPreimage } from './snapshot';
+import { recordMaterializedPreimage, compareSnapshotRevisions, legacySnapshotRevision } from './snapshot';
 import { recordRetainedStorage } from './storageUsage';
 
 const UUID_RE =
@@ -63,6 +63,21 @@ function stripReserved(payload: Record<string, unknown>): Record<string, unknown
     return next;
 }
 
+/** Metadata must sort after its base without consuming a semantic clock tick. */
+function nextStorageMetadataHlc(value: string): string {
+    if (value.length < 512) return `${value}~`;
+    for (let index = Math.min(value.length, 512) - 1; index >= 0; index -= 1) {
+        const unit = value.charCodeAt(index);
+        // Do not leave the first half of a Unicode surrogate pair in a prefix.
+        if (unit >= 0xdc00 && unit <= 0xdfff && index > 0 &&
+            value.charCodeAt(index - 1) >= 0xd800 && value.charCodeAt(index - 1) <= 0xdbff) continue;
+        if (unit === 0xffff) continue;
+        const next = unit + 1 >= 0xd800 && unit + 1 <= 0xdfff ? 0xe000 : unit + 1;
+        return value.slice(0, index) + String.fromCharCode(next);
+    }
+    throw new Error('Cannot advance storage metadata revision');
+}
+
 export async function applyServerAuthoredOp(
     ctx: MutationCtx,
     workspaceId: Id<'workspaces'>,
@@ -76,7 +91,7 @@ export async function applyServerAuthoredOp(
     const tableInfo = TABLE_INDEX[op.table];
     const now = nowSec();
     const opId = crypto.randomUUID();
-    const hlc = `${now}:server:${opId.slice(0, 8)}`;
+    let hlc = `${now}:server:${opId.slice(0, 8)}`;
     const serverVersion = await allocateServerVersion(ctx, workspaceId);
     const payload = stripReserved(op.payload ?? {});
     if (op.table === 'file_meta' && op.operation === 'put') await recordRetainedStorage(ctx, workspaceId, { ...payload, hash: op.pk });
@@ -108,9 +123,14 @@ export async function applyServerAuthoredOp(
                 .eq('pk', op.pk)
         )
         .first();
-    // Wall time alone can move backwards relative to synced revisions, or
-    // repeat within a second. Advance the logical record, including deletions.
-    const clock = Math.max(now, (existing?.clock ?? 0) + 1, (tombstone?.clock ?? 0) + 1);
+    const storedRevisions = [existing, tombstone].filter((value): value is NonNullable<typeof value> => Boolean(value))
+        .map(value => legacySnapshotRevision(op.table, op.pk, value)).sort(compareSnapshotRevisions);
+    const base = storedRevisions.at(-1);
+    const storageCompletion = op.table === 'file_meta' && op.operation === 'put';
+    // Byte completion cannot outrank a delete captured from the same base.
+    // A new metadata row starts at zero; every client mutation advances it.
+    const clock = storageCompletion ? base?.clock ?? 0 : Math.max(now, (base?.clock ?? 0) + 1);
+    if (storageCompletion && base) hlc = nextStorageMetadataHlc(base.hlc);
     if (!Number.isSafeInteger(clock)) throw new Error('Cannot advance record revision');
 
     // Native uploads and server-authored writes participate in the same frozen
@@ -124,6 +144,23 @@ export async function applyServerAuthoredOp(
         server_version: serverVersion,
         updated_at: now,
     };
+    // Storage completion proves bytes, not an intention to restore a file.
+    const preserveDeletion = op.table === 'file_meta' && (existing?.deleted === true ||
+        Boolean(tombstone && (!existing || compareSnapshotRevisions(
+            legacySnapshotRevision(op.table, op.pk, tombstone),
+            legacySnapshotRevision(op.table, op.pk, existing)) >= 0)));
+    const deletedAt = preserveDeletion ? (typeof existing?.deleted_at === 'number' ? existing.deleted_at :
+        tombstone?.server_deleted_at ?? tombstone?.deleted_at ?? now) : undefined;
+    const canonicalPayload: Record<string, unknown> = {
+        ...stripReserved(existing ?? {}),
+        ...payload,
+        [tableInfo.pkField]: op.pk,
+        created_at: existing?.created_at ?? payload.created_at ?? now,
+        deleted: preserveDeletion,
+        ...stamps,
+    };
+    if (preserveDeletion) canonicalPayload.deleted_at = deletedAt;
+    else delete canonicalPayload.deleted_at;
 
     if (op.operation === 'delete') {
         if (existing) {
@@ -168,19 +205,14 @@ export async function applyServerAuthoredOp(
         }
     } else if (existing) {
         await ctx.db.patch(existing._id, {
-            ...payload,
-            deleted: false,
-            deleted_at: undefined,
-            ...stamps,
+            ...canonicalPayload,
+            deleted_at: deletedAt,
         });
     } else {
         await ctx.db.insert(tableInfo.table, {
             workspace_id: workspaceId,
             [tableInfo.pkField]: op.pk,
-            deleted: false,
-            created_at: now,
-            ...payload,
-            ...stamps,
+            ...canonicalPayload,
         } as never);
     }
 
@@ -190,7 +222,7 @@ export async function applyServerAuthoredOp(
         table_name: op.table,
         pk: op.pk,
         op: op.operation,
-        payload: op.operation === 'put' ? { ...payload, ...stamps, deleted: false } : undefined,
+        payload: op.operation === 'put' ? canonicalPayload : undefined,
         clock,
         hlc,
         device_id: 'server',

@@ -3,6 +3,7 @@ import type { MutationCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
 import { getPkField } from './tableMetadata';
 const nowSec = (): number => Math.floor(Date.now() / 1000);
+export const SNAPSHOT_TTL_SECONDS = 60 * 60;
 
 export type SnapshotRevision = {
     clock: number;
@@ -179,7 +180,9 @@ export function materializedSnapshotCandidate(
     serverVersionOverride?: number
 ): SnapshotCandidate {
     const revision = legacySnapshotRevision(tableName, pk, doc);
-    const serverVersion = serverVersionOverride ?? doc.server_version;
+    // Rows predating versioned sync existed before every current watermark.
+    // Keep that baseline when recording their first pre-image as well.
+    const serverVersion = serverVersionOverride ?? doc.server_version ?? 0;
     if (doc.deleted === true) {
         return {
             kind: 'tombstone',
@@ -216,13 +219,14 @@ export async function recordMaterializedPreimage(
         tableName,
         pk,
         doc,
-        doc.server_version ?? fallbackServerVersion
+        doc.server_version ?? 0
     );
     await ctx.db.insert('sync_record_versions', {
         workspace_id: workspaceId,
         table_name: tableName,
         pk,
         server_version: candidate.serverVersion ?? fallbackServerVersion,
+        retain_until: nowSec() + SNAPSHOT_TTL_SECONDS,
         kind: candidate.kind,
         payload: candidate.kind === 'row' || tableName === 'file_meta' ? candidate.payload : undefined,
         clock: candidate.revision.clock,

@@ -1,6 +1,6 @@
 {
     "name": "or3-provider-convex",
-    "version": "0.0.24",
+    "version": "0.0.25",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/Saluana/or3-provider-convex.git"
@@ -51,6 +51,7 @@
         "type-check:standalone": "tsc -p tsconfig.release.json --noEmit",
         "test:release": "vitest run --config vitest.release.config.ts",
         "test:backend-lifecycle": "bun scripts/test/backend-lifecycle.mjs",
+        "test:sync-hardening": "bun scripts/test/sync-hardening.mjs",
         "init": "node ./scripts/init.mjs",
         "test": "vitest run"
     },
