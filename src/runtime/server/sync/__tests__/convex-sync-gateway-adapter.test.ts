@@ -345,6 +345,16 @@ describe('ConvexSyncGatewayAdapter', () => {
         expect(resolveProviderTokenMock).toHaveBeenCalledTimes(3);
     });
 
+    it('preserves structured backend history failures at the adapter boundary', async () => {
+        const adapter = new ConvexSyncGatewayAdapter();
+        const actor = { userId: 'user-1', workspaceId: 'ws-1' };
+        const admission = { version: 1 as const, kind: 'new-turn' as const, admissionId: 'admission-1', generationId: 'generation-1', workspaceId: 'ws-1', threadId: 'thread-1', messageId: 'assistant-1',
+            thread: { id: 'thread-1', clock: 1 }, userMessage: { id: 'message-1', thread_id: 'thread-1', role: 'user', clock: 1 },
+            assistantMessage: { id: 'assistant-1', thread_id: 'thread-1', role: 'assistant', clock: 1, data: { generation_id: 'generation-1' } } };
+        mutationMock.mockRejectedValueOnce(Object.assign(new Error('rejected'), { data: { code: 'CONFLICT', message: 'rejected' } }));
+        await expect(adapter.admitChatGeneration(actor, admission)).rejects.toMatchObject({ code: 'CONFLICT' });
+    });
+
     it('emits admitted creates once and skips an existing thread', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
         const actor = { userId: 'user-1', workspaceId: 'ws-1' };

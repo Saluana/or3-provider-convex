@@ -617,7 +617,7 @@ describe("Convex background request usage persistence", () => {
     expect(pulled.changes[0].payload.data.usage).toEqual(measuredUsage());
     expect(await finalize(fixture.ctx, input)).toMatchObject({ status: "committed", replayed: true });
     expect(fixture.tables.change_log).toHaveLength(1);
-    await expect(finalize(fixture.ctx, { ...input, fingerprint: "conflicting" })).rejects.toThrow("Conflicting");
+    await expect(finalize(fixture.ctx, { ...input, fingerprint: "conflicting" })).rejects.toMatchObject({ data: { code: "CONFLICT" } });
   });
 
   it.each([undefined, { prompt_tokens: -1 }])("does not let absent or malformed terminal usage erase canonical metadata", async (usage) => {

@@ -24,7 +24,7 @@ import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './wor
  * - Per-table cursors or server-side merge strategies beyond LWW
  * - Server-side merge strategies beyond complete-record LWW
  */
-import { v } from 'convex/values';
+import { ConvexError, v } from 'convex/values';
 import { makeFunctionReference } from 'convex/server';
 import schema from './schema';
 import { recordRetainedStorage } from './storageUsage';
@@ -1451,7 +1451,8 @@ async function requireCanonicalGenerationActor(
     workspaceId: Id<'workspaces'>,
     actorUserId: Id<'users'>
 ): Promise<void> {
-    await requireActiveWorkspace(ctx, workspaceId);
+    const workspace = await ctx.db.get(workspaceId);
+    if (!workspace || workspace.deleted === true) throw new ConvexError({ code: 'FORBIDDEN', message: 'Forbidden' });
     const membership = await ctx.db
         .query('workspace_members')
         .withIndex('by_workspace_user', (q: any) =>
@@ -1459,7 +1460,7 @@ async function requireCanonicalGenerationActor(
         )
         .first();
     if (!membership || !SYNC_WRITE_ROLES.has(membership.role)) {
-        throw new Error('Forbidden background history actor');
+        throw new ConvexError({ code: 'FORBIDDEN', message: 'Forbidden background history actor' });
     }
 }
 
@@ -1600,7 +1601,7 @@ export const admitChatGeneration = internalMutation({
         );
         if (receipt) {
             if (receipt.fingerprint !== args.fingerprint) {
-                throw new Error('Conflicting background admission replay');
+                throw new ConvexError({ code: 'CONFLICT', message: 'Conflicting background admission replay' });
             }
             return {
                 status: 'admitted' as const,
@@ -1637,12 +1638,12 @@ export const admitChatGeneration = internalMutation({
                     args.expected_generation_id !== undefined &&
                     data.generation_id !== args.expected_generation_id)
             ) {
-                throw new Error('Conflicting continuation admission');
+                throw new ConvexError({ code: 'CONFLICT', message: 'Conflicting continuation admission' });
             }
         }
 
         if (args.records.length < 1 || args.records.length > 3) {
-            throw new Error('Invalid background history records');
+            throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background history records' });
         }
         const startVersion = await allocateServerVersions(
             ctx,
@@ -1657,7 +1658,7 @@ export const admitChatGeneration = internalMutation({
             const pk = typeof record.id === 'string' ? record.id : '';
             const clock = record.clock;
             if (!pk || !Number.isSafeInteger(clock) || (clock as number) < 0) {
-                throw new Error('Invalid background history record');
+                throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background history record' });
             }
             const hlc = typeof record.hlc === 'string' && record.hlc
                 ? record.hlc
@@ -1670,7 +1671,7 @@ export const admitChatGeneration = internalMutation({
             }
             const encoded = JSON.stringify(payload);
             if (new TextEncoder().encode(encoded).byteLength > MAX_PAYLOAD_SIZE_BYTES) {
-                throw new Error('Invalid background history payload size');
+                throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background history payload size' });
             }
             const serverVersion = startVersion + offset;
             const applyResult = await applyOpToTable(ctx, args.workspace_id, {
@@ -1712,7 +1713,7 @@ export const admitChatGeneration = internalMutation({
         if (!assistant || assistant.deleted === true ||
             assistant.clock !== (args.records.at(-1)?.record as any)?.clock ||
             assistantData.generation_id !== args.generation_id) {
-            throw new Error('Background assistant admission was superseded');
+            throw new ConvexError({ code: 'SUPERSEDED', message: 'Background assistant admission was superseded' });
         }
         const serverVersion = startVersion + args.records.length - 1;
         await ctx.db.insert('background_generation_receipts', {
@@ -1751,7 +1752,7 @@ export const finalizeChatGeneration = internalMutation({
         );
         if (receipt) {
             if (receipt.fingerprint !== args.fingerprint) {
-                throw new Error('Conflicting background finalization replay');
+                throw new ConvexError({ code: 'CONFLICT', message: 'Conflicting background finalization replay' });
             }
             return receipt.outcome === 'committed'
                 ? { status: 'committed' as const, replayed: true, serverVersion: receipt.server_version ?? 0 }
@@ -1800,7 +1801,7 @@ export const finalizeChatGeneration = internalMutation({
         if (!['complete', 'error', 'aborted'].includes(snapshot.status) ||
             typeof snapshot.content !== 'string' || typeof snapshot.reasoning !== 'string' ||
             !Number.isFinite(snapshot.completedAt)) {
-            throw new Error('Invalid background terminal snapshot');
+            throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background terminal snapshot' });
         }
         const clock = current!.clock + 1;
         const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
@@ -1837,7 +1838,7 @@ export const finalizeChatGeneration = internalMutation({
             },
         };
         if (new TextEncoder().encode(JSON.stringify(payload)).byteLength > MAX_PAYLOAD_SIZE_BYTES) {
-            throw new Error('Invalid background history payload size');
+            throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background history payload size' });
         }
         const serverVersion = await allocateServerVersions(ctx, args.workspace_id, 1);
         await applyOpToTable(ctx, args.workspace_id, {
