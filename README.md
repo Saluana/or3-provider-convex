@@ -626,4 +626,4 @@ Background request-usage measurements preserve optional cost, cached and reasoni
 token counts, and running totals from the host. Malformed optional fields are
 discarded without rejecting an otherwise complete measurement.
 
-Background history mutations return structured validation, authorization, conflict, and supersession errors. The gateway preserves those codes while leaving unknown transport failures retryable. Apply updated Convex templates when upgrading the provider.
+Provider `0.0.26` returns structured validation, authorization, conflict, and supersession errors from background history mutations. The gateway preserves those codes while leaving unknown transport failures retryable. Apply updated Convex templates when upgrading the provider.
