@@ -625,3 +625,5 @@ do not secure the public functions of an older deployed backend.
 Background request-usage measurements preserve optional cost, cached and reasoning
 token counts, and running totals from the host. Malformed optional fields are
 discarded without rejecting an otherwise complete measurement.
+
+Background history mutations return structured validation, authorization, conflict, and supersession errors. The gateway preserves those codes while leaving unknown transport failures retryable. Apply updated Convex templates when upgrading the provider.

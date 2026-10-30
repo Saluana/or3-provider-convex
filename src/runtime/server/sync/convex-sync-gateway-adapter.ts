@@ -58,6 +58,24 @@ import { getConvexClient } from '../utils/convex-client';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
 import { validateCanonicalChatQuery, type CanonicalChatQuery, type CanonicalChatReadResult } from '~~/shared/chat/history-reader';
 
+function historyFailure(code: string, message: string, cause?: unknown): Error {
+    return Object.assign(new Error(message, { cause }), { code });
+}
+
+function parseRequiredHistoryAdmission(input: unknown): ChatGenerationAdmissionEnvelope {
+    try { return parseChatGenerationAdmissionEnvelope(input); }
+    catch (cause) { throw historyFailure('VALIDATION_ERROR', 'Invalid background history admission', cause); }
+}
+
+function normalizeHistoryFailure(error: unknown): never {
+    const data = error && typeof error === 'object' && 'data' in error ? error.data : undefined;
+    if (data && typeof data === 'object' && 'code' in data && typeof data.code === 'string' &&
+        ['VALIDATION_ERROR', 'FORBIDDEN', 'CONFLICT', 'SUPERSEDED'].includes(data.code)) {
+        throw historyFailure(data.code, error instanceof Error ? error.message : 'Background history rejected', error);
+    }
+    throw error;
+}
+
 type ConvexPullChange = {
     serverVersion: number;
     tableName: string;
@@ -389,9 +407,9 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         actor: CanonicalHistoryActor,
         input: ChatGenerationAdmissionEnvelope
     ): Promise<AdmitChatGenerationResult> {
-        const admission = parseChatGenerationAdmissionEnvelope(input);
+        const admission = parseRequiredHistoryAdmission(input);
         if (actor.workspaceId !== admission.workspaceId) {
-            throw new Error('Invalid background history workspace');
+            throw historyFailure('VALIDATION_ERROR', 'Invalid background history workspace');
         }
         const records = [
             admission.thread
@@ -407,7 +425,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                 entry!.record,
                 'put'
             );
-            if (!record) throw new Error('Invalid background history payload');
+            if (!record) throw historyFailure('VALIDATION_ERROR', 'Invalid background history payload');
             return {
                 table_name: entry!.table_name,
                 record,
@@ -428,7 +446,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
             fingerprint: fingerprint(admission),
             device_id: backgroundHistoryDeviceId(admission.generationId),
             records,
-        }) as AdmitChatGenerationResult & { hookRows?: Array<{ tableName: 'threads' | 'messages'; payload: Record<string, unknown>; wasExisting: boolean; applied: boolean }> };
+        }).catch(normalizeHistoryFailure) as AdmitChatGenerationResult & { hookRows?: Array<{ tableName: 'threads' | 'messages'; payload: Record<string, unknown>; wasExisting: boolean; applied: boolean }> };
         for (const row of result.hookRows ?? []) {
             if (result.replayed || row.wasExisting || !row.applied) continue;
             const op: PendingOp = {
@@ -458,9 +476,9 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
             snapshot: CanonicalGenerationSnapshot;
         }
     ): Promise<FinalizeChatGenerationResult> {
-        const admission = parseChatGenerationAdmissionEnvelope(input.admission);
+        const admission = parseRequiredHistoryAdmission(input.admission);
         if (actor.workspaceId !== admission.workspaceId) {
-            throw new Error('Invalid background history workspace');
+            throw historyFailure('VALIDATION_ERROR', 'Invalid background history workspace');
         }
         return await getConvexClient().mutation(internalApi.sync.finalizeChatGeneration, {
             workspace_id: toWorkspaceId(admission.workspaceId),
@@ -472,7 +490,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
             device_id: backgroundHistoryDeviceId(admission.generationId),
             op_id: backgroundHistoryOpId(admission, 'finalize'),
             snapshot: input.snapshot,
-        }) as FinalizeChatGenerationResult;
+        }).catch(normalizeHistoryFailure) as FinalizeChatGenerationResult;
     }
 
     async pull(event: H3Event, input: PullRequest): Promise<PullResponse> {
