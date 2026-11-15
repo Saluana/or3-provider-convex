@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { ConvexHttpClient } from 'convex/browser';
 import { anyApi } from 'convex/server';
+import { prepareToolResultStorage, readToolResultStorage } from '../../../or3-chat/shared/chat/tool-result-artifact';
 
 const binary = resolve(process.argv[2] ?? '');
 assert(binary.startsWith(join(process.env.HOME, '.cache/convex/binaries/')) && binary.endsWith('/convex-local-backend'), 'Pass an official cached Convex backend binary');
@@ -211,6 +212,42 @@ try {
   await Promise.all([invoke(f,'push',{ops:[higher]}),invoke(f,'push',{ops:[lower]})]);
   assert.equal((await read(f)).kv.find(row=>row.id==='a').value,'winner');
   const retry=await invoke(f,'push',{ops:[lower]});assert.equal(retry.results[0].winner.payload.value,'winner');assert.equal(retry.results[0].applied,false);
+ });
+ await check('tool chunks survive rollback, retry, sync and backend restart without duplicating versions', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const generation='artifact-generation', thread='artifact-thread', message='artifact-assistant';
+  await invoke(f,'admitChatGeneration',{actor_user_id:f.user,generation_id:generation,message_id:message,kind:'new-turn',
+   fingerprint:'artifact-admission',device_id:'background:'+generation,records:[
+    {table_name:'threads',op_id:crypto.randomUUID(),record:{id:thread,clock:1,status:'active',forked:false,pinned:false,deleted:false,created_at:1,updated_at:1}},
+    {table_name:'messages',op_id:crypto.randomUUID(),record:{id:'artifact-user',thread_id:thread,role:'user',clock:1,index:0,order_key:'a',deleted:false,created_at:1,updated_at:1,data:{content:'research'}}},
+    {table_name:'messages',op_id:crypto.randomUUID(),record:{id:message,thread_id:thread,role:'assistant',clock:1,index:1,order_key:'b',pending:true,deleted:false,created_at:1,updated_at:1,data:{generation_id:generation}}},
+   ]});
+  const parent={workspace_id:f.workspace,actor_user_id:f.user,generation_id:generation,message_id:message,thread_id:thread,admission_clock:1,fingerprint:'artifact-admission'};
+  const content='x'.repeat(24*1024);
+  const prepared=await Promise.all(Array.from({length:9},(_,i)=>prepareToolResultStorage(content,{threadId:thread,parentAssistantId:message,callId:'read-'+i})));
+  assert(prepared.every(item=>item.rows.length===1));
+  const input={...parent,device_id:'background:'+generation,rows:prepared.flatMap(item=>item.rows.map(record=>({record,op_id:crypto.randomUUID()})))};
+  const before=(await read(f)).server_version_counter[0].value;
+  await assert.rejects(invoke(f,'retainChatToolResult',input,{fail_after:true}),/Injected crash/);
+  assert.equal((await read(f)).server_version_counter[0].value,before);
+  assert.equal((await read(f)).kv.filter(row=>row.id.startsWith('tool-result:')).length,0);
+  await invoke(f,'retainChatToolResult',input);
+  await invoke(f,'retainChatToolResult',input);
+  assert.equal((await read(f)).server_version_counter[0].value,before+9);
+  backend.kill('SIGKILL');await backend.exited;backend=start();await ready();
+  await invoke(f,'retainChatToolResult',input);
+  const pulled=await invoke(f,'pull',{cursor:before,limit:100});
+  assert.equal(pulled.changes.length,9);
+  const chunks=new Map(pulled.changes.map(change=>{
+   assert.match(change.stamp.opId,/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+   return [change.pk,change.payload];
+  }));
+  for(const item of prepared){
+   assert.equal(await readToolResultStorage(item.result,async id=>chunks.get(id)),content);
+   const ids=item.rows.map(row=>row.id);
+   assert.equal(await client.query(anyApi.sync.readChatToolResult,{...parent,ids}),content);
+  }
+  assert.equal((await read(f)).server_version_counter[0].value,before+9);
  });
  await check('acknowledged operations survive backend crash and exact receipt replay', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});const write=op();await invoke(f,'push',{ops:[write]});

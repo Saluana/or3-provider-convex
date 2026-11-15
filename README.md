@@ -627,3 +627,14 @@ token counts, and running totals from the host. Malformed optional fields are
 discarded without rejecting an otherwise complete measurement.
 
 Provider `0.0.26` returns structured validation, authorization, conflict, and supersession errors from background history mutations. The gateway preserves those codes while leaving unknown transport failures retryable. Apply updated Convex templates when upgrading the provider.
+
+The sync gateway retains complete background tool results in immutable workspace
+KV chunks through the internal `sync:retainChatToolResult` and
+`sync:readChatToolResult` functions. Apply the matching updated backend templates
+with the provider. Retention authorizes the live admitted generation and commits
+chunks plus contiguous UUID-stamped sync changes atomically; identical retries
+allocate no versions. Deleted/conflicting chunks and superseded generations are
+rejected. With the updated host, all nonempty results use bounded transcript
+references, leaving the assistant response budget available for its answer.
+Full results remain available for sync, reload and model replay, within the existing
+256 KiB per-result limit.
