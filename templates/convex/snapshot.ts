@@ -146,8 +146,19 @@ export function legacySnapshotRevision(
     return { clock, hlc, opId };
 }
 
+/** Null carried no fork reason in historical Convex rows. Omission is lossless;
+ * keep stored revisions and receipt fingerprints unchanged. Other defects fail
+ * closed until durable unavailable-record recovery is implemented. */
+export function normalizeHistoricalSyncPayload(table: string, payload: unknown): unknown {
+    if (table !== 'threads' || !payload || typeof payload !== 'object' || Array.isArray(payload) ||
+        (payload as Record<string, unknown>).fork_reason !== null) return payload;
+    const { fork_reason, ...normalized } = payload as Record<string, unknown>;
+    return normalized;
+}
+
 function snapshotPayloadFromDoc(
     doc: MaterializedDoc,
+    tableName: string,
     pkField: string,
     pk: string,
     revision: SnapshotRevision
@@ -166,7 +177,7 @@ function snapshotPayloadFromDoc(
     void server_version;
     void op_id;
     return {
-        ...payload,
+        ...normalizeHistoricalSyncPayload(tableName, payload) as Record<string, unknown>,
         [pkField]: pk,
         clock: revision.clock,
         hlc: revision.hlc,
@@ -189,7 +200,7 @@ export function materializedSnapshotCandidate(
             tableName,
             pk,
             revision,
-            ...(tableName === 'file_meta' ? { payload: snapshotPayloadFromDoc(doc, getPkField(tableName), pk, revision) } : {}),
+            ...(tableName === 'file_meta' ? { payload: snapshotPayloadFromDoc(doc, tableName, getPkField(tableName), pk, revision) } : {}),
             serverDeletedAt:
                 typeof doc.deleted_at === 'number' && doc.deleted_at >= 0
                     ? Math.floor(doc.deleted_at)
@@ -201,7 +212,7 @@ export function materializedSnapshotCandidate(
         kind: 'row',
         tableName,
         pk,
-        payload: snapshotPayloadFromDoc(doc, getPkField(tableName), pk, revision),
+        payload: snapshotPayloadFromDoc(doc, tableName, getPkField(tableName), pk, revision),
         revision,
         serverVersion,
     };

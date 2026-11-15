@@ -1,3 +1,5 @@
+import { prepareSyncWrite, nextSyncClock } from './syncContract/shared/sync/prepare_sync_write';
+import { normalizeHistoricalSyncPayload } from './snapshot';
 import { assertStorageNotDeleted } from './storageDeletion';
 import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './workspaceItemCapability';
 /**
@@ -195,8 +197,9 @@ async function allocateServerVersions(
         .first();
 
     if (existing) {
-        const start = existing.value + 1;
+        const start = nextSyncClock(existing.value);
         const end = existing.value + count;
+        if (!Number.isSafeInteger(end)) throw new Error('Sync version exhausted');
         await ctx.db.patch(existing._id, { value: end });
         return start;
     } else {
@@ -394,7 +397,7 @@ function historySnapshotCandidate(history: SnapshotHistoryDoc): SnapshotCandidat
         kind: 'row',
         tableName: history.table_name,
         pk: history.pk,
-        payload: history.payload,
+        payload: normalizeHistoricalSyncPayload(history.table_name, history.payload),
         revision,
         serverVersion: history.server_version,
     };
@@ -677,6 +680,15 @@ function changeLogFingerprint(change: Record<string, unknown>): string {
     });
 }
 
+function prepareOperation(op: SyncOperation): SyncOperation {
+    const payload = op.operation === 'put' && op.payload && typeof op.payload === 'object'
+        ? { ...op.payload as Record<string, unknown>, clock: op.clock, hlc: op.hlc, op_id: op.op_id }
+        : op.payload;
+    const prepared = prepareSyncWrite({ tableName: op.table_name, pk: op.pk, operation: op.operation,
+        payload, stamp: { clock: op.clock, hlc: op.hlc, opId: op.op_id, deviceId: op.device_id } });
+    return { ...op, payload: prepared.payload };
+}
+
 function validateSyncOperation(
     workspaceId: Id<'workspaces'>,
     op: SyncOperation
@@ -687,7 +699,7 @@ function validateSyncOperation(
     if (!TABLE_INDEX_MAP[op.table_name]) return `Invalid table: ${op.table_name}`;
     if (!Number.isSafeInteger(op.clock) || op.clock < 0) return 'Invalid clock';
     for (const [name, value, maximum] of [['hlc', op.hlc, 512], ['device_id', op.device_id, 256], ['pk', op.pk, 1024]] as const) {
-        if (!value.trim() || value.length > maximum) return `Invalid ${name}`;
+        if (!(name === 'device_id' ? value.trim() : value) || value.length > maximum) return `Invalid ${name}`;
     }
     const reservedKey = reservedKvSettingKey(op);
     if (reservedKey) {
@@ -713,13 +725,22 @@ function validateSyncOperation(
     }
 
     const payload = op.payload as Record<string, unknown> | undefined;
+    if (op.operation === 'delete') {
+        try { prepareOperation(op); }
+        catch (error) { return error instanceof Error ? error.message : 'Invalid sync write'; }
+        return undefined;
+    }
     try {
         validatePayload(op.table_name, payload);
     } catch (error) {
         return error instanceof Error ? error.message : String(error);
     }
     if (!payload && op.operation === 'put') return `Invalid payload for ${op.table_name}: put requires a complete record`;
-    if (!payload) return undefined;
+    if (!payload) {
+        try { prepareOperation(op); }
+        catch (error) { return error instanceof Error ? error.message : 'Invalid sync write'; }
+        return undefined;
+    }
     if ('_id' in payload) return `Invalid payload for ${op.table_name}: '_id' is immutable`;
     if ('workspace_id' in payload && String(payload.workspace_id) !== String(workspaceId)) {
         return `Invalid payload for ${op.table_name}: 'workspace_id' is immutable`;
@@ -728,13 +749,15 @@ function validateSyncOperation(
     if (pkField in payload && payload[pkField] !== op.pk) {
         return `Invalid payload for ${op.table_name}: '${pkField}' must match operation pk`;
     }
+    try { op.payload = prepareOperation(op).payload; }
+    catch (error) { return error instanceof Error ? error.message : 'Invalid sync write'; }
     const tables = schema.tables as unknown as Record<string, { validator: { json: any } }>;
     if (op.operation === 'put') {
         if (op.table_name === 'file_meta' && (!Number.isSafeInteger(payload.size_bytes) || (payload.size_bytes as number) < 0)) {
             return 'Invalid payload for file_meta: size_bytes must be a nonnegative integer';
         }
         const canonical = {
-            ...sanitizePayload(op.table_name, payload),
+            ...sanitizePayload(op.table_name, op.payload as Record<string, unknown>),
             ...(op.table_name === 'file_meta' ? { ref_count: 0 } : {}),
             workspace_id: workspaceId,
             [pkField]: op.pk,
@@ -744,13 +767,6 @@ function validateSyncOperation(
         };
         if (!matchesDocumentValidator(tables[op.table_name]!.validator.json, canonical)) {
             return `Invalid payload for ${op.table_name}: record does not match the canonical schema`;
-        }
-    } else {
-        const definition = tables[op.table_name]!.validator.json;
-        const fields = Object.fromEntries(Object.entries(definition.value).map(([key, field]: [string, any]) =>
-            [key, { ...field, optional: true }]));
-        if (!matchesDocumentValidator({ type: 'object', value: fields }, sanitizePayload(op.table_name, payload))) {
-            return `Invalid payload for ${op.table_name}: delete fields do not match the canonical schema`;
         }
     }
     return undefined;
@@ -795,10 +811,12 @@ async function applyOpToTable(
         clock: number;
         hlc: string;
         op_id: string;
+        device_id: string;
     },
     serverVersion: number,
     preimageVersion: number
 ): Promise<{ wasExisting: boolean; applied: boolean }> {
+    op = prepareOperation(op);
     const tableInfo = TABLE_INDEX_MAP[op.table_name];
     if (!tableInfo) {
         console.warn(`Unknown table: ${op.table_name}`);
@@ -814,7 +832,7 @@ async function applyOpToTable(
         op.payload as Record<string, unknown> | undefined
     );
 
-    validatePayload(op.table_name, payload);
+    if (op.operation === 'put') validatePayload(op.table_name, payload);
     const payloadCreatedAt =
         typeof payload?.created_at === 'number' ? (payload.created_at as number) : undefined;
     const payloadUpdatedAt =
@@ -1110,7 +1128,7 @@ function toWireChange(c: {
         tableName: c.table_name,
         pk: c.pk,
         op: c.op,
-        payload: c.payload,
+        payload: normalizeHistoricalSyncPayload(c.table_name, c.payload),
         stamp: {
             clock: c.clock,
             hlc: c.hlc,
@@ -1271,7 +1289,7 @@ export const push = mutation({
             if (group.fingerprint !== fingerprint) group.conflicting = true;
         });
 
-        const candidates: Array<{ op: SyncOperation; indices: number[] }> = [];
+        const candidates: Array<{ op: SyncOperation; indices: number[]; fingerprint: string }> = [];
         for (const group of groups.values()) {
             if (group.conflicting) {
                 failGroup(
@@ -1289,12 +1307,7 @@ export const push = mutation({
                     callerUserId,
                     group.op
                 );
-                const validationError = validateSyncOperation(args.workspace_id, scopedOp);
-                if (validationError) {
-                    failGroup(group.indices, group.op, validationError);
-                    continue;
-                }
-                candidates.push({ op: scopedOp, indices: group.indices });
+                candidates.push({ op: scopedOp, indices: group.indices, fingerprint: operationFingerprint(scopedOp) });
             } catch (error) {
                 failGroup(
                     group.indices,
@@ -1321,7 +1334,7 @@ export const push = mutation({
             }
             if (
                 String(existing.workspace_id) !== String(args.workspace_id) ||
-                (existing.request_fingerprint ?? changeLogFingerprint(existing)) !== operationFingerprint(candidate.op)
+                (existing.request_fingerprint ?? changeLogFingerprint(existing)) !== candidate.fingerprint
             ) {
                 failGroup(
                     candidate.indices,
@@ -1352,6 +1365,8 @@ export const push = mutation({
         for (const candidate of unprocessedOps) {
             const { op, indices } = candidate;
             try {
+                const validationError = validateSyncOperation(args.workspace_id, op);
+                if (validationError) { failGroup(indices, op, validationError); continue; }
                 if (op.operation === 'put') await assertStorageNotDeleted(ctx, args.workspace_id, op.table_name, {
                     ...sanitizePayload(op.table_name, op.payload as Record<string, unknown>),
                     [getPkField(op.table_name)]: op.pk,
@@ -1369,7 +1384,7 @@ export const push = mutation({
 
             // Apply unique ops sequentially in allocated server-version order.
             for (let offset = 0; offset < newOps.length; offset += 1) {
-                const { op, indices } = newOps[offset]!;
+                const { op, indices, fingerprint } = newOps[offset]!;
                 const serverVersion = startVersion + offset;
                 console.debug('[sync] push apply', {
                     table: op.table_name,
@@ -1406,7 +1421,7 @@ export const push = mutation({
                     device_id: op.device_id,
                     op_id: op.op_id,
                     created_at: nowSec(),
-                    request_fingerprint: operationFingerprint(op),
+                    request_fingerprint: fingerprint,
                 });
 
                 if (op.operation === 'delete') {
@@ -1628,7 +1643,7 @@ export const retainChatToolResult = internalMutation({
             const payload = { id: row.id, name: row.name, value: row.value, clock: 1, deleted: false,
                 created_at: row.created_at, updated_at: row.updated_at, hlc, op_id: entry.op_id };
             await applyOpToTable(ctx, args.workspace_id, { table_name: 'kv', operation: 'put', pk: row.id,
-                payload, clock: 1, hlc, op_id: entry.op_id }, start + index, start - 1);
+                payload, clock: 1, hlc, op_id: entry.op_id, device_id: args.device_id }, start + index, start - 1);
             await ctx.db.insert('change_log', { workspace_id: args.workspace_id, server_version: start + index,
                 table_name: 'kv', pk: row.id, op: 'put', payload, clock: 1, hlc, device_id: args.device_id,
                 op_id: entry.op_id, created_at: nowSec() });
@@ -1734,15 +1749,7 @@ export const admitChatGeneration = internalMutation({
         if (args.records.length < 1 || args.records.length > 3) {
             throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background history records' });
         }
-        const startVersion = await allocateServerVersions(
-            ctx,
-            args.workspace_id,
-            args.records.length
-        );
-        const preimageVersion = startVersion - 1;
-        const hookRows: Array<{ tableName: 'threads' | 'messages'; payload: Record<string, unknown>; wasExisting: boolean; applied: boolean }> = [];
-        for (let offset = 0; offset < args.records.length; offset += 1) {
-            const entry = args.records[offset]!;
+        const preparedRecords = args.records.map((entry) => {
             const record = entry.record as Record<string, unknown>;
             const pk = typeof record.id === 'string' ? record.id : '';
             const clock = record.clock;
@@ -1758,10 +1765,21 @@ export const admitChatGeneration = internalMutation({
             if (entry.table_name === 'messages' && !payload.order_key) {
                 payload.order_key = hlc;
             }
-            const encoded = JSON.stringify(payload);
-            if (new TextEncoder().encode(encoded).byteLength > MAX_PAYLOAD_SIZE_BYTES) {
-                throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background history payload size' });
-            }
+            const op = { table_name: entry.table_name, operation: 'put' as const, pk, payload,
+                clock: clock as number, hlc, op_id: entry.op_id, device_id: args.device_id };
+            const validationError = validateSyncOperation(args.workspace_id, op);
+            if (validationError) throw new ConvexError({ code: 'VALIDATION_ERROR', message: validationError });
+            return { entry, pk, clock: clock as number, hlc, payload: op.payload as Record<string, unknown> };
+        });
+        const startVersion = await allocateServerVersions(
+            ctx,
+            args.workspace_id,
+            preparedRecords.length
+        );
+        const preimageVersion = startVersion - 1;
+        const hookRows: Array<{ tableName: 'threads' | 'messages'; payload: Record<string, unknown>; wasExisting: boolean; applied: boolean }> = [];
+        for (let offset = 0; offset < args.records.length; offset += 1) {
+            const { entry, pk, clock, hlc, payload } = preparedRecords[offset]!;
             const serverVersion = startVersion + offset;
             const applyResult = await applyOpToTable(ctx, args.workspace_id, {
                 table_name: entry.table_name,
@@ -1771,6 +1789,7 @@ export const admitChatGeneration = internalMutation({
                 clock: clock as number,
                 hlc,
                 op_id: entry.op_id,
+                device_id: args.device_id,
             }, serverVersion, preimageVersion);
             if (entry.table_name === 'threads' || pk !== args.message_id) {
                 hookRows.push({ tableName: entry.table_name, payload, ...applyResult });
@@ -1892,7 +1911,9 @@ export const finalizeChatGeneration = internalMutation({
             !Number.isFinite(snapshot.completedAt)) {
             throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background terminal snapshot' });
         }
-        const clock = current!.clock + 1;
+        let clock: number;
+        try { clock = nextSyncClock(current!.clock); }
+        catch { throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Sync clock exhausted or invalid' }); }
         const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
         const {
             _id: _currentId,
@@ -1906,7 +1927,7 @@ export const finalizeChatGeneration = internalMutation({
             ? 'complete'
             : snapshot.status === 'aborted' ? 'aborted' : 'failed';
         const usage = readRequestUsage(snapshot.usage);
-        const payload = {
+        let payload = {
             ...currentWithoutError,
             ...(snapshot.error ? { error: snapshot.error } : {}),
             pending: false,
@@ -1926,13 +1947,12 @@ export const finalizeChatGeneration = internalMutation({
                 error: snapshot.error ?? null,
             },
         };
-        if (new TextEncoder().encode(JSON.stringify(payload)).byteLength > MAX_PAYLOAD_SIZE_BYTES) {
-            throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background history payload size' });
-        }
+        payload = prepareOperation({ table_name: 'messages', pk: args.message_id, operation: 'put',
+            payload, clock, hlc, op_id: args.op_id, device_id: args.device_id }).payload as typeof payload;
         const serverVersion = await allocateServerVersions(ctx, args.workspace_id, 1);
         await applyOpToTable(ctx, args.workspace_id, {
             table_name: 'messages', operation: 'put', pk: args.message_id,
-            payload, clock, hlc, op_id: args.op_id,
+            payload, clock, hlc, op_id: args.op_id, device_id: args.device_id,
         }, serverVersion, serverVersion - 1);
         await ctx.db.insert('change_log', {
             workspace_id: args.workspace_id,

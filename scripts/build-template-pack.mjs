@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { rmSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
@@ -8,6 +8,46 @@ import { createHash } from 'node:crypto';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const templateRoot = resolve(__dirname, '..', 'templates', 'convex');
 const outputPath = resolve(__dirname, '..', 'templates', 'convex.pack.json.gz');
+
+// Generated verbatim source graph. Refresh only from an explicitly selected,
+// committed host; ordinary package builds verify the recorded source hashes.
+const contractRoot = resolve(templateRoot, 'syncContract');
+const manifestPath = resolve(contractRoot, 'source.json');
+const hostFlag = process.argv.indexOf('--sync-host');
+const checkFlag = process.argv.indexOf('--check-host');
+const templatePath = (file) => file.replaceAll('-', '_');
+const templateSource = (source) => source.replace(/((?:from\s*|import\s*)['"])(\.[^'"]+)(['"])/g, (_, before, path, after) => before + templatePath(path) + after);
+const sha256 = (source) => createHash('sha256').update(source).digest('hex');
+if (hostFlag !== -1) {
+    const { execFileSync } = await import('node:child_process');
+    const host = resolve(process.argv[hostFlag + 1]);
+    rmSync(contractRoot, { recursive: true, force: true });
+    const files = {};
+    const pending = ['shared/sync/prepare-sync-write.ts'];
+    while (pending.length) {
+        const file = pending.pop();
+        if (file in files) continue;
+        const source = readFileSync(resolve(host, file), 'utf8');
+        const committed = execFileSync('git', ['show', `HEAD:${file}`], { cwd: host, encoding: 'utf8' });
+        if (source !== committed) throw new Error(`Uncommitted host contract: ${file}`);
+        files[file] = { source: sha256(source), generated: sha256(templateSource(source)) };
+        const target = resolve(contractRoot, templatePath(file));
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, templateSource(source));
+        for (const match of source.matchAll(/(?:from\s*|import\s*)['"](\.[^'"]+)['"]/g)) {
+            const dependency = resolve(host, dirname(file), match[1]);
+            const path = existsSync(dependency + '.ts') ? dependency + '.ts' : resolve(dependency, 'index.ts');
+            pending.push(toPosixPath(relative(host, path)));
+        }
+    }
+    writeFileSync(manifestPath, JSON.stringify({ hostCommit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: host, encoding: 'utf8' }).trim(), files }, null, 2) + '\n');
+}
+const sourceManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+for (const [file, digest] of Object.entries(sourceManifest.files)) {
+    if (sha256(readFileSync(resolve(contractRoot, templatePath(file)))) !== digest.generated) throw new Error(`Generated source parity failed: ${file}`);
+    if (checkFlag !== -1 && sha256(readFileSync(resolve(process.argv[checkFlag + 1], file))) !== digest.source)
+        throw new Error(`Host source parity failed: ${file}`);
+}
 
 const IGNORED_FILE_NAMES = new Set(['.DS_Store']);
 

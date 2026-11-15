@@ -11,7 +11,9 @@ import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { ConvexHttpClient } from 'convex/browser';
 import { anyApi } from 'convex/server';
-import { prepareToolResultStorage, readToolResultStorage } from '../../../or3-chat/shared/chat/tool-result-artifact';
+const host = resolve(process.env.OR3_CANONICAL_HOST_ROOT || new URL('../../../or3-chat', import.meta.url).pathname);
+const { prepareToolResultStorage, readToolResultStorage } = await import(join(host, 'shared/chat/tool-result-artifact.ts'));
+const { TABLE_PAYLOAD_SCHEMAS, compareSyncTuple, SnapshotResponseSchema, PullResponseSchema } = await import(join(host, 'shared/sync/schemas.ts'));
 
 const binary = resolve(process.argv[2] ?? '');
 assert(binary.startsWith(join(process.env.HOME, '.cache/convex/binaries/')) && binary.endsWith('/convex-local-backend'), 'Pass an official cached Convex backend binary');
@@ -19,15 +21,15 @@ const provider = resolve(import.meta.dir, '../..');
 const root = await mkdtemp(join(tmpdir(), 'or3-sync-hardening-'));
 const evidence = resolve(process.argv[3] ?? join(root, 'evidence'));
 await mkdir(evidence, { recursive: true });
-await cp(join(provider, 'templates/convex'), join(root, 'convex'), { recursive: true });
-await cp(join(provider, '../or3-chat/shared'), join(root, 'shared'), { recursive: true });
+await cp(resolve(process.env.OR3_CONVEX_TEMPLATE_ROOT || join(provider, 'templates/convex')), join(root, 'convex'), { recursive: true });
+await cp(join(host, 'shared'), join(root, 'shared'), { recursive: true });
 // Symlink this provider's dependencies only; no install or operator env is read.
 await Bun.write(join(root, 'package.json'), JSON.stringify({ private: true, type: 'module', dependencies: { convex: '1.48.0' } }));
 await import('node:fs/promises').then(({ symlink }) => symlink(join(provider, 'node_modules'), join(root, 'node_modules')));
 await writeFile(join(root, 'convex/auth.config.ts'), 'export default { providers: [] };\n');
 await writeFile(join(root, 'convex/syncProbe.ts'), `
 import { internalMutation, internalQuery } from './_generated/server';
-import { v } from 'convex/values';
+import { v, getConvexSize } from 'convex/values';
 import * as sync from './sync';
 import * as notifications from './notifications';
 import * as storage from './storage';
@@ -45,11 +47,26 @@ export const seed=internalMutation({args:{},handler:async(ctx)=>{
 }});
 export const invoke=internalMutation({args:{workspace:v.id('workspaces'),name:v.string(),input:v.any(),actor:v.optional(v.string()),fail_after:v.optional(v.boolean()),fail_write:v.optional(v.boolean())},handler:async(ctx,args)=>{
  const context=actor(ctx,args.workspace+(args.actor??'a'));
+ let bytes=0, reads=0, written=0;
+ const measured=(value:any)=>{if(value){bytes+=getConvexSize(value);reads++;}return value;};
+ const queryProxy=(target:any):any=>new Proxy(target,{get(t,key){
+  if(key===Symbol.asyncIterator)return async function*(){for await(const row of t)yield measured(row);};
+  if(['first','unique'].includes(String(key)))return async(...a:any[])=>measured(await t[key](...a));
+  if(['take','collect'].includes(String(key)))return async(...a:any[])=>{const rows=await t[key](...a);rows.forEach(measured);return rows;};
+  if(['withIndex','order','filter'].includes(String(key)))return(...a:any[])=>queryProxy(t[key](...a));
+  const value=t[key];return typeof value==='function'?value.bind(t):value;
+ }});
+ context.db=new Proxy(ctx.db,{get(t,key){
+  if(key==='query')return(...a:any[])=>queryProxy((t.query as any)(...a));
+  if(key==='get')return async(...a:any[])=>measured(await (t.get as any)(...a));
+  if(['insert','patch','replace'].includes(String(key)))return async(...a:any[])=>{written+=getConvexSize(a.at(-1));return (t as any)[key](...a);};
+  const value=(t as any)[key];return typeof value==='function'?value.bind(t):value;
+ }});
  if(args.fail_write)context.db=new Proxy(ctx.db,{get(target,key){if(key==='insert')return async(table:any,value:any)=>{if(table==='change_log')throw Error('Injected change-log write failure');return target.insert(table,value);};return Reflect.get(target,key);}});
  const handlers:any={...sync,createNotification:notifications.create,markNotificationRead:notifications.markRead,generateUploadUrl:storage.generateUploadUrl,commitUpload:storage.commitUpload,deleteObject:storage.deleteObject};
- const result=await handlers[args.name]._handler(context,{workspace_id:args.workspace,...args.input});
+ const result=await handlers[args.name]._handler(context,{...Object.fromEntries(Object.entries(args.input).filter(([key])=>key!=='__budget')),workspace_id:args.workspace});
  if(args.fail_after)throw Error('Injected crash before transaction commit');
- return result;
+ return args.input.__budget ? {result,bytes,reads,written} : result;
 }});
 export const authored=internalMutation({args:{workspace:v.id('workspaces'),op:v.any()},handler:(ctx,args)=>applyServerAuthoredOp(ctx,args.workspace,args.op)});
 export const patch=internalMutation({args:{id:v.string(),value:v.any()},handler:(ctx,args)=>ctx.db.patch(args.id as any,args.value)});
@@ -60,8 +77,12 @@ export const gcPage=internalMutation({args:{workspace_id:v.id('workspaces'),rete
  const remaining=(await ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace',(q)=>q.eq('workspace_id',args.workspace_id)).collect()).length;
  return {result,remaining};
 }});
+export const original=internalQuery({args:{id:v.string()},handler:(ctx,args)=>ctx.db.get(args.id as any)});
+export const jobCount=internalQuery({args:{user:v.string()},handler:async(ctx,args)=>(await ctx.db.query('background_jobs').withIndex('by_user',q=>q.eq('user_id',args.user)).collect()).length});
+export const age=internalMutation({args:{workspace:v.id('workspaces'),version:v.number(),old:v.number()},handler:async(ctx,args)=>{const row=await ctx.db.query('change_log').withIndex('by_workspace_version',q=>q.eq('workspace_id',args.workspace).eq('server_version',args.version)).first();if(row)await ctx.db.patch(row._id,{created_at:args.old});}});
+export const expire=internalMutation({args:{workspace:v.id('workspaces'),old:v.number()},handler:async(ctx,args)=>{for(const row of await ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace',q=>q.eq('workspace_id',args.workspace)).collect())await ctx.db.patch(row._id,{expires_at:args.old});}});
 export const read=internalQuery({args:{workspace:v.id('workspaces')},handler:async(ctx,args)=>{
- const result:any={};for(const name of ['kv','notifications','file_meta','upload_intents','change_log','server_version_counter','device_cursors','sync_snapshot_sessions','sync_record_versions'])result[name]=(await ctx.db.query(name as any).collect()).filter((row:any)=>row.workspace_id===args.workspace);return result;
+ const result:any={};for(const name of ['kv','notifications','file_meta','upload_intents','change_log','server_version_counter','device_cursors','sync_snapshot_sessions','sync_record_versions'])result[name]=await ctx.db.query(name as any).withIndex(({file_meta:'by_workspace_hash',kv:'by_workspace_id',device_cursors:'by_workspace_version',upload_intents:'by_workspace_status',change_log:'by_workspace_version',sync_record_versions:'by_workspace_version'} as any)[name]??'by_workspace',(q:any)=>q.eq('workspace_id',args.workspace)).collect();return result;
 }});
 `);
 const instance = 'sync-hardening-' + randomBytes(8).toString('hex');
@@ -80,13 +101,70 @@ const read = (fixture) => client.query(anyApi.syncProbe.read, { workspace: fixtu
 const op = (overrides = {}) => ({ op_id: crypto.randomUUID(), table_name: 'kv', operation: 'put', pk: 'a', payload: { id: 'a', name: 'setting', deleted: false, created_at: 1, updated_at: 2, clock: 6 }, clock: 6, hlc: '6:0:dev', device_id: 'device', ...overrides });
 let backend;
 const checks = [], failures = [];
-async function check(name, run) { try { await run(); checks.push(name); console.log('PASS ' + name); } catch (error) { failures.push({ name, error: String(error) }); console.error('FAIL ' + name + ': ' + error); } }
+async function check(name, run) { if(process.env.OR3_SYNC_TEST_FILTER && !name.includes(process.env.OR3_SYNC_TEST_FILTER))return; try { await run(); checks.push(name); console.log('PASS ' + name); } catch (error) { failures.push({ name, error: String(error) }); console.error('FAIL ' + name + ': ' + error); } }
 function start() { return Bun.spawn([binary, '--interface', '127.0.0.1', '--port', String(apiPort), '--site-proxy-port', String(sitePort), '--instance-name', instance, '--instance-secret', secret, '--disable-beacon', '--local-storage', join(root, 'storage'), join(root, 'backend.sqlite3')], { cwd: root, stdout: Bun.file(join(root, 'backend.log')), stderr: Bun.file(join(root, 'backend-errors.log')) }); }
 async function ready() { for (let i = 0; i < 100; i++) { try { if ((await fetch(url + '/version')).ok) return; } catch {} await Bun.sleep(100); } throw Error('Disposable backend did not start'); }
 try {
  backend = start(); await ready();
  const deploy = Bun.spawn([process.execPath, join(provider, 'node_modules/convex/bin/main.js'), 'deploy', '--yes', '--typecheck', 'enable', '--env-file', envPath], { cwd: root, env, stdout: Bun.file(join(root, 'deploy.log')), stderr: Bun.file(join(root, 'deploy-errors.log')) });
  assert.equal(await deploy.exited, 0, 'Sandbox deployment failed: ' + root);
+
+ await check('public push rejects null fork reason atomically', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const payload={id:'thread',status:'active',pinned:false,forked:false,deleted:false,created_at:1,updated_at:1,clock:1,fork_reason:null};
+  const invalid=await invoke(f,'push',{ops:[op({table_name:'threads',pk:'thread',clock:1,hlc:'1:0:dev',payload})]});assert.equal(invalid.results[0].success,false);
+  const state=await read(f);assert.equal(state.server_version_counter[0].value,5);assert.equal(state.change_log.length,0);
+ });
+ await check('notification authoring rejects non-array actions atomically', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  await assert.rejects(invoke(f,'createNotification',{user_id:f.user,type:'info',title:'bad',actions:{}}),/Invalid payload/);
+  assert.equal((await read(f)).server_version_counter[0].value,5);
+ });
+ await check('background timestamp rejection precedes writes and finalizer clock overflow is atomic', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});const record={id:'assistant',thread_id:'thread',role:'assistant',index:1,order_key:'a',pending:true,deleted:false,clock:1,data:{generation_id:'generation'}};
+  const admission={actor_user_id:f.user,generation_id:'generation',message_id:'assistant',kind:'new-turn',fingerprint:'admission',device_id:'background:generation',records:[{table_name:'messages',op_id:crypto.randomUUID(),record}]};
+  await assert.rejects(invoke(f,'admitChatGeneration',admission),/Invalid payload/);
+  assert.equal((await read(f)).server_version_counter[0].value,5);
+ });
+ await check('background finalizer rejects safe-integer exhaustion before receipt or allocation', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});const record={id:'assistant',thread_id:'thread',role:'assistant',index:1,order_key:'a',pending:true,deleted:false,clock:Number.MAX_SAFE_INTEGER,created_at:1,updated_at:1,data:{generation_id:'generation'}};
+  await invoke(f,'admitChatGeneration',{actor_user_id:f.user,generation_id:'generation',message_id:'assistant',kind:'new-turn',fingerprint:'admission',device_id:'background:generation',records:[{table_name:'messages',op_id:crypto.randomUUID(),record}]});
+  await assert.rejects(invoke(f,'finalizeChatGeneration',{actor_user_id:f.user,generation_id:'generation',message_id:'assistant',admission_clock:record.clock,fingerprint:'final',device_id:'background:generation',op_id:crypto.randomUUID(),snapshot:{status:'complete',content:'ok',reasoning:'',completedAt:2000}}),/clock|revision/i);
+  assert.equal((await read(f)).server_version_counter[0].value,6);
+ });
+ await check('legacy null fork reason reads losslessly without changing stored revision', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const thread={workspace_id:f.workspace,id:'legacy',status:'active',pinned:false,forked:false,fork_reason:null,deleted:false,created_at:1,updated_at:1,clock:1,hlc:'1:0:dev',op_id:crypto.randomUUID(),server_version:5};
+  const stored=await client.mutation(anyApi.syncProbe.insert,{table:'threads',value:thread});
+  await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:{workspace_id:f.workspace,server_version:5,table_name:'threads',pk:'legacy',op:'put',payload:Object.fromEntries(Object.entries(thread).filter(([key])=>key!=='workspace_id')),clock:1,hlc:'1:0:dev',device_id:'dev',op_id:thread.op_id,created_at:1}});
+  const pull=await invoke(f,'pull',{cursor:4,limit:300});TABLE_PAYLOAD_SCHEMAS.threads.parse(pull.changes[0].payload);assert.equal(pull.changes[0].payload.fork_reason,undefined);
+  const page=await invoke(f,'snapshot',{tables:['threads'],page_size:100});TABLE_PAYLOAD_SCHEMAS.threads.parse(page.items[0].payload);assert.equal(page.items[0].payload.fork_reason,undefined);assert.equal(page.items[0].revision.opId,thread.op_id);
+  const original=await client.query(anyApi.syncProbe.original,{id:stored});assert.equal(original.fork_reason,null);assert.equal(original.op_id,thread.op_id);
+ });
+ await check('new background jobs reject malformed canonical admission before durable acceptance', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const record={id:'assistant',thread_id:'thread',role:'assistant',index:1,order_key:'a',pending:true,deleted:false,clock:1,data:{generation_id:'generation'}};
+  const history={version:1,kind:'continuation',admissionId:'admission',generationId:'generation',workspaceId:f.workspace,threadId:'thread',messageId:'assistant',expectedAssistant:{clock:0},assistantMessage:record};
+  const input={user_id:f.user,thread_id:'thread',message_id:'assistant',model:'test',kind:'chat',generation_id:'generation',idempotency_key:'admission',history_phase:'admission_pending',sync_provider_id:'convex',execution:{version:1,workspaceId:f.workspace,body:{},history},max_concurrent_jobs:20,max_concurrent_jobs_per_user:5};
+  await assert.rejects(client.mutation(anyApi.backgroundJobs.create,input),/Invalid payload/);
+  assert.equal(await client.query(anyApi.syncProbe.jobCount,{user:f.user}),0);
+  record.created_at=1;record.updated_at=1;
+  history.generationId='g'.repeat(246);
+  await assert.rejects(client.mutation(anyApi.backgroundJobs.create,input),/Invalid sync stamp/);
+  assert.equal(await client.query(anyApi.syncProbe.jobCount,{user:f.user}),0);
+  history.generationId='generation';assert.ok((await client.mutation(anyApi.backgroundJobs.create,input)).jobId);
+ });
+ await check('canonical normalization preserves raw receipt fingerprints and exact delete payloads', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const write=op({payload:{id:'a',name:'setting',deleted:false,createdAt:1,updatedAt:2,clock:6}});
+  const first=await invoke(f,'push',{ops:[write]});assert.equal(first.results[0].success,true);
+  const replay=await invoke(f,'push',{ops:[write]});assert.equal(replay.results[0].replayed,true);assert.equal(replay.results[0].serverVersion,first.results[0].serverVersion);
+  const state=await read(f);assert.deepEqual(JSON.parse(state.change_log[0].request_fingerprint).payload,write.payload);assert.equal(state.change_log[0].payload.created_at,1);assert.equal(state.change_log[0].payload.createdAt,undefined);
+  const deletion=op({operation:'delete',clock:7,hlc:'7:0:dev',payload:{updatedAt:123,custom:{keep:true}}});
+  assert.equal((await invoke(f,'push',{ops:[deletion]})).results[0].success,true);
+  assert.equal((await invoke(f,'push',{ops:[deletion]})).results[0].replayed,true);
+  assert.deepEqual((await read(f)).change_log[1].payload,deletion.payload);
+ });
  await check('real schema rejects an unknown canonical field', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
   await assert.rejects(client.mutation(anyApi.syncProbe.patch,{id:f.row,value:{unknown_field:true}}), /validator|schema|extra field/i);

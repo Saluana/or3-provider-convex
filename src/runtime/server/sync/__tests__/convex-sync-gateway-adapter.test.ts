@@ -349,8 +349,8 @@ describe('ConvexSyncGatewayAdapter', () => {
         const adapter = new ConvexSyncGatewayAdapter();
         const actor = { userId: 'user-1', workspaceId: 'ws-1' };
         const admission = { version: 1 as const, kind: 'new-turn' as const, admissionId: 'admission-1', generationId: 'generation-1', workspaceId: 'ws-1', threadId: 'thread-1', messageId: 'assistant-1',
-            thread: { id: 'thread-1', clock: 1 }, userMessage: { id: 'message-1', thread_id: 'thread-1', role: 'user', clock: 1 },
-            assistantMessage: { id: 'assistant-1', thread_id: 'thread-1', role: 'assistant', clock: 1, data: { generation_id: 'generation-1' } } };
+            thread: { id: 'thread-1', clock: 1, status: 'active', pinned: false, forked: false, deleted: false, created_at: 1, updated_at: 1 }, userMessage: { id: 'message-1', thread_id: 'thread-1', role: 'user', clock: 1, index: 0, order_key: 'a', deleted: false, created_at: 1, updated_at: 1 },
+            assistantMessage: { id: 'assistant-1', thread_id: 'thread-1', role: 'assistant', clock: 1, index: 1, order_key: 'b', deleted: false, created_at: 1, updated_at: 1, data: { generation_id: 'generation-1' } } };
         mutationMock.mockRejectedValueOnce(Object.assign(new Error('rejected'), { data: { code: 'CONFLICT', message: 'rejected' } }));
         await expect(adapter.admitChatGeneration(actor, admission)).rejects.toMatchObject({ code: 'CONFLICT' });
     });
@@ -359,9 +359,9 @@ describe('ConvexSyncGatewayAdapter', () => {
         const adapter = new ConvexSyncGatewayAdapter();
         const actor = { userId: 'user-1', workspaceId: 'ws-1' };
         const admission = { version: 1 as const, kind: 'new-turn' as const, admissionId: 'admission-1', generationId: 'generation-1', workspaceId: 'ws-1', threadId: 'thread-1', messageId: 'assistant-1',
-            thread: { id: 'thread-1', clock: 1, title: 'Chat' },
-            userMessage: { id: 'message-1', thread_id: 'thread-1', role: 'user', clock: 1 },
-            assistantMessage: { id: 'assistant-1', thread_id: 'thread-1', role: 'assistant', clock: 1, data: { generation_id: 'generation-1' } },
+            thread: { id: 'thread-1', clock: 1, title: 'Chat', status: 'active', pinned: false, forked: false, deleted: false, created_at: 1, updated_at: 1 },
+            userMessage: { id: 'message-1', thread_id: 'thread-1', role: 'user', clock: 1, index: 0, order_key: 'a', deleted: false, created_at: 1, updated_at: 1 },
+            assistantMessage: { id: 'assistant-1', thread_id: 'thread-1', role: 'assistant', clock: 1, index: 1, order_key: 'b', deleted: false, created_at: 1, updated_at: 1, data: { generation_id: 'generation-1' } },
         };
         const rows = [
             { tableName: 'threads', payload: admission.thread, wasExisting: false, applied: true },

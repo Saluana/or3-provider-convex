@@ -4,7 +4,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
-import { ChangeStampSchema } from "~~/shared/sync/schemas";
+import { compareSyncTuple, ChangeStampSchema } from "~~/shared/sync/schemas";
 import { readRequestUsage } from "~~/shared/chat/compaction";
 import templateSchema from "../../../templates/convex/schema";
 import { convexJobProvider } from "../server/background-jobs/convex-provider";
@@ -95,7 +95,7 @@ const INDEX_FIELDS: Record<string, string[]> = {
 
 class MemoryQuery {
   private conditions: Array<{
-    op: "eq" | "gt" | "lt" | "lte";
+    op: "eq" | "gt" | "gte" | "lt" | "lte";
     field: string;
     value: unknown;
   }> = [];
@@ -116,6 +116,10 @@ class MemoryQuery {
       },
       gt: (field: string, value: unknown) => {
         this.conditions.push({ op: "gt", field, value });
+        return chain;
+      },
+      gte: (field: string, value: unknown) => {
+        this.conditions.push({ op: "gte", field, value });
         return chain;
       },
       lt: (field: string, value: unknown) => {
@@ -158,13 +162,23 @@ class MemoryQuery {
     const filtered = this.rows.filter((row) =>
       this.conditions.every(({ op, field, value }) => {
         if (op === "eq") return row[field] === value;
+        if (typeof row[field] === "string" && typeof value === "string") {
+          const order = compareSyncTuple([row[field]], [value]);
+          return op === "gt" ? order > 0 : op === "gte" ? order >= 0 : op === "lt" ? order < 0 : order <= 0;
+        }
         if (op === "gt") return row[field] > (value as any);
+        if (op === "gte") return row[field] >= (value as any);
         if (op === "lt") return row[field] < (value as any);
         return row[field] <= (value as any);
       }),
     );
     filtered.sort((left, right) => {
       for (const field of fields) {
+        if (typeof left[field] === "string" && typeof right[field] === "string") {
+          const order = compareSyncTuple([left[field]], [right[field]]);
+          if (order) return this.direction === "asc" ? order : -order;
+          continue;
+        }
         if (left[field] < right[field])
           return this.direction === "asc" ? -1 : 1;
         if (left[field] > right[field])
@@ -212,6 +226,7 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
         _id: "message-doc-1",
         workspace_id: "ws-1",
         id: "message-1",
+        thread_id: "thread-a", role: "assistant", index: 1, order_key: "a", created_at: 1, updated_at: 1,
         deleted: false,
         data: { text: "hello" },
         clock: 1,
@@ -381,7 +396,7 @@ describe("Convex background request usage persistence", () => {
     const adapter = new ConvexSyncGatewayAdapter();
     const admission = { version: 1 as const, kind: "continuation" as const, admissionId: "admission", generationId: "generation-1", expectedAssistant: { clock: 1 },
       workspaceId: "ws-1", threadId: "thread-a", messageId: "message-1",
-      assistantMessage: { id: "message-1", clock: 2, pending: true, thread_id: "thread-a", role: "assistant" as const, data: { generation_id: "generation-1" } } };
+      assistantMessage: { id: "message-1", index: 1, order_key: "b", deleted: false, created_at: 1, updated_at: 1, clock: 2, pending: true, thread_id: "thread-a", role: "assistant" as const, data: { generation_id: "generation-1" } } };
     const actor = { userId: "user-1", workspaceId: "ws-1" };
     await adapter.admitChatGeneration(actor, admission);
     const content = "read content ".repeat(1800);
@@ -427,10 +442,10 @@ describe("Convex background request usage persistence", () => {
     const admission = {
       version: 1 as const, kind: "new-turn" as const, admissionId: "admission-1", generationId: "generation-1",
       workspaceId: "ws-1", threadId: "thread-a", messageId: "message-1",
-      thread: { id: "thread-a", clock: 1 },
-      assistantMessage: { id: "message-1", thread_id: "thread-a", role: "assistant", clock: 1,
+      thread: { id: "thread-a", status: "active", pinned: false, forked: false, deleted: false, created_at: 1, updated_at: 1, clock: 1 },
+      assistantMessage: { id: "message-1", thread_id: "thread-a", role: "assistant", index: 1, order_key: "b", deleted: false, created_at: 1, updated_at: 1, clock: 1,
         data: { generation_id: "generation-1" } },
-      userMessage: { id: "user-message", thread_id: "thread-a", role: "user", clock: 1 },
+      userMessage: { id: "user-message", thread_id: "thread-a", role: "user", index: 0, order_key: "a", deleted: false, created_at: 1, updated_at: 1, clock: 1 },
     };
     const jobId = await convexJobProvider.createJob({
       userId: "user-1", threadId: "thread-a", messageId: "message-1", model: "test-model",
@@ -1071,6 +1086,7 @@ describe("Convex materialized snapshot contract", () => {
           operation: "put",
           pk: "message-dead",
           payload: {
+            id: "message-dead",
             thread_id: "thread-a",
             role: "user",
             index: 1,
@@ -1097,6 +1113,7 @@ describe("Convex materialized snapshot contract", () => {
           operation: "put",
           pk: "message-dead",
           payload: {
+            id: "message-dead",
             thread_id: "thread-a",
             role: "user",
             index: 1,
