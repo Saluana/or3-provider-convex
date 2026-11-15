@@ -117,6 +117,7 @@ function makeFixture(options: {
     };
 
     const ctx = {
+        scheduler: { runAfter: vi.fn(async () => 'scheduled') },
         auth: {
             getUserIdentity: async () => ({
                 issuer: 'https://clerk.example.test',

@@ -28,6 +28,7 @@ import {
     type QueryCtx,
 } from './_generated/server';
 import { ConvexError, v } from 'convex/values';
+import { makeFunctionReference } from 'convex/server';
 import type { Id, TableNames } from './_generated/dataModel';
 import {
     requireCallerSubject,
@@ -284,6 +285,7 @@ async function deleteWorkspaceData(ctx: MutationCtx, workspaceId: Id<'workspaces
     await deleteByIndexBatched('device_cursors', 'by_workspace_device');
     await deleteByIndexBatched('workspace_members', 'by_workspace');
     await deleteByIndexBatched('server_version_counter', 'by_workspace');
+    await ctx.scheduler.runAfter(0, makeFunctionReference<'mutation'>('sync:purgeSnapshotPages'), { workspace_id: workspaceId });
 }
 
 /**

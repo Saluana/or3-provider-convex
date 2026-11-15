@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as hostSettings from '../../../templates/convex/hostSettings';
 import * as adminFunctions from '../../../templates/convex/admin';
 import * as syncFunctions from '../../../templates/convex/sync';
@@ -68,6 +68,7 @@ function fixture(options: {
     let nextId = 1;
 
     const ctx = {
+        scheduler: { runAfter: vi.fn(async () => 'scheduled') },
         auth: {
             getUserIdentity: async () =>
                 options.identity === undefined ? SERVER_IDENTITY : options.identity,

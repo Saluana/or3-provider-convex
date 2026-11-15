@@ -680,7 +680,8 @@ Snapshot continuation responses are persisted as bounded UTF-8 chunks until the
 one-hour session expiry. Repeating the same token and page size returns the same
 page during concurrent writes; authorization, table/mode and capability checks
 still run on every request. Maintenance removes expired page chunks within the
-shared transaction read budget. Deploy the scaffold to install the additive
+shared transaction read budget. Workspace deletion schedules a separate bounded
+purge for its cached pages. Deploy the scaffold to install the additive
 `sync_snapshot_pages` table.
 
 The provider does not advertise `unavailableRecords`. A visible historical
@@ -694,3 +695,9 @@ CI and tag qualification check out the exact host commit recorded in
 with that original source after module-path spelling changes. Updating only the
 generated manifest hash cannot bless a weaker validator. The referenced host
 commit must be available remotely before release qualification can pass.
+
+The disposable sync-hardening harness additionally qualifies upgrades from the
+exact published 0.0.26 template pack when `OR3_CONVEX_UPGRADE_PACK` points to its
+`templates/convex.pack.json.gz`. It verifies the pack digest, deploys that backend,
+commits legacy rows/receipts, then deploys the candidate and checks exact replay.
+Release CI supplies this fixture and retains the upgrade receipt artifact.

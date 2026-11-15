@@ -5,8 +5,9 @@
 // expired snapshots retain bodies forever. This runs the shipped handlers against
 // a fresh official loopback Convex backend, including its validators and rollback.
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
+import { cp, mkdir, mkdtemp, writeFile, readFile } from 'node:fs/promises';
+import { randomBytes, createHash } from 'node:crypto';
+import { gunzipSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { ConvexHttpClient } from 'convex/browser';
@@ -33,6 +34,7 @@ import { v, getConvexSize } from 'convex/values';
 import * as sync from './sync';
 import * as notifications from './notifications';
 import * as storage from './storage';
+import * as workspaces from './workspaces';
 import { applyServerAuthoredOp } from './syncAuthoring';
 const actor=(ctx:any,subject:string)=>({...ctx,auth:{getUserIdentity:async()=>({subject,issuer:'https://clerk.example.test'})}});
 export const seed=internalMutation({args:{},handler:async(ctx)=>{
@@ -71,6 +73,15 @@ export const invoke=internalMutation({args:{workspace:v.id('workspaces'),name:v.
 export const authored=internalMutation({args:{workspace:v.id('workspaces'),op:v.any()},handler:(ctx,args)=>applyServerAuthoredOp(ctx,args.workspace,args.op)});
 export const patch=internalMutation({args:{id:v.string(),value:v.any()},handler:(ctx,args)=>ctx.db.patch(args.id as any,args.value)});
 export const insert=internalMutation({args:{table:v.string(),value:v.any()},handler:(ctx,args)=>ctx.db.insert(args.table as any,args.value)});
+export const removeOwnedFixture=internalMutation({args:{workspace:v.id('workspaces')},handler:async(ctx,args)=>{
+ const owner=await ctx.db.get(args.workspace);
+ const member=await ctx.db.query('workspace_members').withIndex('by_workspace_user',q=>q.eq('workspace_id',args.workspace).eq('user_id',owner!.owner_user_id)).first();
+ await ctx.db.patch(member!._id,{role:'owner'});
+ return (workspaces.remove as any)._handler(actor(ctx,args.workspace+'a'),{workspace_id:args.workspace});
+}});
+export const upgradeState=internalQuery({args:{workspace:v.id('workspaces')},handler:async(ctx,args)=>{
+ const result:any={};for(const table of ['threads','notifications','change_log','server_version_counter'])result[table]=await (ctx.db as any).query(table).filter((q:any)=>q.eq(q.field('workspace_id'),args.workspace)).collect();return result;
+}});
 export const seedExpiredSessions=internalMutation({args:{workspace:v.id('workspaces')},handler:async(ctx,args)=>{for(let i=0;i<205;i++)await ctx.db.insert('sync_snapshot_sessions',{workspace_id:args.workspace,user_id:'expired',high_watermark:1,tables:['kv'],created_at:1,expires_at:2});}});
 export const gcPage=internalMutation({args:{workspace_id:v.id('workspaces'),retention_seconds:v.number(),batch_size:v.number()},handler:async(ctx,args)=>{
  const result=await (sync.runWorkspaceGc as any)._handler(ctx,args);
@@ -80,7 +91,8 @@ export const gcPage=internalMutation({args:{workspace_id:v.id('workspaces'),rete
 export const original=internalQuery({args:{id:v.string()},handler:(ctx,args)=>ctx.db.get(args.id as any)});
 export const jobCount=internalQuery({args:{user:v.string()},handler:async(ctx,args)=>(await ctx.db.query('background_jobs').withIndex('by_user',q=>q.eq('user_id',args.user)).collect()).length});
 export const age=internalMutation({args:{workspace:v.id('workspaces'),version:v.number(),old:v.number()},handler:async(ctx,args)=>{const row=await ctx.db.query('change_log').withIndex('by_workspace_version',q=>q.eq('workspace_id',args.workspace).eq('server_version',args.version)).first();if(row)await ctx.db.patch(row._id,{created_at:args.old});}});
-export const expire=internalMutation({args:{workspace:v.id('workspaces'),old:v.number()},handler:async(ctx,args)=>{for(const table of ['sync_snapshot_sessions','sync_snapshot_pages'] as const)for(const row of await ctx.db.query(table).withIndex('by_workspace',q=>q.eq('workspace_id',args.workspace)).collect())await ctx.db.patch(row._id,{expires_at:args.old});}});
+// Age fixture leases in bounded transactions, including large response chunks.
+export const expire=internalMutation({args:{workspace:v.id('workspaces'),old:v.number()},handler:async(ctx,args)=>{let count=0;for(const table of ['sync_snapshot_sessions','sync_snapshot_pages'] as const)for(const row of await (ctx.db as any).query(table).withIndex('by_workspace_expiry',(q:any)=>q.eq('workspace_id',args.workspace).gt('expires_at',args.old)).take(1)){await ctx.db.patch(row._id,{expires_at:args.old});count++;}return count;}});
 export const read=internalQuery({args:{workspace:v.id('workspaces')},handler:async(ctx,args)=>{
  const result:any={};for(const name of ['kv','notifications','file_meta','upload_intents','change_log','server_version_counter','device_cursors','sync_snapshot_sessions','sync_snapshot_pages','sync_record_versions'])result[name]=await ctx.db.query(name as any).withIndex(({file_meta:'by_workspace_hash',kv:'by_workspace_id',device_cursors:'by_workspace_version',upload_intents:'by_workspace_status',change_log:'by_workspace_version',sync_record_versions:'by_workspace_version'} as any)[name]??'by_workspace',(q:any)=>q.eq('workspace_id',args.workspace)).collect();return result;
 }});
@@ -109,10 +121,61 @@ try {
  const deploy = Bun.spawn([process.execPath, join(provider, 'node_modules/convex/bin/main.js'), 'deploy', '--yes', '--typecheck', 'enable', '--env-file', envPath], { cwd: root, env, stdout: Bun.file(join(root, 'deploy.log')), stderr: Bun.file(join(root, 'deploy-errors.log')) });
  assert.equal(await deploy.exited, 0, 'Sandbox deployment failed: ' + root);
 
+ if(process.env.OR3_CONVEX_UPGRADE_PACK)await check('review: published 0.0.26 receipts and rows survive deployment upgrade', async () => {
+  const candidate=join(root,'candidate');await cp(join(root,'convex'),candidate,{recursive:true});
+  const packed=await readFile(process.env.OR3_CONVEX_UPGRADE_PACK);
+  assert.equal(createHash('sha256').update(packed).digest('hex'),'d2897f162d47b492870f9ca23ce7329f934dd9efac9b8c0c7825d46da6aa8713','Use the exact published 0.0.26 template pack');
+  const published=JSON.parse(gunzipSync(packed));
+  const probe=await readFile(join(root,'convex/syncProbe.ts'));
+  const deployTemplates=async(label)=>{
+   const child=Bun.spawn([process.execPath,join(provider,'node_modules/convex/bin/main.js'),'deploy','--yes','--typecheck','enable','--env-file',envPath],{cwd:root,env,stdout:Bun.file(join(root,label+'.log')),stderr:Bun.file(join(root,label+'-errors.log'))});assert.equal(await child.exited,0,'Upgrade deployment failed: '+root);
+  };
+  let f,writes,before;
+  try {
+   for(const [name,source] of Object.entries(published.files)){await mkdir(join(root,'convex',name,'..'),{recursive:true});await writeFile(join(root,'convex',name),source);}
+   await writeFile(join(root,'convex/auth.config.ts'),'export default { providers: [] };\n');await writeFile(join(root,'convex/syncProbe.ts'),probe);
+   await deployTemplates('published');
+   f=await client.mutation(anyApi.syncProbe.seed,{});
+   writes=[
+    op({table_name:'threads',pk:'old-thread',payload:{id:'old-thread',status:'active',pinned:false,forked:false,fork_reason:null,deleted:false,created_at:1,updated_at:2,clock:6}}),
+    op({table_name:'notifications',pk:'old-note',payload:{id:'old-note',user_id:f.user,type:'info',title:'old',actions:[{legacy_action:'open'},'legacy-string',null],deleted:false,created_at:1,updated_at:2,clock:6}}),
+    op({pk:'deleted',operation:'delete',payload:{updated_at:123,value:'keep'}}),
+   ];
+   for(const write of writes){const result=await invoke(f,'push',{ops:[write]});assert.equal(result.results[0].success,true,JSON.stringify(result));}
+   before=await client.query(anyApi.syncProbe.upgradeState,{workspace:f.workspace});
+  } finally {
+   await cp(candidate,join(root,'convex'),{recursive:true});await deployTemplates('candidate-upgrade');
+  }
+  for(const write of writes){const replay=await invoke(f,'push',{ops:[write]});assert.equal(replay.results[0].replayed,true,JSON.stringify(replay));}
+  const after=await client.query(anyApi.syncProbe.upgradeState,{workspace:f.workspace});
+  assert.deepEqual(after,before,'Lost-ACK replay must not mutate original receipts, revisions or rows');
+  const page=await invoke(f,'pull',{cursor:5,limit:100});PullResponseSchema.parse(page);for(const change of page.changes)if(change.op==='put')TABLE_PAYLOAD_SCHEMAS[change.tableName].parse(change.payload);
+  const snapshot=await invoke(f,'snapshot',{tables:['threads','notifications'],page_size:100});SnapshotResponseSchema.parse(snapshot);for(const item of snapshot.items)if(item.kind==='row')TABLE_PAYLOAD_SCHEMAS[item.tableName].parse(item.payload);
+  assert.equal(await invoke(f,'markNotificationRead',{notification_id:'old-note'}),true);
+  assert.deepEqual((await client.query(anyApi.syncProbe.upgradeState,{workspace:f.workspace})).notifications[0].actions,writes[1].payload.actions);
+  await writeFile(join(evidence,'published-upgrade.json'),JSON.stringify({version:'0.0.26',templateSha256:createHash('sha256').update(packed).digest('hex'),operations:writes.map(write=>write.op_id),fingerprints:before.change_log.map(row=>createHash('sha256').update(row.request_fingerprint).digest('hex')),unchangedAfterReplay:true}));
+ });
  await check('review: bad stored operation IDs fail closed without unavailable negotiation', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
   await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:{workspace_id:f.workspace,server_version:5,table_name:'kv',pk:'a',op:'put',payload:{id:'a',name:'setting',clock:5,created_at:1,updated_at:1},clock:5,hlc:'5:0:dev',device_id:'device',op_id:'background-tool:legacy',created_at:1}});
   for(const name of ['pull','watchChanges'])await assert.rejects(invoke(f,name,{cursor:4,limit:10}),/Invalid stored sync operation ID/);
+  const bad=await client.mutation(anyApi.syncProbe.seed,{});
+  const payload={id:'bad-note',user_id:bad.user,type:'info',title:'bad',actions:{legacy:true},deleted:false,created_at:1,updated_at:1,clock:5};
+  await client.mutation(anyApi.syncProbe.insert,{table:'notifications',value:{...payload,workspace_id:bad.workspace,server_version:5}});
+  await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:{workspace_id:bad.workspace,server_version:5,table_name:'notifications',pk:'bad-note',op:'put',payload,clock:5,hlc:'5:0:dev',device_id:'device',op_id:crypto.randomUUID(),created_at:1}});
+  const pull=await invoke(bad,'pull',{cursor:4,limit:10});assert.equal(pull.changes.length,1);assert.equal(TABLE_PAYLOAD_SCHEMAS.notifications.safeParse(pull.changes[0].payload).success,false);
+  const snapshot=await invoke(bad,'snapshot',{tables:['notifications'],page_size:10});assert.equal(snapshot.items.length,1);assert.equal(TABLE_PAYLOAD_SCHEMAS.notifications.safeParse(snapshot.items[0].payload).success,false);
+
+ });
+ await check('review: workspace removal drains persisted snapshot pages', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const first=await invoke(f,'snapshot',{tables:['kv'],page_size:1});
+  await invoke(f,'snapshot',{tables:['kv'],page_size:1,page_token:first.nextPageToken});
+  assert.equal((await read(f)).sync_snapshot_pages.length,1);
+  await client.mutation(anyApi.syncProbe.removeOwnedFixture,{workspace:f.workspace});
+  for(let i=0;i<30 && (await read(f)).sync_snapshot_pages.length;i++)await Bun.sleep(100);
+  assert.equal((await read(f)).sync_snapshot_pages.length,0);
+  await assert.rejects(invoke(f,'snapshot',{tables:['kv'],page_size:1,page_token:first.nextPageToken}),/Unauthorized|Forbidden|Workspace|workspace/);
  });
  await check('review: identical snapshot tokens replay identical pages after concurrent writes', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
@@ -122,6 +185,7 @@ try {
   assert.equal(second.items[0].pk,'z');
   for(const id of ['b','z']){const result=await invoke(f,'push',{ops:[op({pk:id,payload:{id,name:'setting',value:'x'.repeat(240*1024),deleted:false,clock:6,created_at:1,updated_at:2}})]});assert.equal(result.results[0].success,true,JSON.stringify(result));}
   assert.deepEqual(await invoke(f,'snapshot',request),second);
+  await assert.rejects(invoke(f,'snapshot',request,{actor:'b'}),/unavailable/);
   await writeFile(join(evidence,'snapshot-retry.json'),JSON.stringify({first,second,retry:await invoke(f,'snapshot',request)}));
  });
  await check('70 large KV rows pull, snapshot and combined GC advance below transaction limits', async () => {
@@ -133,14 +197,14 @@ try {
   for(let i=0;i<100;i++){const page=await measure('pull',{cursor,limit:300});PullResponseSchema.parse(page);count+=page.changes.length;if(!page.hasMore)break;assert(page.nextCursor>cursor);cursor=page.nextCursor;}
   assert.equal(count,70);
   let token,countSnapshot=0;
-  for(let i=0;i<100;i++){const page=await measure('snapshot',{tables:['kv'],page_size:300,page_token:token});SnapshotResponseSchema.parse(page);for(const item of page.items)if(item.kind==='row')TABLE_PAYLOAD_SCHEMAS.kv.parse(item.payload);countSnapshot+=page.items.length;if(!page.nextPageToken)break;assert.notEqual(page.nextPageToken,token);token=page.nextPageToken;}
+  for(let i=0;i<100;i++){if(token)await Bun.sleep(350);const request={tables:['kv'],page_size:300,page_token:token};const page=await measure('snapshot',request);if(token)assert.deepEqual(await measure('snapshot',request),page);SnapshotResponseSchema.parse(page);for(const item of page.items)if(item.kind==='row')TABLE_PAYLOAD_SCHEMAS.kv.parse(item.payload);countSnapshot+=page.items.length;if(!page.nextPageToken)break;assert.notEqual(page.nextPageToken,token);token=page.nextPageToken;}
   assert.equal(countSnapshot,72);
   // Overwrite the same records: each transaction creates a large preimage.
   for(let i=0;i<70;i++){await Bun.sleep(350);const id='large-'+String(i).padStart(3,'0');assert.equal((await invoke(f,'push',{ops:[op({pk:id,clock:7,hlc:'7:0:dev',payload:{id,name:'large',value:'y'.repeat(240*1024),clock:7,created_at:1,updated_at:3,deleted:false}})]})).results[0].success,true);}
   const old=Math.floor(Date.now()/1000)-7200;
   // Patch one indexed page at a time; never use the unbounded fixture reader.
   for(let cursor=5;;){const page=await invoke(f,'pull',{cursor,limit:1});for(const change of page.changes)await client.mutation(anyApi.syncProbe.age,{workspace:f.workspace,version:change.serverVersion,old});if(!page.hasMore)break;cursor=page.nextCursor;}
-  await client.mutation(anyApi.syncProbe.expire,{workspace:f.workspace,old});
+  for(let i=0;i<1000;i++){if(!await client.mutation(anyApi.syncProbe.expire,{workspace:f.workspace,old}))break;assert(i<999,'Fixture expiry must drain');}
   let gc;
   for(let i=0;i<200;i++){gc=await measure('runWorkspaceGc',{retention_seconds:3600,batch_size:100,continuation_count:999});if(!gc.hasMore)break;}
   assert.equal(gc.hasMore,false);

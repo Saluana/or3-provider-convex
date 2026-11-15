@@ -2887,6 +2887,19 @@ export const getServerVersion = query({
  * - Is unavailable to public Convex callers
  * - Scans and deletes at most `batch_size` records
  */
+/** Workspace deletion schedules this separately: cached responses can be much
+ * larger than the workspace's current records and must not share its deletion
+ * transaction. The function remains internal and uses indexed bounded pages. */
+export const purgeSnapshotPages = internalMutation({
+    args: { workspace_id: v.id('workspaces') },
+    handler: async (ctx, args) => {
+        const page = await readSyncBatch(ctx.db.query('sync_snapshot_pages')
+            .withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id)), 100, newSyncReadBudget());
+        for (const row of page.rows) await ctx.db.delete(row._id);
+        if (page.hasMore) await ctx.scheduler.runAfter(0, makeFunctionReference<'mutation'>('sync:purgeSnapshotPages'), args);
+    },
+});
+
 /** Bounded maintenance. A pre-image can only serve snapshots begun before its
  * write, so its one-hour lease outlives every session that could need it. */
 async function collectSyncState(ctx: MutationCtx, workspaceId: Id<'workspaces'>, retentionSeconds: number, batchSize: number, budget: SyncReadBudget) {
