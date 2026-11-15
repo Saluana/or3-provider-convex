@@ -57,6 +57,7 @@ import { canRunSyncHistoryGc } from '../../utils/sync-history-gc-policy';
 import { getConvexClient } from '../utils/convex-client';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
 import { validateCanonicalChatQuery, type CanonicalChatQuery, type CanonicalChatReadResult } from '~~/shared/chat/history-reader';
+import { prepareToolResultStorage, parseToolResultArtifact, matchesToolResultStorage, type ToolResultArtifactRow } from '~~/shared/chat/tool-result-artifact';
 
 function historyFailure(code: string, message: string, cause?: unknown): Error {
     return Object.assign(new Error(message, { cause }), { code });
@@ -70,7 +71,7 @@ function parseRequiredHistoryAdmission(input: unknown): ChatGenerationAdmissionE
 function normalizeHistoryFailure(error: unknown): never {
     const data = error && typeof error === 'object' && 'data' in error ? error.data : undefined;
     if (data && typeof data === 'object' && 'code' in data && typeof data.code === 'string' &&
-        ['VALIDATION_ERROR', 'FORBIDDEN', 'CONFLICT', 'SUPERSEDED'].includes(data.code)) {
+        ['VALIDATION_ERROR', 'FORBIDDEN', 'CONFLICT', 'SUPERSEDED', 'TOOL_RESULT_UNAVAILABLE'].includes(data.code)) {
         throw historyFailure(data.code, error instanceof Error ? error.message : 'Background history rejected', error);
     }
     throw error;
@@ -115,7 +116,7 @@ function fingerprint(value: unknown): string {
 
 function backgroundHistoryOpId(
     admission: Pick<ChatGenerationAdmissionEnvelope, 'workspaceId' | 'generationId'>,
-    stage: 'thread' | 'user' | 'assistant' | 'finalize'
+    stage: string
 ): string {
     const hex = createHash('sha256')
         .update(`${admission.workspaceId}\0${admission.generationId}\0${stage}`)
@@ -491,6 +492,52 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
             op_id: backgroundHistoryOpId(admission, 'finalize'),
             snapshot: input.snapshot,
         }).catch(normalizeHistoryFailure) as FinalizeChatGenerationResult;
+    }
+
+    async retainChatToolResult(actor: CanonicalHistoryActor, input: {
+        admission: ChatGenerationAdmissionEnvelope; callId: string; reference: string; rows: ToolResultArtifactRow[];
+    }): Promise<void> {
+        const admission = parseRequiredHistoryAdmission(input.admission);
+        if (actor.workspaceId !== admission.workspaceId || !input.callId || new TextEncoder().encode(input.callId).length > 512 ||
+            !Array.isArray(input.rows) || !input.rows.length || input.rows.length > 32 ||
+            input.rows.some(row => !row || typeof row.value !== 'string' || new TextEncoder().encode(row.value).length > 64 * 1024 ||
+                row.clock !== 1 || row.deleted !== false || !Number.isSafeInteger(row.created_at) || row.created_at < 0 ||
+                !Number.isSafeInteger(row.updated_at) || row.updated_at < 0))
+            throw historyFailure('VALIDATION_ERROR', 'Invalid tool result retention');
+        const expected = await prepareToolResultStorage(input.rows.map(row => row.value).join(''), {
+            threadId: admission.threadId, parentAssistantId: admission.messageId, callId: input.callId,
+        });
+        if (expected.result !== input.reference || expected.rows.length !== input.rows.length || expected.rows.some((row, index) =>
+            row.id !== input.rows[index]?.id || row.name !== input.rows[index]?.name || row.value !== input.rows[index]?.value))
+            throw historyFailure('VALIDATION_ERROR', 'Invalid tool result identity');
+        await getConvexClient().mutation(internalApi.sync.retainChatToolResult, {
+            ...this.toolResultParent(actor, admission), device_id: backgroundHistoryDeviceId(admission.generationId),
+            rows: input.rows.map(row => ({ record: row, op_id: backgroundHistoryOpId(admission, `tool:${row.id}`) })),
+        }).catch(normalizeHistoryFailure);
+    }
+
+    async readChatToolResult(actor: CanonicalHistoryActor, input: {
+        admission: ChatGenerationAdmissionEnvelope; callId: string; reference: string;
+    }): Promise<string> {
+        const admission = parseRequiredHistoryAdmission(input.admission);
+        const manifest = parseToolResultArtifact(input.reference);
+        if (!manifest || manifest.threadId !== admission.threadId || !input.callId || new TextEncoder().encode(input.callId).length > 512)
+            throw historyFailure('VALIDATION_ERROR', 'Invalid tool result reference');
+        const result = await getConvexClient().query(internalApi.sync.readChatToolResult, {
+            ...this.toolResultParent(actor, admission),
+            ids: Array.from({ length: manifest.parts }, (_, index) => `tool-result:${manifest.id}:${index}`),
+        }).catch(normalizeHistoryFailure) as string;
+        if (typeof result !== 'string' || !matchesToolResultStorage(input.reference, result, {
+            threadId: admission.threadId, parentAssistantId: admission.messageId, callId: input.callId,
+        })) throw historyFailure('TOOL_RESULT_UNAVAILABLE', 'Tool result is unavailable or corrupt');
+        return result;
+    }
+
+    private toolResultParent(actor: CanonicalHistoryActor, admission: ChatGenerationAdmissionEnvelope) {
+        if (actor.workspaceId !== admission.workspaceId) throw historyFailure('VALIDATION_ERROR', 'Invalid tool result workspace');
+        return { workspace_id: toWorkspaceId(admission.workspaceId), actor_user_id: actor.userId as Id<'users'>,
+            generation_id: admission.generationId, message_id: admission.messageId, thread_id: admission.threadId,
+            admission_clock: admission.assistantMessage.clock, fingerprint: fingerprint(admission) };
     }
 
     async pull(event: H3Event, input: PullRequest): Promise<PullResponse> {

@@ -15,6 +15,7 @@ import { registerAuthWorkspaceStore } from "~~/server/auth/store/registry";
 import type { AuthWorkspaceStore } from "~~/server/auth/store/types";
 import { canonicalHistoryContext } from "~~/server/utils/chat/canonical-history-context";
 import { createHistoryRetrievalService } from "~~/shared/chat/history-retrieval";
+import { prepareToolResultStorage, readToolResultStorage } from "~~/shared/chat/tool-result-artifact";
 
 const localTransport = vi.hoisted(() => ({
   query: vi.fn(), mutation: vi.fn(), adapter: undefined as any,
@@ -366,6 +367,48 @@ function finalizationInput(usage: unknown = measuredUsage()) {
 }
 
 describe("Convex background request usage persistence", () => {
+  // Retention must authorize the live generation, refuse deleted/corrupt chunks,
+  // and replay without allocating versions; synced references must stay readable.
+  it("retains ordinary tool results through the real adapter, template and second-client pull", async () => {
+    const fixture = createFixture("editor");
+    fixture.tables.messages[0]!.data = { generation_id: "generation-1" };
+    const route = async (reference: any, args: any) => {
+      const [, name] = getFunctionName(reference).split(":");
+      return await (syncFunctions[name!] as RegisteredFunction)._handler(fixture.ctx, structuredClone(args));
+    };
+    localTransport.query.mockImplementation(route);
+    localTransport.mutation.mockImplementation(route);
+    const adapter = new ConvexSyncGatewayAdapter();
+    const admission = { version: 1 as const, kind: "continuation" as const, admissionId: "admission", generationId: "generation-1", expectedAssistant: { clock: 1 },
+      workspaceId: "ws-1", threadId: "thread-a", messageId: "message-1",
+      assistantMessage: { id: "message-1", clock: 2, pending: true, thread_id: "thread-a", role: "assistant" as const, data: { generation_id: "generation-1" } } };
+    const actor = { userId: "user-1", workspaceId: "ws-1" };
+    await adapter.admitChatGeneration(actor, admission);
+    const content = "read content ".repeat(1800);
+    const prepared = await prepareToolResultStorage(content, { threadId: admission.threadId, parentAssistantId: admission.messageId, callId: "read" });
+    expect(prepared.rows).toHaveLength(1);
+    const input = { admission, callId: "read", reference: prepared.result, rows: prepared.rows };
+    await adapter.retainChatToolResult!(actor, input);
+    const version = fixture.tables.server_version_counter[0]!.value;
+    await adapter.retainChatToolResult!(actor, structuredClone(input));
+    expect(fixture.tables.server_version_counter[0]!.value).toBe(version);
+    expect(await adapter.readChatToolResult!(actor, { admission, callId: "read", reference: prepared.result })).toBe(content);
+    const pulled = await (syncFunctions.pull as RegisteredFunction)._handler(fixture.ctx, { workspace_id: "ws-1", cursor: 5, limit: 100 });
+    const chunks = new Map(pulled.changes.filter((change: any) => change.tableName === "kv").map((change: any) => {
+      expect(ChangeStampSchema.safeParse(change.stamp).success).toBe(true);
+      return [change.pk, change.payload];
+    }));
+    expect(await readToolResultStorage(prepared.result, async id => chunks.get(id) as any)).toBe(content);
+    fixture.tables.kv[0]!.deleted = true;
+    await expect(adapter.retainChatToolResult!(actor, input)).rejects.toThrow();
+    await expect(adapter.readChatToolResult!(actor, { admission, callId: "read", reference: prepared.result })).rejects.toMatchObject({ code: "TOOL_RESULT_UNAVAILABLE" });
+    fixture.tables.kv[0]!.deleted = false;
+    fixture.tables.messages[0]!.data.generation_id = "replacement";
+    await expect(adapter.retainChatToolResult!(actor, input)).rejects.toThrow();
+    fixture.tables.workspace_members.length = 0;
+    await expect(adapter.readChatToolResult!(actor, { admission, callId: "read", reference: prepared.result })).rejects.toThrow();
+  });
+
   it.each(["complete", "error", "aborted"] as const)("reconciles %s provider usage through the immutable host and actual gateway/finalizer/second-client pull", async (status) => {
     const fixture = createFixture("editor");
     fixture.tables.messages[0]!.data = { generation_id: "generation-1", custom: "keep", compaction: { marker: "keep" } };

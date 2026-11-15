@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Saluana/or3-chat
-          ref: 8e51143840af95380e819d6b4894a06c57735c75
+          ref: f023391feba96f3424431dbaaa8a8c97074ef452
           path: qualification-host
       - name: Install canonical host qualification dependencies
         working-directory: qualification-host

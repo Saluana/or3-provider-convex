@@ -149,6 +149,8 @@ export const convexInternalApiContractNames = [
     'sync:gcTombstones',
     'sync:admitChatGeneration',
     'sync:finalizeChatGeneration',
+    'sync:retainChatToolResult',
+    'sync:readChatToolResult',
     'sync:runScheduledGc',
     'sync:runWorkspaceGc',
     'users:getAuthAccountByProvider',

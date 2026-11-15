@@ -1447,7 +1447,7 @@ export const push = mutation({
 });
 
 async function requireCanonicalGenerationActor(
-    ctx: MutationCtx,
+    ctx: MutationCtx | QueryCtx,
     workspaceId: Id<'workspaces'>,
     actorUserId: Id<'users'>
 ): Promise<void> {
@@ -1554,7 +1554,7 @@ export const readChatHistory = internalQuery({
 });
 
 async function generationReceipt(
-    ctx: MutationCtx,
+    ctx: MutationCtx | QueryCtx,
     workspaceId: Id<'workspaces'>,
     generationId: string,
     stage: 'admission' | 'finalization'
@@ -1568,6 +1568,95 @@ async function generationReceipt(
         )
         .first();
 }
+
+const toolResultParentArgs = {
+    workspace_id: v.id('workspaces'), actor_user_id: v.id('users'), generation_id: v.string(),
+    message_id: v.string(), thread_id: v.string(), admission_clock: v.number(), fingerprint: v.string(),
+};
+
+async function requireToolResultParent(ctx: MutationCtx | QueryCtx, args: {
+    workspace_id: Id<'workspaces'>; actor_user_id: Id<'users'>; generation_id: string;
+    message_id: string; thread_id: string; admission_clock: number; fingerprint: string;
+}): Promise<void> {
+    await requireCanonicalGenerationActor(ctx, args.workspace_id, args.actor_user_id);
+    const receipt = await generationReceipt(ctx, args.workspace_id, args.generation_id, 'admission');
+    const thread = await ctx.db.query('threads').withIndex('by_workspace_id', q =>
+        q.eq('workspace_id', args.workspace_id).eq('id', args.thread_id)).first();
+    const assistant = await ctx.db.query('messages').withIndex('by_workspace_id', q =>
+        q.eq('workspace_id', args.workspace_id).eq('id', args.message_id)).first();
+    const data = assistant?.data as { generation_id?: string } | undefined;
+    if (!receipt || receipt.outcome !== 'admitted' || receipt.fingerprint !== args.fingerprint || !thread || thread.deleted ||
+        !assistant || assistant.deleted || assistant.clock !== args.admission_clock || assistant.thread_id !== args.thread_id ||
+        assistant.pending !== true || data?.generation_id !== args.generation_id)
+        throw new ConvexError({ code: 'SUPERSEDED', message: 'Tool result parent history is unavailable' });
+}
+
+/** Retain immutable tool chunks and publish their sync changes atomically. */
+export const retainChatToolResult = internalMutation({
+    args: { ...toolResultParentArgs, device_id: v.string(), rows: v.array(v.object({ record: v.any(), op_id: v.string() })) },
+    handler: async (ctx, args) => {
+        await requireToolResultParent(ctx, args);
+        if (!args.rows.length || args.rows.length > 32) throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid tool chunks' });
+        const fresh = [];
+        let bytes = 0;
+        const ids = new Set<string>();
+        for (const entry of args.rows) {
+            const row = entry.record;
+            if (!row || typeof row.id !== 'string' || !/^tool-result:[a-f0-9]{64}:\d+$/.test(row.id) || ids.has(row.id) ||
+                row.name !== `chat.tool-result:${encodeURIComponent(args.thread_id)}:${row.id.slice('tool-result:'.length)}` ||
+                typeof row.value !== 'string' || new TextEncoder().encode(row.value).length > 64 * 1024 ||
+                row.clock !== 1 || row.deleted !== false || !Number.isSafeInteger(row.created_at) || row.created_at < 0 ||
+                !Number.isSafeInteger(row.updated_at) || row.updated_at < 0 || !isSyncUuid(entry.op_id))
+                throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid tool chunk' });
+            ids.add(row.id); bytes += new TextEncoder().encode(row.value).length;
+            const tombstone = await ctx.db.query('tombstones').withIndex('by_workspace_table_pk', q =>
+                q.eq('workspace_id', args.workspace_id).eq('table_name', 'kv').eq('pk', row.id)).first();
+            const existing = await ctx.db.query('kv').withIndex('by_workspace_id', q =>
+                q.eq('workspace_id', args.workspace_id).eq('id', row.id)).first();
+            if (tombstone || existing?.deleted) throw new ConvexError({ code: 'SUPERSEDED', message: 'Tool result was deleted' });
+            if (existing) {
+                if (existing.clock !== 1 || existing.name !== row.name || existing.value !== row.value)
+                    throw new ConvexError({ code: 'CONFLICT', message: 'Conflicting tool result retention' });
+            } else fresh.push(entry);
+        }
+        if (bytes > 256 * 1024) throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid tool result size' });
+        if (!fresh.length) return;
+        const start = await allocateServerVersions(ctx, args.workspace_id, fresh.length);
+        const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+        for (const [index, entry] of fresh.entries()) {
+            const row = entry.record;
+            const payload = { id: row.id, name: row.name, value: row.value, clock: 1, deleted: false,
+                created_at: row.created_at, updated_at: row.updated_at, hlc, op_id: entry.op_id };
+            await applyOpToTable(ctx, args.workspace_id, { table_name: 'kv', operation: 'put', pk: row.id,
+                payload, clock: 1, hlc, op_id: entry.op_id }, start + index, start - 1);
+            await ctx.db.insert('change_log', { workspace_id: args.workspace_id, server_version: start + index,
+                table_name: 'kv', pk: row.id, op: 'put', payload, clock: 1, hlc, device_id: args.device_id,
+                op_id: entry.op_id, created_at: nowSec() });
+        }
+    },
+});
+
+export const readChatToolResult = internalQuery({
+    args: { ...toolResultParentArgs, ids: v.array(v.string()) },
+    handler: async (ctx, args) => {
+        await requireToolResultParent(ctx, args);
+        if (!args.ids.length || args.ids.length > 32) throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid tool chunks' });
+        const parts = [];
+        let bytes = 0;
+        for (const id of args.ids) {
+            const row = await ctx.db.query('kv').withIndex('by_workspace_id', q =>
+                q.eq('workspace_id', args.workspace_id).eq('id', id)).first();
+            if (!row || row.deleted || row.clock !== 1 || typeof row.value !== 'string' ||
+                new TextEncoder().encode(row.value).length > 64 * 1024 ||
+                row.name !== `chat.tool-result:${encodeURIComponent(args.thread_id)}:${id.slice('tool-result:'.length)}`)
+                throw new ConvexError({ code: 'TOOL_RESULT_UNAVAILABLE', message: 'Tool result is unavailable or corrupt' });
+            bytes += new TextEncoder().encode(row.value).length;
+            parts.push(row.value);
+        }
+        if (bytes > 256 * 1024) throw new ConvexError({ code: 'TOOL_RESULT_UNAVAILABLE', message: 'Invalid tool result size' });
+        return parts.join('');
+    },
+});
 
 /** Atomically admits the rows a background generation owns before execution. */
 export const admitChatGeneration = internalMutation({
