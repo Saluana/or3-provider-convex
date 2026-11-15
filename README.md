@@ -688,3 +688,9 @@ change with an invalid operation ID fails the page instead of acknowledging a
 silently omitted version. Other malformed payloads still reach the host's strict
 validation and fail closed. Historical null thread fork reasons normalize to
 omission on reads without changing stored revisions or receipt fingerprints.
+
+CI and tag qualification check out the exact host commit recorded in
+`templates/convex/syncContract/source.json` and compare every generated validator
+with that original source after module-path spelling changes. Updating only the
+generated manifest hash cannot bless a weaker validator. The referenced host
+commit must be available remotely before release qualification can pass.

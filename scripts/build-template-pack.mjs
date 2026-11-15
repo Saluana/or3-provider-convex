@@ -45,8 +45,12 @@ if (hostFlag !== -1) {
 const sourceManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 for (const [file, digest] of Object.entries(sourceManifest.files)) {
     if (sha256(readFileSync(resolve(contractRoot, templatePath(file)))) !== digest.generated) throw new Error(`Generated source parity failed: ${file}`);
-    if (checkFlag !== -1 && sha256(readFileSync(resolve(process.argv[checkFlag + 1], file))) !== digest.source)
-        throw new Error(`Host source parity failed: ${file}`);
+    if (checkFlag !== -1) {
+        const original = readFileSync(resolve(process.argv[checkFlag + 1], file), 'utf8');
+        if (sha256(original) !== digest.source) throw new Error(`Host source parity failed: ${file}`);
+        if (readFileSync(resolve(contractRoot, templatePath(file)), 'utf8') !== templateSource(original))
+            throw new Error(`Generated host source mismatch: ${file}`);
+    }
 }
 
 const IGNORED_FILE_NAMES = new Set(['.DS_Store']);

@@ -49,11 +49,16 @@ jobs:
       - run: bun run build
       - name: Validate package archive
         run: npm pack --dry-run --json > "$RUNNER_TEMP/package-pack.json"
+      - name: Select immutable canonical contract source
+        id: canonical-contract
+        run: node --input-type=module -e 'import fs from "node:fs"; const {hostCommit} = JSON.parse(fs.readFileSync("templates/convex/syncContract/source.json", "utf8")); if (!/^[0-9a-f]{40}$/.test(hostCommit)) throw Error("Invalid host commit"); fs.appendFileSync(process.env.GITHUB_OUTPUT, `commit=${hostCommit}\n`);'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Saluana/or3-chat
-          ref: f023391feba96f3424431dbaaa8a8c97074ef452
+          ref: ${{ steps.canonical-contract.outputs.commit }}
           path: qualification-host
+      - name: Verify bundled validator against canonical host source
+        run: node scripts/build-template-pack.mjs --check-host qualification-host
       - name: Install canonical host qualification dependencies
         working-directory: qualification-host
         run: bun install --frozen-lockfile
@@ -81,6 +86,8 @@ jobs:
           (cd "$RUNNER_TEMP/qualified-provider/package" && bun install --production --ignore-scripts)
           bun run test:backend-lifecycle "$backend_dir/convex-local-backend" "$PWD/qualification-host" "$RUNNER_TEMP/convex-upgrade-baseline/package/templates/convex.pack.json.gz" "$RUNNER_TEMP/convex-lifecycle" "$RUNNER_TEMP/qualified-provider/package"
       - name: Qualify sync outage, crash, and storage recovery
+        env:
+          OR3_CANONICAL_HOST_ROOT: ${{ github.workspace }}/qualification-host
         run: bun run test:sync-hardening "$HOME/.cache/convex/binaries/precompiled-2026-09-21-0cf49cb/convex-local-backend" "$RUNNER_TEMP/convex-sync"
       - name: Upload backend lifecycle evidence
         if: always()
