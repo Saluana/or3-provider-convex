@@ -1629,7 +1629,7 @@ describe("Convex materialized snapshot contract", () => {
     ).rejects.toThrow("unavailable");
   });
 
-  it("mints UUID op_ids for notifications.create and skips legacy prefixed ids on pull", async () => {
+  it("mints UUID op_ids and fails closed on legacy prefixed ids without unavailable evidence", async () => {
     const fixture = createFixture("editor");
     const create = (notificationFunctions.create as RegisteredFunction)._handler;
     const pull = (syncFunctions.pull as RegisteredFunction)._handler;
@@ -1664,21 +1664,11 @@ describe("Convex materialized snapshot contract", () => {
     });
     fixture.tables.server_version_counter[0]!.value = created!.server_version + 1;
 
-    const page = await pull(fixture.ctx, {
+    await expect(pull(fixture.ctx, {
       workspace_id: "ws-1",
       cursor: created!.server_version - 1,
       limit: 50,
-    });
-    expect(page.changes.every((change: { stamp: { opId: string } }) =>
-      ChangeStampSchema.shape.opId.safeParse(change.stamp.opId).success
-    )).toBe(true);
-    expect(page.changes.map((change: { pk: string }) => change.pk)).toContain(id);
-    expect(page.changes.map((change: { pk: string }) => change.pk)).not.toContain(
-      "legacy-note",
-    );
-    expect(page.nextCursor).toBe(created!.server_version + 1);
-    expect(page.oldestRetainedVersion).toBeGreaterThan(0);
-    expect(page.requiresSnapshot).toBe(false);
+    })).rejects.toThrow("Invalid stored sync operation ID");
   });
 
   it("rejects a non-UUID op_id before allocating a server version", async () => {

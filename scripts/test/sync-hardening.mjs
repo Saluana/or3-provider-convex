@@ -109,6 +109,11 @@ try {
  const deploy = Bun.spawn([process.execPath, join(provider, 'node_modules/convex/bin/main.js'), 'deploy', '--yes', '--typecheck', 'enable', '--env-file', envPath], { cwd: root, env, stdout: Bun.file(join(root, 'deploy.log')), stderr: Bun.file(join(root, 'deploy-errors.log')) });
  assert.equal(await deploy.exited, 0, 'Sandbox deployment failed: ' + root);
 
+ await check('review: bad stored operation IDs fail closed without unavailable negotiation', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:{workspace_id:f.workspace,server_version:5,table_name:'kv',pk:'a',op:'put',payload:{id:'a',name:'setting',clock:5,created_at:1,updated_at:1},clock:5,hlc:'5:0:dev',device_id:'device',op_id:'background-tool:legacy',created_at:1}});
+  for(const name of ['pull','watchChanges'])await assert.rejects(invoke(f,name,{cursor:4,limit:10}),/Invalid stored sync operation ID/);
+ });
  await check('70 large KV rows pull, snapshot and combined GC advance below transaction limits', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
   const budgets=[];

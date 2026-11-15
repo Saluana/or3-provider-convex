@@ -1150,8 +1150,10 @@ function toWireChange(c: {
     };
 }
 
-function isWireCompatibleChange(change: { op_id: string }): boolean {
-    return isSyncUuid(change.op_id);
+function assertWireCompatibleChanges(changes: { op_id: string }[]): void {
+    // No durable unavailable-record support is advertised. Never acknowledge a
+    // visible poisoned version by filtering it before the host can validate it.
+    if (changes.some(change => !isSyncUuid(change.op_id))) throw new Error('Invalid stored sync operation ID');
 }
 
 async function pullRetentionForWorkspace(
@@ -2717,11 +2719,11 @@ export const pull = query({
         const visibleWindow = window.filter((change) =>
             isChangeVisibleToUser(change, callerUserId)
         );
-        const compatibleWindow = visibleWindow.filter(isWireCompatibleChange);
+        assertWireCompatibleChanges(visibleWindow);
         const changes =
             tableFilter.length > 0
-                ? compatibleWindow.filter((c) => tableFilter.includes(c.table_name))
-                : compatibleWindow;
+                ? visibleWindow.filter((c) => tableFilter.includes(c.table_name))
+                : visibleWindow;
 
         const lastChange = window[window.length - 1];
         const nextCursor = lastChange ? lastChange.server_version : args.cursor;
@@ -2792,7 +2794,8 @@ export const watchChanges = query({
         const latestVersion = latestChange ? latestChange.server_version : since;
         const visibleChanges = changes.filter((change) =>
             isChangeVisibleToUser(change, callerUserId)
-        ).filter(isWireCompatibleChange);
+        );
+        assertWireCompatibleChanges(visibleChanges);
 
         console.debug('[sync] watchChanges', {
             workspace: args.workspace_id,
