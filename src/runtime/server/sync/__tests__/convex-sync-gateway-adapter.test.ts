@@ -345,6 +345,44 @@ describe('ConvexSyncGatewayAdapter', () => {
         expect(resolveProviderTokenMock).toHaveBeenCalledTimes(3);
     });
 
+    // The disposable backend harness supplies a mode-0600 connection file.
+    // Keep the existing host-auth stub, but route both shipped reader codecs
+    // over real HTTP to the deployed, schema-checked Convex functions.
+    it.runIf(Boolean(process.env.OR3_CONVEX_QUALIFICATION_FILE))('qualifies direct and gateway readers against the deployed backend', async () => {
+        const { readFileSync } = await import('node:fs');
+        const { ConvexHttpClient } = await import('convex/browser');
+        const { createConvexSyncProvider } = await import('../../../app/sync/convex-sync-provider');
+        const { SnapshotResponseSchema, PullResponseSchema, compareSyncTuple, TABLE_PAYLOAD_SCHEMAS } = await import('~~/shared/sync/schemas');
+        const fixture = JSON.parse(readFileSync(process.env.OR3_CONVEX_QUALIFICATION_FILE!, 'utf8'));
+        const client = new ConvexHttpClient(fixture.url, { logger: false });
+        (client as any).setAdminAuth(fixture.adminKey, { subject: fixture.workspace + 'a', issuer: 'https://clerk.example.test', tokenIdentifier: 'qualification' });
+        const forwardQuery = (reference: string, args: any) => client.query(reference.replace('sync.', 'sync:') as any, args);
+        const forwardMutation = (reference: string, args: any) => client.mutation(reference.replace('sync.', 'sync:') as any, args);
+        queryMock.mockImplementation(forwardQuery);
+        mutationMock.mockImplementation(forwardMutation);
+        resolveSessionContextMock.mockResolvedValue({ authenticated: true, provider: 'clerk', providerUserId: fixture.workspace + 'a' });
+        const gateway = new ConvexSyncGatewayAdapter();
+        const direct = createConvexSyncProvider({ query: forwardQuery, mutation: forwardMutation } as any);
+        const scope = { workspaceId: fixture.workspace };
+        const outputs = [];
+        for (const reader of [direct, { pull: (input: any) => gateway.pull(makeEvent(), input), snapshot: (input: any) => gateway.snapshot(makeEvent(), input) }]) {
+            const pulled = PullResponseSchema.parse(await reader.pull({ scope, cursor: 5, limit: 300 }));
+            expect(pulled.changes).toHaveLength(5);
+            const tuples: string[][] = []; let pageToken: string | undefined;
+            for (let page = 0; page < 20; page++) {
+                const response = SnapshotResponseSchema.parse(await reader.snapshot!({ scope, tables: ['kv'], pageSize: 1, pageToken }));
+                for (const item of response.items) { if (item.kind === 'row') TABLE_PAYLOAD_SCHEMAS.kv!.parse(item.payload); tuples.push([item.tableName, item.pk, item.kind]); }
+                if (!response.nextPageToken) break;
+                expect(response.nextPageToken.length).toBeLessThanOrEqual(65536);
+                pageToken = response.nextPageToken;
+            }
+            expect(tuples).toHaveLength(7);
+            expect(tuples).toEqual([...tuples].sort(compareSyncTuple));
+            outputs.push({ pulled, tuples });
+        }
+        expect(outputs[0]).toEqual(outputs[1]);
+    });
+
     it('preserves structured backend history failures at the adapter boundary', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
         const actor = { userId: 'user-1', workspaceId: 'ws-1' };

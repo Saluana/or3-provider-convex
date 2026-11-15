@@ -187,6 +187,19 @@ try {
   await writeFile(join(evidence,'ordering-tuples.json'),JSON.stringify(tuples));
   assert.deepEqual(tuples,[...tuples].sort(compareSyncTuple));assert.equal(tuples.length,9,JSON.stringify(tuples.map(row=>[row[0],row[1].slice(0,12),row[2]])));
  });
+ await check('server-authored delete placeholder preserves envelope identity and deletion', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  await client.mutation(anyApi.syncProbe.authored,{workspace:f.workspace,op:{table:'kv',operation:'delete',pk:'wanted',payload:{id:'different',name:'setting',deleted:false,created_at:1}}});
+  const state=await read(f);assert.equal(state.kv.find(row=>row.id==='wanted')?.deleted,true);assert.equal(state.kv.some(row=>row.id==='different'),false);
+ });
+ await check('server-authored wire payload remains within the canonical byte ceiling at the boundary', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});const now=Math.floor(Date.now()/1000);
+  const shape={id:'a'.repeat(36),user_id:f.user,type:'info',title:'boundary',body:'',created_at:now,deleted:false,clock:now,hlc:now+':server:'+'a'.repeat(8),op_id:'a'.repeat(36),updated_at:now};
+  const body='x'.repeat(256*1024-new TextEncoder().encode(JSON.stringify(shape)).length);
+  await invoke(f,'createNotification',{user_id:f.user,type:'info',title:'boundary',body});
+  const state=await read(f);assert(new TextEncoder().encode(JSON.stringify(state.change_log[0].payload)).length<=256*1024);
+  assert.equal(state.notifications[0].server_version,state.change_log[0].server_version);
+ });
  await check('canonical normalization preserves raw receipt fingerprints and exact delete payloads', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
   const write=op({payload:{id:'a',name:'setting',deleted:false,createdAt:1,updatedAt:2,clock:6}});
@@ -197,6 +210,16 @@ try {
   assert.equal((await invoke(f,'push',{ops:[deletion]})).results[0].success,true);
   assert.equal((await invoke(f,'push',{ops:[deletion]})).results[0].replayed,true);
   assert.deepEqual((await read(f)).change_log[1].payload,deletion.payload);
+ });
+ await check('shipped direct and gateway readers qualify against this deployed backend', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  for(const id of ['a\0b',':'.repeat(1024),'漢'.repeat(1024),'\ue000','\u{10000}'])assert.equal((await invoke(f,'push',{ops:[op({pk:id,payload:{id,name:'reader',clock:6,created_at:1,updated_at:1,deleted:false}})]})).results[0].success,true);
+  const qualificationFile=join(root,'reader-qualification.json');
+  await writeFile(qualificationFile,JSON.stringify({url,adminKey,workspace:f.workspace}),{mode:0o600});
+  const child=Bun.spawn(['node',join(provider,'node_modules/vitest/vitest.mjs'),'run','src/runtime/server/sync/__tests__/convex-sync-gateway-adapter.test.ts','-t','qualifies direct and gateway readers against the deployed backend'],{cwd:provider,env:{...process.env,OR3_CANONICAL_HOST_ROOT:host,OR3_CONVEX_QUALIFICATION_FILE:qualificationFile},stdout:'pipe',stderr:'pipe'});
+  const [stdout,stderr,code]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+  assert(!(stdout+stderr).includes(adminKey),'Reader qualification output leaked credentials');
+  await writeFile(join(evidence,'direct-gateway-readers.log'),stdout+stderr);assert.equal(code,0,'Reader qualification failed; see direct-gateway-readers.log');
  });
  await check('real schema rejects an unknown canonical field', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});

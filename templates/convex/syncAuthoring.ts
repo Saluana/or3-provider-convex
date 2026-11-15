@@ -61,6 +61,7 @@ function stripReserved(payload: Record<string, unknown>): Record<string, unknown
     delete next._id;
     delete next._creationTime;
     delete next.workspace_id;
+    delete next.server_version;
     return next;
 }
 
@@ -162,7 +163,6 @@ export async function applyServerAuthoredOp(
     if (op.operation === 'put') canonicalPayload = prepared.payload as Record<string, unknown>;
     const serverVersion = await allocateServerVersion(ctx, workspaceId);
     const versionedStamps = { ...stamps, server_version: serverVersion };
-    canonicalPayload.server_version = serverVersion;
     if (op.table === 'file_meta' && op.operation === 'put') await recordRetainedStorage(ctx, workspaceId, canonicalPayload);
     // Native uploads and server-authored writes participate in the same frozen
     // snapshots as client sync pushes. Keep the old state before replacing it.
@@ -177,12 +177,12 @@ export async function applyServerAuthoredOp(
             });
         } else {
             await ctx.db.insert(tableInfo.table, {
+                ...payload,
                 workspace_id: workspaceId,
                 [tableInfo.pkField]: op.pk,
                 deleted: true,
                 deleted_at: now,
                 created_at: now,
-                ...payload,
                 ...versionedStamps,
             } as never);
         }
@@ -212,6 +212,7 @@ export async function applyServerAuthoredOp(
     } else if (existing) {
         await ctx.db.patch(existing._id, {
             ...canonicalPayload,
+            ...versionedStamps,
             deleted_at: deletedAt,
         });
     } else {
@@ -219,6 +220,7 @@ export async function applyServerAuthoredOp(
             workspace_id: workspaceId,
             [tableInfo.pkField]: op.pk,
             ...canonicalPayload,
+            ...versionedStamps,
         } as never);
     }
 
