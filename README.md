@@ -12,6 +12,38 @@ canonical writes or version gaps. Exact retries return `replayed: true`,
 the live or deleted winner. Server-authored events preserve canonical creation
 timestamps and emit complete payloads.
 
+The template pack includes the host's canonical `prepareSyncWrite` source and
+its dependency graph, identified by host commit in
+`templates/convex/syncContract/source.json`. Public push, background admission
+(including new durable jobs), finalization, tool retention, notifications and
+storage authoring validate through that source before persistence. Finalizers
+reject exhausted safe-integer clocks. New thread writes reject `fork_reason:
+null`; historical null values are omitted only from wire read payloads because
+null means no fork reason. Stored rows, revisions and replay fingerprints remain
+unchanged. Other historical corruption still fails closed: this provider does
+**not** advertise `unavailableRecords` or implement durable evidence/repair.
+
+Pull/watch, snapshot windows, preimage cleanup and combined GC reserve space for
+the next maximum-size Convex document before reading it. Pages can be shorter
+than requested; follow their cursors/tokens through completion. Snapshot merges
+use component-wise UTF-8 order; inclusive indexed seeks preserve NUL extensions
+of the preceding key. Snapshot tokens support the shared 65,536-character
+ceiling. Deploy this backend with a host/client supporting that ordering and
+limit; existing backend deployments and open legacy clients need separate
+qualification. This does not activate the host unavailable-record capability.
+
+To refresh or verify generated-source parity against an explicitly selected
+committed host (no host runtime imports in the generated backend):
+
+```sh
+node scripts/build-template-pack.mjs --sync-host /absolute/path/to/or3-chat
+node scripts/build-template-pack.mjs --check-host /absolute/path/to/or3-chat
+```
+
+Ordinary `build:templates` verifies generated hashes without a sibling checkout.
+Only relative import path spellings change to satisfy Convex module naming;
+the validator implementation and dependencies are generated from host source.
+
 Snapshots admit versionless legacy rows at baseline version zero and preserve
 that baseline in pre-images. No destructive backfill is required. Snapshot
 sessions expire after one hour. Pre-images carry a lease lasting at least as long
@@ -43,7 +75,10 @@ bun run test:sync-hardening /absolute/path/to/.cache/convex/binaries/<build>/con
 
 The command creates an isolated backend, checks real Convex schema validation,
 native storage, rollback, snapshot retention, concurrent writes, outage recovery,
-and process crash/restart. It writes `sync-hardening.json` in the evidence folder
+and process crash/restart. It also exercises 70 distinct 240 KiB KV records
+with full request fingerprints, invalid writer rollback and Unicode/token paging.
+Set `OR3_CANONICAL_HOST_ROOT` to select the matched host checkout. It writes
+`large-record-budgets.json` and `ordering-tuples.json` alongside `sync-hardening.json` in the evidence folder
 and stops the backend; no deployed URL or operator environment file is accepted.
 The provider qualification workflow runs this lane with its checksum-verified
 local backend binary after the packaged lifecycle checks.

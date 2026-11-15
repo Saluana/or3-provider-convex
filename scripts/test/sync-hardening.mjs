@@ -109,6 +109,29 @@ try {
  const deploy = Bun.spawn([process.execPath, join(provider, 'node_modules/convex/bin/main.js'), 'deploy', '--yes', '--typecheck', 'enable', '--env-file', envPath], { cwd: root, env, stdout: Bun.file(join(root, 'deploy.log')), stderr: Bun.file(join(root, 'deploy-errors.log')) });
  assert.equal(await deploy.exited, 0, 'Sandbox deployment failed: ' + root);
 
+ await check('70 large KV rows pull, snapshot and combined GC advance below transaction limits', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const budgets=[];
+  const measure=async(name,input)=>{const result=await invoke(f,name,{...input,__budget:true});budgets.push({name,bytes:result.bytes,reads:result.reads,written:result.written});assert(result.bytes<16*1024*1024);assert(result.written<16*1024*1024);return result.result;};
+  for(let i=0;i<70;i++){await Bun.sleep(350);const id='large-'+String(i).padStart(3,'0');const write=op({pk:id,payload:{id,name:'large',value:'x'.repeat(240*1024),clock:6,created_at:1,updated_at:2,deleted:false}});assert.equal((await invoke(f,'push',{ops:[write]})).results[0].success,true);}
+  let cursor=5,count=0;
+  for(let i=0;i<100;i++){const page=await measure('pull',{cursor,limit:300});PullResponseSchema.parse(page);count+=page.changes.length;if(!page.hasMore)break;assert(page.nextCursor>cursor);cursor=page.nextCursor;}
+  assert.equal(count,70);
+  let token,countSnapshot=0;
+  for(let i=0;i<100;i++){const page=await measure('snapshot',{tables:['kv'],page_size:300,page_token:token});SnapshotResponseSchema.parse(page);for(const item of page.items)if(item.kind==='row')TABLE_PAYLOAD_SCHEMAS.kv.parse(item.payload);countSnapshot+=page.items.length;if(!page.nextPageToken)break;assert.notEqual(page.nextPageToken,token);token=page.nextPageToken;}
+  assert.equal(countSnapshot,72);
+  // Overwrite the same records: each transaction creates a large preimage.
+  for(let i=0;i<70;i++){await Bun.sleep(350);const id='large-'+String(i).padStart(3,'0');assert.equal((await invoke(f,'push',{ops:[op({pk:id,clock:7,hlc:'7:0:dev',payload:{id,name:'large',value:'y'.repeat(240*1024),clock:7,created_at:1,updated_at:3,deleted:false}})]})).results[0].success,true);}
+  const old=Math.floor(Date.now()/1000)-7200;
+  // Patch one indexed page at a time; never use the unbounded fixture reader.
+  for(let cursor=5;;){const page=await invoke(f,'pull',{cursor,limit:1});for(const change of page.changes)await client.mutation(anyApi.syncProbe.age,{workspace:f.workspace,version:change.serverVersion,old});if(!page.hasMore)break;cursor=page.nextCursor;}
+  await client.mutation(anyApi.syncProbe.expire,{workspace:f.workspace,old});
+  let gc;
+  for(let i=0;i<200;i++){gc=await measure('runWorkspaceGc',{retention_seconds:3600,batch_size:100,continuation_count:999});if(!gc.hasMore)break;}
+  assert.equal(gc.hasMore,false);
+  const empty=await invoke(f,'pull',{cursor:0,limit:300});assert.equal(empty.changes.length,0);assert.equal(empty.requiresSnapshot,true);
+  await writeFile(join(evidence,'large-record-budgets.json'),JSON.stringify(budgets,null,2));
+ });
  await check('public push rejects null fork reason atomically', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
   const payload={id:'thread',status:'active',pinned:false,forked:false,deleted:false,created_at:1,updated_at:1,clock:1,fork_reason:null};
@@ -156,13 +179,13 @@ try {
  });
  await check('UTF-8 merge and long-key snapshot continuation match the canonical reader', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
-  const keys=[':'.repeat(1024),'漢'.repeat(1024),'\u{10000}','\ue000'];
+  const keys=['a\0b','a\0',':'.repeat(1024),'漢'.repeat(1024),'\u{10000}','\ue000'];
   for(const id of keys)assert.equal((await invoke(f,'push',{ops:[op({pk:id,payload:{id,name:'unicode',clock:6,created_at:1,updated_at:1,deleted:false}})]})).results[0].success,true);
   await client.mutation(anyApi.syncProbe.insert,{table:'tombstones',value:{workspace_id:f.workspace,table_name:'kv',pk:'\ue001',clock:1,hlc:'1:0:dev',op_id:crypto.randomUUID(),server_version:1,deleted_at:1,server_deleted_at:1,created_at:1}});
   const tuples=[];let token;
   for(let i=0;i<30;i++){const page=await invoke(f,'snapshot',{tables:['kv'],page_size:2,page_token:token});SnapshotResponseSchema.parse(page);tuples.push(...page.items.map(row=>[row.tableName,row.pk,row.kind]));if(!page.nextPageToken)break;assert.notEqual(page.nextPageToken,token);token=page.nextPageToken;}
   await writeFile(join(evidence,'ordering-tuples.json'),JSON.stringify(tuples));
-  assert.deepEqual(tuples,[...tuples].sort(compareSyncTuple));assert.equal(tuples.length,7,JSON.stringify(tuples.map(row=>[row[0],row[1].slice(0,12),row[2]])));
+  assert.deepEqual(tuples,[...tuples].sort(compareSyncTuple));assert.equal(tuples.length,9,JSON.stringify(tuples.map(row=>[row[0],row[1].slice(0,12),row[2]])));
  });
  await check('canonical normalization preserves raw receipt fingerprints and exact delete payloads', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});

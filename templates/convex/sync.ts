@@ -1,6 +1,3 @@
-import { compareSyncTuple } from './syncContract/shared/sync/schemas';
-import { prepareSyncWrite, nextSyncClock } from './syncContract/shared/sync/prepare_sync_write';
-import { normalizeHistoricalSyncPayload } from './snapshot';
 import { assertStorageNotDeleted } from './storageDeletion';
 import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './workspaceItemCapability';
 /**
@@ -50,6 +47,11 @@ import {
     type SnapshotCandidate,
     type SnapshotRevision,
 } from './snapshot';
+import { prepareSyncWrite, nextSyncClock } from './syncContract/shared/sync/prepare_sync_write';
+import { compareSyncTuple, syncJsonByteLength } from './syncContract/shared/sync/schemas';
+import { normalizeHistoricalSyncPayload } from './snapshot';
+import { getConvexSize } from 'convex/values';
+import { newSyncReadBudget, readSyncBatch, canReadSyncDocument, type SyncReadBudget } from './syncReadBudget';
 import { isSyncUuid } from './syncAuthoring';
 import { readRequestUsage } from './requestUsage';
 import { parseChatSeek, encodeChatSeek } from './historySeek';
@@ -260,6 +262,7 @@ type SnapshotHistoryDoc = {
 type DynamicIndexBuilder = {
     eq: (field: string, value: unknown) => DynamicIndexBuilder;
     gt: (field: string, value: unknown) => DynamicIndexBuilder;
+    gte: (field: string, value: unknown) => DynamicIndexBuilder;
     lte: (field: string, value: unknown) => DynamicIndexBuilder;
 };
 
@@ -409,7 +412,8 @@ async function readSnapshotHistory(
     workspaceId: Id<'workspaces'>,
     tableName: string,
     pk: string,
-    highWatermark: number
+    highWatermark: number,
+    budget?: SyncReadBudget
 ): Promise<SnapshotCandidate | null> {
     const history = (await ctx.db
         .query('sync_record_versions')
@@ -421,6 +425,7 @@ async function readSnapshotHistory(
         )
         .order('desc')
         .first()) as SnapshotHistoryDoc | null;
+    if (history && budget) { budget.bytes -= getConvexSize(history as import('convex/values').Value); budget.reads--; }
     return history ? historySnapshotCandidate(history) : null;
 }
 
@@ -429,23 +434,26 @@ async function readMaterializedSnapshotRows(
     workspaceId: Id<'workspaces'>,
     tableName: string,
     afterPk: string | null,
-    limit: number
-): Promise<MaterializedDoc[]> {
+    limit: number,
+    budget: SyncReadBudget
+) {
     const tableInfo = TABLE_INDEX_MAP[tableName];
-    if (!tableInfo) return [];
+    if (!tableInfo) throw new Error('Invalid snapshot table');
     const pkField = getPkField(tableName);
     type DynamicQuery = {
         withIndex: (
             indexName: string,
             build: (q: DynamicIndexBuilder) => DynamicIndexBuilder
-        ) => { take: (count: number) => Promise<MaterializedDoc[]> };
+        ) => AsyncIterable<MaterializedDoc>;
     };
-    return (ctx.db.query(tableInfo.table as TableNames) as unknown as DynamicQuery)
+    // Strict Convex string bounds skip NUL extensions of the boundary key.
+    // Seek inclusively and discard only the exact boundary, charging its read.
+    return readSyncBatch((ctx.db.query(tableInfo.table as TableNames) as unknown as DynamicQuery)
         .withIndex(tableInfo.indexName, (q) => {
             const scoped = q.eq('workspace_id', workspaceId);
-            return afterPk === null ? scoped : scoped.gt(pkField, afterPk);
+            return afterPk === null ? scoped : scoped.gte(pkField, afterPk);
         })
-        .take(limit);
+        , limit, budget, row => afterPk !== null && row[pkField] === afterPk);
 }
 
 async function readSnapshotTombstones(
@@ -453,17 +461,18 @@ async function readSnapshotTombstones(
     workspaceId: Id<'workspaces'>,
     tableName: string,
     afterPk: string | null,
-    limit: number
-): Promise<TombstoneDoc[]> {
-    return (await ctx.db
+    limit: number,
+    budget: SyncReadBudget
+) {
+    return readSyncBatch(ctx.db
         .query('tombstones')
         .withIndex('by_workspace_table_pk', (q) => {
             const scoped = q
                 .eq('workspace_id', workspaceId)
                 .eq('table_name', tableName);
-            return afterPk === null ? scoped : scoped.gt('pk', afterPk);
+            return afterPk === null ? scoped : scoped.gte('pk', afterPk);
         })
-        .take(limit)) as TombstoneDoc[];
+        , limit, budget, row => afterPk !== null && row.pk === afterPk);
 }
 
 async function resolveSnapshotKey(
@@ -475,7 +484,8 @@ async function resolveSnapshotKey(
     row: MaterializedDoc | undefined,
     tombstone: TombstoneDoc | undefined,
     callerUserId: Id<'users'>,
-    retainedFiles = false
+    retainedFiles = false,
+    budget?: SyncReadBudget
 ): Promise<SnapshotCandidate | null> {
     if (
         tableName === 'notifications' &&
@@ -491,7 +501,8 @@ async function resolveSnapshotKey(
         workspaceId,
         tableName,
         pk,
-        highWatermark
+        highWatermark,
+        budget
     );
     if (history) candidates.push(history);
     if (row) candidates.push(materializedSnapshotCandidate(tableName, pk, row));
@@ -2232,43 +2243,55 @@ async function captureSnapshot(ctx: MutationCtx, args: {
               serverDeletedAt: number;
           };
     const items: PageItem[] = [];
+    const budget = newSyncReadBudget();
+    let responseBytes = 0;
     let examined = 0;
     let stoppedWithinTable = false;
 
-    while (tableIndex < tables.length && examined < args.page_size) {
+    while (tableIndex < tables.length && examined < args.page_size && budget.bytes >= 5 * 1024 * 1024) {
         const tableName = tables[tableIndex];
         if (!tableName) break;
         const remaining = args.page_size - examined;
-        const [rows, tombstones] = await Promise.all([
-            readMaterializedSnapshotRows(
+        const rowPage = await readMaterializedSnapshotRows(
                 ctx,
                 args.workspace_id,
                 tableName,
                 afterPk,
-                remaining + 1
-            ),
-            readSnapshotTombstones(
+                remaining + 1,
+                budget
+            );
+        const tombstonePage = await readSnapshotTombstones(
                 ctx,
                 args.workspace_id,
                 tableName,
                 afterPk,
-                remaining + 1
-            ),
-        ]);
+                remaining + 1,
+                budget
+            );
 
+        const rows = rowPage.rows;
+        const tombstones = tombstonePage.rows;
         const pkField = getPkField(tableName);
         const rowsByPk = new Map<string, MaterializedDoc>();
         for (const row of rows) {
             const pk = row[pkField];
-            if (typeof pk === 'string' && pk.length > 0) rowsByPk.set(pk, row);
+            if (typeof pk !== 'string' || pk.length === 0) throw new Error('Invalid snapshot logical key');
+            rowsByPk.set(pk, row);
         }
         const tombstonesByPk = new Map(tombstones.map((row) => [row.pk, row]));
         const orderedPks = [
             ...new Set([...rowsByPk.keys(), ...tombstonesByPk.keys()]),
         ].sort((a, b) => compareSyncTuple([a], [b]));
-        const pagePks = orderedPks.slice(0, remaining);
+        // A truncated source proves coverage only through its last fetched key.
+        // Never seek past unseen rows merely because the other source read ahead.
+        const frontiers = [rowPage.hasMore ? rows.at(-1)?.[pkField] : undefined,
+            tombstonePage.hasMore ? tombstones.at(-1)?.pk : undefined]
+            .filter((pk): pk is string => typeof pk === 'string');
+        const pagePks = orderedPks.filter(pk => frontiers.every(last => compareSyncTuple([pk], [last]) <= 0)).slice(0, remaining);
 
+        let consumed = 0;
         for (const pk of pagePks) {
+            if (!canReadSyncDocument(budget)) break;
             const winner = await resolveSnapshotKey(
                 ctx,
                 args.workspace_id,
@@ -2278,8 +2301,16 @@ async function captureSnapshot(ctx: MutationCtx, args: {
                 rowsByPk.get(pk),
                 tombstonesByPk.get(pk),
                 callerUserId,
-                retainedFiles
+                retainedFiles,
+                budget
             );
+            const itemBytes = winner ? syncJsonByteLength(winner) : 0;
+            if (responseBytes + itemBytes > 1536 * 1024) {
+                if (!items.length) throw new Error('Snapshot record exceeds response budget');
+                break;
+            }
+            responseBytes += itemBytes;
+            consumed++;
             if (!winner) continue;
             if (winner.kind === 'row') {
                 items.push({
@@ -2300,9 +2331,9 @@ async function captureSnapshot(ctx: MutationCtx, args: {
             }
         }
 
-        examined += pagePks.length;
-        if (orderedPks.length > pagePks.length) {
-            afterPk = pagePks[pagePks.length - 1] ?? afterPk;
+        examined += consumed;
+        if (orderedPks.length > consumed || rowPage.hasMore || tombstonePage.hasMore) {
+            afterPk = pagePks[consumed - 1] ?? afterPk;
             stoppedWithinTable = true;
             break;
         }
@@ -2658,6 +2689,7 @@ export const pull = query({
         }
 
         // Cap limit to prevent abuse
+        if (!Number.isSafeInteger(args.limit) || args.limit < 1) throw new Error('Invalid pull limit');
         const limit = Math.min(args.limit, MAX_PULL_LIMIT);
 
         type ChangeLogRow = {
@@ -2671,16 +2703,16 @@ export const pull = query({
             device_id: string;
             op_id: string;
         };
-        const rawResults = (await ctx.db
+        const page = await readSyncBatch(ctx.db
             .query('change_log')
             .withIndex('by_workspace_version', (q) =>
                 q.eq('workspace_id', args.workspace_id).gt('server_version', args.cursor)
             )
             .order('asc')
-            .take(limit + 1)) as ChangeLogRow[];
-
-        const hasMore = rawResults.length > limit;
-        const window = hasMore ? rawResults.slice(0, -1) : rawResults;
+            , limit + 1, newSyncReadBudget());
+        const rawResults = page.rows as ChangeLogRow[];
+        const hasMore = rawResults.length > limit || page.hasMore;
+        const window = rawResults.slice(0, limit);
         const tableFilter: string[] = Array.isArray(args.tables) ? args.tables : [];
         const visibleWindow = window.filter((change) =>
             isChangeVisibleToUser(change, callerUserId)
@@ -2733,7 +2765,8 @@ export const watchChanges = query({
     handler: async (ctx, args) => {
         const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
         const since = args.cursor ?? 0;
-        const limit = args.limit ?? 100;
+        const limit = Math.min(args.limit ?? 100, MAX_PULL_LIMIT);
+        if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('Invalid watch limit');
 
         type ChangeLogRow = {
             server_version: number;
@@ -2746,13 +2779,14 @@ export const watchChanges = query({
             device_id: string;
             op_id: string;
         };
-        const changes = (await ctx.db
+        const page = await readSyncBatch(ctx.db
             .query('change_log')
             .withIndex('by_workspace_version', (q) =>
                 q.eq('workspace_id', args.workspace_id).gt('server_version', since)
             )
             .order('asc')
-            .take(limit)) as ChangeLogRow[];
+            , limit, newSyncReadBudget());
+        const changes = page.rows as ChangeLogRow[];
 
         const latestChange = changes[changes.length - 1];
         const latestVersion = latestChange ? latestChange.server_version : since;
@@ -2810,12 +2844,18 @@ export const getServerVersion = query({
  */
 /** Bounded maintenance. A pre-image can only serve snapshots begun before its
  * write, so its one-hour lease outlives every session that could need it. */
-async function collectSyncState(ctx: MutationCtx, workspaceId: Id<'workspaces'>, retentionSeconds: number, batchSize: number) {
+async function collectSyncState(ctx: MutationCtx, workspaceId: Id<'workspaces'>, retentionSeconds: number, batchSize: number, budget: SyncReadBudget) {
+    let budgetHasMore = false;
+    const read = async <T extends import('convex/values').Value>(query: AsyncIterable<T>) => {
+        const page = await readSyncBatch(query, batchSize + 1, budget);
+        budgetHasMore ||= page.hasMore;
+        return page.rows;
+    };
     const now = nowSec();
-    const expiredDevices = await ctx.db.query('device_cursors').withIndex('by_workspace_updated', q =>
-        q.eq('workspace_id', workspaceId).lt('updated_at', now - retentionSeconds)).take(batchSize + 1);
-    const expiredSessions = await ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace_expiry', q =>
-        q.eq('workspace_id', workspaceId).lte('expires_at', now)).take(batchSize + 1);
+    const expiredDevices = await read(ctx.db.query('device_cursors').withIndex('by_workspace_updated', q =>
+        q.eq('workspace_id', workspaceId).lt('updated_at', now - retentionSeconds)));
+    const expiredSessions = await read(ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace_expiry', q =>
+        q.eq('workspace_id', workspaceId).lte('expires_at', now)));
     for (const row of [...expiredDevices.slice(0, batchSize), ...expiredSessions.slice(0, batchSize)]) await ctx.db.delete(row._id);
 
     const active = await ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace_expiry', q =>
@@ -2824,23 +2864,46 @@ async function collectSyncState(ctx: MutationCtx, workspaceId: Id<'workspaces'>,
     if (active) {
         // Add leases to pre-upgrade history in bounded pages. Extending a legacy
         // lease for one hour is conservative and needs no destructive migration.
-        const legacy = await ctx.db.query('sync_record_versions').withIndex('by_workspace_expiry', q =>
-            q.eq('workspace_id', workspaceId).eq('retain_until', undefined)).take(batchSize + 1);
+        const legacy = await read(ctx.db.query('sync_record_versions').withIndex('by_workspace_expiry', q =>
+            q.eq('workspace_id', workspaceId).eq('retain_until', undefined)));
         for (const row of legacy.slice(0, batchSize)) await ctx.db.patch(row._id, { retain_until: now + SNAPSHOT_TTL_SECONDS });
         legacyHasMore = legacy.length > batchSize;
     }
     const history = active
-        ? await ctx.db.query('sync_record_versions').withIndex('by_workspace_expiry', q =>
-            q.eq('workspace_id', workspaceId).gt('retain_until', 0).lte('retain_until', now)).take(batchSize + 1)
-        : await ctx.db.query('sync_record_versions').withIndex('by_workspace_version', q =>
-            q.eq('workspace_id', workspaceId)).take(batchSize + 1);
+        ? await read(ctx.db.query('sync_record_versions').withIndex('by_workspace_expiry', q =>
+            q.eq('workspace_id', workspaceId).gt('retain_until', 0).lte('retain_until', now)))
+        : await read(ctx.db.query('sync_record_versions').withIndex('by_workspace_version', q =>
+            q.eq('workspace_id', workspaceId)));
     for (const row of history.slice(0, batchSize)) await ctx.db.delete(row._id);
     const minimum = await ctx.db.query('device_cursors').withIndex('by_workspace_version', q =>
         q.eq('workspace_id', workspaceId)).order('asc').first();
     const counter = minimum ? null : await ctx.db.query('server_version_counter').withIndex('by_workspace', q =>
         q.eq('workspace_id', workspaceId)).first();
     return { minimumVersion: minimum?.last_seen_version ?? counter?.value ?? 0,
-        hasMore: expiredDevices.length > batchSize || expiredSessions.length > batchSize || history.length > batchSize || legacyHasMore };
+        hasMore: budgetHasMore || expiredDevices.length > batchSize || expiredSessions.length > batchSize || history.length > batchSize || legacyHasMore };
+}
+
+async function gcTombstonesPage(ctx: MutationCtx, args: { workspace_id: Id<'workspaces'>; retention_seconds: number; batch_size?: number; cursor?: number }, budget = newSyncReadBudget(), state?: Awaited<ReturnType<typeof collectSyncState>>) {
+    validateGcArguments(args);
+    const startCursor = args.cursor ?? 0;
+    if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
+        return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: true, reason: SYNC_HISTORY_GC_POLICY.reason };
+    }
+    const batchSize = args.batch_size ?? 100;
+    state ??= await collectSyncState(ctx, args.workspace_id, args.retention_seconds, batchSize, budget);
+    const page = await readSyncBatch(ctx.db.query('tombstones')
+        .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id).gt('server_version', startCursor))
+        .order('asc'), batchSize + 1, budget);
+    const scanned = page.rows.slice(0, batchSize);
+    const cutoff = nowSec() - args.retention_seconds;
+    let purged = 0;
+    for (const tombstone of scanned) {
+        if (tombstone.server_version <= state.minimumVersion && typeof tombstone.server_deleted_at === 'number' && tombstone.server_deleted_at < cutoff) {
+            await ctx.db.delete(tombstone._id);
+            purged += 1;
+        }
+    }
+    return { purged, hasMore: page.rows.length > batchSize || page.hasMore || state.hasMore, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
 }
 
 export const gcTombstones = internalMutation({
@@ -2850,28 +2913,7 @@ export const gcTombstones = internalMutation({
         batch_size: v.optional(v.number()),
         cursor: v.optional(v.number()),
     },
-    handler: async (ctx, args) => {
-        validateGcArguments(args);
-        const startCursor = args.cursor ?? 0;
-        if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
-            return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: true, reason: SYNC_HISTORY_GC_POLICY.reason };
-        }
-        const batchSize = args.batch_size ?? 100;
-        const state = await collectSyncState(ctx, args.workspace_id, args.retention_seconds, batchSize);
-        const page = await ctx.db.query('tombstones')
-            .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id).gt('server_version', startCursor))
-            .order('asc').take(batchSize + 1);
-        const scanned = page.slice(0, batchSize);
-        const cutoff = nowSec() - args.retention_seconds;
-        let purged = 0;
-        for (const tombstone of scanned) {
-            if (tombstone.server_version <= state.minimumVersion && typeof tombstone.server_deleted_at === 'number' && tombstone.server_deleted_at < cutoff) {
-                await ctx.db.delete(tombstone._id);
-                purged += 1;
-            }
-        }
-        return { purged, hasMore: page.length > batchSize || state.hasMore, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
-    },
+    handler: (ctx, args) => gcTombstonesPage(ctx, args),
 });
 
 /**
@@ -2885,6 +2927,29 @@ export const gcTombstones = internalMutation({
  * - Is unavailable to public Convex callers
  * - Returns a disabled result without querying or deleting sync history
  */
+async function gcChangeLogPage(ctx: MutationCtx, args: { workspace_id: Id<'workspaces'>; retention_seconds: number; batch_size?: number; cursor?: number }, budget = newSyncReadBudget(), state?: Awaited<ReturnType<typeof collectSyncState>>) {
+    validateGcArguments(args);
+    const startCursor = args.cursor ?? 0;
+    if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
+        return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: true, reason: SYNC_HISTORY_GC_POLICY.reason };
+    }
+    const batchSize = args.batch_size ?? 100;
+    state ??= await collectSyncState(ctx, args.workspace_id, args.retention_seconds, batchSize, budget);
+    const page = await readSyncBatch(ctx.db.query('change_log')
+        .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id).gt('server_version', startCursor))
+        .order('asc'), batchSize + 1, budget);
+    const scanned = page.rows.slice(0, batchSize);
+    const cutoff = nowSec() - args.retention_seconds;
+    let purged = 0;
+    for (const change of scanned) {
+        if (change.server_version <= state.minimumVersion && change.created_at < cutoff) {
+            await ctx.db.delete(change._id);
+            purged += 1;
+        }
+    }
+    return { purged, hasMore: page.rows.length > batchSize || page.hasMore || state.hasMore, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
+}
+
 export const gcChangeLog = internalMutation({
     args: {
         workspace_id: v.id('workspaces'),
@@ -2892,28 +2957,7 @@ export const gcChangeLog = internalMutation({
         batch_size: v.optional(v.number()),
         cursor: v.optional(v.number()),
     },
-    handler: async (ctx, args) => {
-        validateGcArguments(args);
-        const startCursor = args.cursor ?? 0;
-        if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
-            return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: true, reason: SYNC_HISTORY_GC_POLICY.reason };
-        }
-        const batchSize = args.batch_size ?? 100;
-        const state = await collectSyncState(ctx, args.workspace_id, args.retention_seconds, batchSize);
-        const page = await ctx.db.query('change_log')
-            .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id).gt('server_version', startCursor))
-            .order('asc').take(batchSize + 1);
-        const scanned = page.slice(0, batchSize);
-        const cutoff = nowSec() - args.retention_seconds;
-        let purged = 0;
-        for (const change of scanned) {
-            if (change.server_version <= state.minimumVersion && change.created_at < cutoff) {
-                await ctx.db.delete(change._id);
-                purged += 1;
-            }
-        }
-        return { purged, hasMore: page.length > batchSize || state.hasMore, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
-    },
+    handler: (ctx, args) => gcChangeLogPage(ctx, args),
 });
 
 // ============================================================
@@ -2955,26 +2999,13 @@ export const runWorkspaceGc = internalMutation({
         let continuation = args.continuation_count ?? 0;
         let hasMore = true;
         if (continuation < MAX_SYNC_GC_CONTINUATIONS) {
-            const tomb = await (gcTombstones as unknown as {
-                _handler: (ctx: MutationCtx, args: Record<string, unknown>) => Promise<{
-                    purged: number; hasMore: boolean; nextCursor: number;
-                }>;
-            })._handler(ctx, {
-                workspace_id: args.workspace_id,
-                retention_seconds: args.retention_seconds ?? MIN_SYNC_RETENTION_SECONDS,
-                batch_size: args.batch_size,
-                cursor: tombstoneCursor,
-            });
-            const log = await (gcChangeLog as unknown as {
-                _handler: (ctx: MutationCtx, args: Record<string, unknown>) => Promise<{
-                    purged: number; hasMore: boolean; nextCursor: number;
-                }>;
-            })._handler(ctx, {
-                workspace_id: args.workspace_id,
-                retention_seconds: args.retention_seconds ?? MIN_SYNC_RETENTION_SECONDS,
-                batch_size: args.batch_size,
-                cursor: changelogCursor,
-            });
+            const budget = newSyncReadBudget();
+            const retentionSeconds = args.retention_seconds ?? MIN_SYNC_RETENTION_SECONDS;
+            const state = await collectSyncState(ctx, args.workspace_id, retentionSeconds, args.batch_size ?? 100, budget);
+            const tomb = await gcTombstonesPage(ctx, { workspace_id: args.workspace_id,
+                retention_seconds: retentionSeconds, batch_size: args.batch_size, cursor: tombstoneCursor }, budget, state);
+            const log = await gcChangeLogPage(ctx, { workspace_id: args.workspace_id,
+                retention_seconds: retentionSeconds, batch_size: args.batch_size, cursor: changelogCursor }, budget, state);
             purged += tomb.purged + log.purged;
             tombstoneCursor = tomb.nextCursor;
             changelogCursor = log.nextCursor;

@@ -131,15 +131,19 @@ function makeDirectCtx(options: {
                 order: vi.fn(() => ({
                     first: vi.fn(async () => null),
                     take: vi.fn(async () => []),
+                    [Symbol.asyncIterator]: async function* () {},
                 })),
                 take: vi.fn(async () => []),
+                    [Symbol.asyncIterator]: async function* () {},
             };
         },
         order: vi.fn(() => ({
             first: vi.fn(async () => null),
             take: vi.fn(async () => []),
+                    [Symbol.asyncIterator]: async function* () {},
         })),
         take: vi.fn(async () => []),
+                    [Symbol.asyncIterator]: async function* () {},
     }));
 
     return {
@@ -191,6 +195,7 @@ function makeNotificationSyncCtx(changes: Array<Record<string, unknown>> = []) {
                 }),
                 order: vi.fn(() => ({
                     take: vi.fn(async () => changes),
+                    [Symbol.asyncIterator]: async function* () { yield* changes; },
                     first: vi.fn(async () => {
                         if (table === 'change_log' && changes[0]) {
                             return changes[0];
