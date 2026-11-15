@@ -231,6 +231,22 @@ export default defineSchema({
         .index('by_workspace_expiry', ['workspace_id', 'expires_at'])
         .index('by_expires_at', ['expires_at']),
 
+    /** Continuation responses are immutable for the lifetime of their session.
+     * Split UTF-8 bytes keep each document below Convex's 1 MiB ceiling. */
+    sync_snapshot_pages: defineTable({
+        workspace_id: v.id('workspaces'),
+        session_id: v.id('sync_snapshot_sessions'),
+        table_index: v.number(),
+        after_pk: v.union(v.string(), v.null()),
+        page_size: v.number(),
+        chunk: v.number(),
+        data: v.bytes(),
+        expires_at: v.number(),
+    })
+        .index('by_page', ['session_id', 'table_index', 'after_pk', 'page_size', 'chunk'])
+        .index('by_workspace', ['workspace_id'])
+        .index('by_workspace_expiry', ['workspace_id', 'expires_at']),
+
     /**
      * Applied materialized pre-images used only when a later write occurs
      * after a snapshot's frozen high-watermark.

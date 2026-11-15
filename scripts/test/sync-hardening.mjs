@@ -80,9 +80,9 @@ export const gcPage=internalMutation({args:{workspace_id:v.id('workspaces'),rete
 export const original=internalQuery({args:{id:v.string()},handler:(ctx,args)=>ctx.db.get(args.id as any)});
 export const jobCount=internalQuery({args:{user:v.string()},handler:async(ctx,args)=>(await ctx.db.query('background_jobs').withIndex('by_user',q=>q.eq('user_id',args.user)).collect()).length});
 export const age=internalMutation({args:{workspace:v.id('workspaces'),version:v.number(),old:v.number()},handler:async(ctx,args)=>{const row=await ctx.db.query('change_log').withIndex('by_workspace_version',q=>q.eq('workspace_id',args.workspace).eq('server_version',args.version)).first();if(row)await ctx.db.patch(row._id,{created_at:args.old});}});
-export const expire=internalMutation({args:{workspace:v.id('workspaces'),old:v.number()},handler:async(ctx,args)=>{for(const row of await ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace',q=>q.eq('workspace_id',args.workspace)).collect())await ctx.db.patch(row._id,{expires_at:args.old});}});
+export const expire=internalMutation({args:{workspace:v.id('workspaces'),old:v.number()},handler:async(ctx,args)=>{for(const table of ['sync_snapshot_sessions','sync_snapshot_pages'] as const)for(const row of await ctx.db.query(table).withIndex('by_workspace',q=>q.eq('workspace_id',args.workspace)).collect())await ctx.db.patch(row._id,{expires_at:args.old});}});
 export const read=internalQuery({args:{workspace:v.id('workspaces')},handler:async(ctx,args)=>{
- const result:any={};for(const name of ['kv','notifications','file_meta','upload_intents','change_log','server_version_counter','device_cursors','sync_snapshot_sessions','sync_record_versions'])result[name]=await ctx.db.query(name as any).withIndex(({file_meta:'by_workspace_hash',kv:'by_workspace_id',device_cursors:'by_workspace_version',upload_intents:'by_workspace_status',change_log:'by_workspace_version',sync_record_versions:'by_workspace_version'} as any)[name]??'by_workspace',(q:any)=>q.eq('workspace_id',args.workspace)).collect();return result;
+ const result:any={};for(const name of ['kv','notifications','file_meta','upload_intents','change_log','server_version_counter','device_cursors','sync_snapshot_sessions','sync_snapshot_pages','sync_record_versions'])result[name]=await ctx.db.query(name as any).withIndex(({file_meta:'by_workspace_hash',kv:'by_workspace_id',device_cursors:'by_workspace_version',upload_intents:'by_workspace_status',change_log:'by_workspace_version',sync_record_versions:'by_workspace_version'} as any)[name]??'by_workspace',(q:any)=>q.eq('workspace_id',args.workspace)).collect();return result;
 }});
 `);
 const instance = 'sync-hardening-' + randomBytes(8).toString('hex');
@@ -113,6 +113,16 @@ try {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
   await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:{workspace_id:f.workspace,server_version:5,table_name:'kv',pk:'a',op:'put',payload:{id:'a',name:'setting',clock:5,created_at:1,updated_at:1},clock:5,hlc:'5:0:dev',device_id:'device',op_id:'background-tool:legacy',created_at:1}});
   for(const name of ['pull','watchChanges'])await assert.rejects(invoke(f,name,{cursor:4,limit:10}),/Invalid stored sync operation ID/);
+ });
+ await check('review: identical snapshot tokens replay identical pages after concurrent writes', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const first=await invoke(f,'snapshot',{tables:['kv'],page_size:1});
+  const request={tables:['kv'],page_size:1,page_token:first.nextPageToken};
+  const second=await invoke(f,'snapshot',request);
+  assert.equal(second.items[0].pk,'z');
+  for(const id of ['b','z']){const result=await invoke(f,'push',{ops:[op({pk:id,payload:{id,name:'setting',value:'x'.repeat(240*1024),deleted:false,clock:6,created_at:1,updated_at:2}})]});assert.equal(result.results[0].success,true,JSON.stringify(result));}
+  assert.deepEqual(await invoke(f,'snapshot',request),second);
+  await writeFile(join(evidence,'snapshot-retry.json'),JSON.stringify({first,second,retry:await invoke(f,'snapshot',request)}));
  });
  await check('70 large KV rows pull, snapshot and combined GC advance below transaction limits', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
@@ -327,9 +337,9 @@ try {
   await invoke(f,'runWorkspaceGc',{retention_seconds:3600,batch_size:20});
   assert.equal((await read(f)).device_cursors.length,0);
   const second=await invoke(f,'snapshot',{tables:['kv'],page_size:1,page_token:first.nextPageToken});assert.equal(second.items[0]?.payload.value,'retained');
-  const state=await read(f);for(const session of state.sync_snapshot_sessions)await client.mutation(anyApi.syncProbe.patch,{id:session._id,value:{expires_at:old}});
+  const state=await read(f);for(const session of [...state.sync_snapshot_sessions,...state.sync_snapshot_pages])await client.mutation(anyApi.syncProbe.patch,{id:session._id,value:{expires_at:old}});
   await invoke(f,'runWorkspaceGc',{retention_seconds:3600,batch_size:20});
-  const after=await read(f);assert.equal(after.sync_snapshot_sessions.length,0);assert.equal(after.sync_record_versions.length,0);
+  const after=await read(f);assert.equal(after.sync_snapshot_sessions.length,0);assert.equal(after.sync_record_versions.length,0);assert.equal(after.sync_snapshot_pages.length,0);
   await assert.rejects(invoke(f,'snapshot',{tables:['kv'],page_size:1,page_token:first.nextPageToken}),/unavailable/);
  });
  await check('large GC backlog yields between bounded workspace transactions', async () => {

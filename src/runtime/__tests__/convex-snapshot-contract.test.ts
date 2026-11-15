@@ -58,7 +58,7 @@ type Row = Record<string, any> & { _id: string };
 type FixtureTables = Record<string, Row[]> & Record<
   "auth_accounts" | "workspaces" | "workspace_members" | "server_version_counter" |
   "device_cursors" | "messages" | "projects" | "threads" | "tombstones" |
-  "upload_intents" | "sync_record_versions" | "sync_snapshot_sessions" |
+  "upload_intents" | "sync_record_versions" | "sync_snapshot_sessions" | "sync_snapshot_pages" |
   "change_log" | "file_meta" | "kv" | "notifications" | "posts", Row[]>;
 
 afterEach(() => vi.unstubAllGlobals());
@@ -91,6 +91,7 @@ const INDEX_FIELDS: Record<string, string[]> = {
   by_history_order: ["workspace_id", "thread_id", "index", "order_key", "id"],
   by_workspace_thread: ["workspace_id", "thread_id"],
   by_op_id: ["op_id"],
+  by_page: ["session_id", "table_index", "after_pk", "page_size", "chunk"],
 };
 
 class MemoryQuery {
@@ -291,6 +292,7 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
     upload_intents: [],
     sync_record_versions: [],
     sync_snapshot_sessions: [],
+    sync_snapshot_pages: [],
     change_log: [],
     file_meta: [],
     kv: [],
@@ -1574,7 +1576,8 @@ describe("Convex materialized snapshot contract", () => {
     expect(
       new Set(allItems.map((item: any) => `${item.tableName}:${item.pk}`)).size,
     ).toBe(allItems.length);
-    expect(fixture.takeCounts.every((count) => count <= 3)).toBe(true);
+    // Continuation replay reads at most four bounded response chunks.
+    expect(fixture.takeCounts.every((count) => count <= 4)).toBe(true);
   });
 
   it("binds opaque continuation tokens to the original table filter", async () => {

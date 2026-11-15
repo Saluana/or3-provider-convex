@@ -673,3 +673,18 @@ rejected. With the updated host, all nonempty results use bounded transcript
 references, leaving the assistant response budget available for its answer.
 Full results remain available for sync, reload and model replay, within the existing
 256 KiB per-result limit.
+
+### Snapshot retry and corrupt history
+
+Snapshot continuation responses are persisted as bounded UTF-8 chunks until the
+one-hour session expiry. Repeating the same token and page size returns the same
+page during concurrent writes; authorization, table/mode and capability checks
+still run on every request. Maintenance removes expired page chunks within the
+shared transaction read budget. Deploy the scaffold to install the additive
+`sync_snapshot_pages` table.
+
+The provider does not advertise `unavailableRecords`. A visible historical
+change with an invalid operation ID fails the page instead of acknowledging a
+silently omitted version. Other malformed payloads still reach the host's strict
+validation and fail closed. Historical null thread fork reasons normalize to
+omission on reads without changing stored revisions or receipt fingerprints.

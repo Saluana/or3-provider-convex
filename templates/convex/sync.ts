@@ -2148,6 +2148,29 @@ export const backupSnapshot = internalMutation({
     handler: (ctx, args) => captureSnapshot(ctx, args, true),
 });
 
+type PageItem =
+    | {
+          kind: 'row';
+          tableName: string;
+          pk: string;
+          payload: unknown;
+          revision: SnapshotRevision;
+      }
+    | {
+          kind: 'tombstone';
+          tableName: string;
+          pk: string;
+          revision: SnapshotRevision;
+          serverDeletedAt: number;
+      };
+type SnapshotPageResponse = {
+    workspaceId: string;
+    snapshotId: string;
+    highWatermark: number;
+    items: PageItem[];
+    nextPageToken: string | null;
+};
+
 async function captureSnapshot(ctx: MutationCtx, args: {
     workspace_id: Id<'workspaces'>;
     workspace_item_capability?: 'v1';
@@ -2173,6 +2196,7 @@ async function captureSnapshot(ctx: MutationCtx, args: {
     let highWatermark: number;
     let tableIndex = 0;
     let afterPk: string | null = null;
+    let expiresAt = now + SNAPSHOT_TTL_SECONDS;
 
     if (args.page_token) {
         const cursor = decodeSnapshotCursor(args.page_token);
@@ -2210,6 +2234,20 @@ async function captureSnapshot(ctx: MutationCtx, args: {
         highWatermark = session.high_watermark;
         tableIndex = cursor.tableIndex;
         afterPk = cursor.afterPk;
+        expiresAt = session.expires_at;
+        // Authorization, mode, tables and expiry were checked before replay.
+        // A response fits in 2 MiB, hence at most four 512 KiB chunks.
+        const cached = await ctx.db.query('sync_snapshot_pages').withIndex('by_page', q =>
+            q.eq('session_id', cursor.snapshotId as Id<'sync_snapshot_sessions'>)
+                .eq('table_index', tableIndex).eq('after_pk', afterPk).eq('page_size', args.page_size)).take(4);
+        if (cached.length) {
+            const bytes = new Uint8Array(cached.reduce((total, chunk) => total + chunk.data.byteLength, 0));
+            let offset = 0;
+            for (const chunk of cached) { bytes.set(new Uint8Array(chunk.data), offset); offset += chunk.data.byteLength; }
+            const response = JSON.parse(new TextDecoder().decode(bytes)) as SnapshotPageResponse;
+            if (response.items.some((item) => item.kind === 'row' && hasWorkspaceItemSemantics(item.tableName, item.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
+            return response;
+        }
     } else {
         const counter = await ctx.db
             .query('server_version_counter')
@@ -2225,25 +2263,12 @@ async function captureSnapshot(ctx: MutationCtx, args: {
             tables,
             retained_files: retainedFiles,
             created_at: now,
-            expires_at: now + SNAPSHOT_TTL_SECONDS,
+            expires_at: expiresAt,
         }));
     }
 
-    type PageItem =
-        | {
-              kind: 'row';
-              tableName: string;
-              pk: string;
-              payload: unknown;
-              revision: SnapshotRevision;
-          }
-        | {
-              kind: 'tombstone';
-              tableName: string;
-              pk: string;
-              revision: SnapshotRevision;
-              serverDeletedAt: number;
-          };
+    const requestPosition = { tableIndex, afterPk };
+
     const items: PageItem[] = [];
     const budget = newSyncReadBudget();
     let responseBytes = 0;
@@ -2355,13 +2380,30 @@ async function captureSnapshot(ctx: MutationCtx, args: {
         : null;
 
     if (items.some(item => item.kind === 'row' && hasWorkspaceItemSemantics(item.tableName, item.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
-    return {
+    const response: SnapshotPageResponse = {
         workspaceId: String(args.workspace_id),
         snapshotId,
         highWatermark,
         items,
         nextPageToken,
     };
+    if (args.page_token) {
+        const bytes = new TextEncoder().encode(JSON.stringify(response));
+        if (bytes.byteLength > 2 * 1024 * 1024) throw new Error('Snapshot response exceeds byte ceiling');
+        for (let offset = 0, chunk = 0; offset < bytes.byteLength; offset += 512 * 1024, chunk++) {
+            await ctx.db.insert('sync_snapshot_pages', {
+                workspace_id: args.workspace_id,
+                session_id: snapshotId as Id<'sync_snapshot_sessions'>,
+                table_index: requestPosition.tableIndex,
+                after_pk: requestPosition.afterPk,
+                page_size: args.page_size,
+                chunk,
+                data: bytes.slice(offset, offset + 512 * 1024).buffer,
+                expires_at: expiresAt,
+            });
+        }
+    }
+    return response;
 }
 
 /**
@@ -2861,6 +2903,10 @@ async function collectSyncState(ctx: MutationCtx, workspaceId: Id<'workspaces'>,
         q.eq('workspace_id', workspaceId).lte('expires_at', now)));
     for (const row of [...expiredDevices.slice(0, batchSize), ...expiredSessions.slice(0, batchSize)]) await ctx.db.delete(row._id);
 
+    const expiredPages = await read(ctx.db.query('sync_snapshot_pages').withIndex('by_workspace_expiry', q =>
+        q.eq('workspace_id', workspaceId).lte('expires_at', now)));
+    for (const row of expiredPages.slice(0, batchSize)) await ctx.db.delete(row._id);
+
     const active = await ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace_expiry', q =>
         q.eq('workspace_id', workspaceId).gt('expires_at', now)).first();
     let legacyHasMore = false;
@@ -2883,7 +2929,7 @@ async function collectSyncState(ctx: MutationCtx, workspaceId: Id<'workspaces'>,
     const counter = minimum ? null : await ctx.db.query('server_version_counter').withIndex('by_workspace', q =>
         q.eq('workspace_id', workspaceId)).first();
     return { minimumVersion: minimum?.last_seen_version ?? counter?.value ?? 0,
-        hasMore: budgetHasMore || expiredDevices.length > batchSize || expiredSessions.length > batchSize || history.length > batchSize || legacyHasMore };
+        hasMore: budgetHasMore || expiredDevices.length > batchSize || expiredSessions.length > batchSize || expiredPages.length > batchSize || history.length > batchSize || legacyHasMore };
 }
 
 async function gcTombstonesPage(ctx: MutationCtx, args: { workspace_id: Id<'workspaces'>; retention_seconds: number; batch_size?: number; cursor?: number }, budget = newSyncReadBudget(), state?: Awaited<ReturnType<typeof collectSyncState>>) {
