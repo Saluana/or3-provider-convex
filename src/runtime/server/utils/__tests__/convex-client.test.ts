@@ -29,6 +29,7 @@ describe('shared Convex server client', () => {
     beforeEach(() => {
         vi.resetModules();
         setAdminAuth.mockReset();
+        vi.clearAllMocks();
         runtimeConfig.sync.convexUrl = 'https://example.convex.cloud';
         runtimeConfig.sync.convexAdminKey = 'admin-key';
     });
@@ -46,6 +47,19 @@ describe('shared Convex server client', () => {
         second(); second();
         expect(realtime.close).toHaveBeenCalledTimes(1);
         expect(realtime.unsubscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it('releases the last watcher even when SDK unsubscribe throws', async () => {
+        realtime.onUpdate.mockImplementation(() => () => { throw new Error('SDK unsubscribe'); });
+        const { watchConvexVersion } = await import('../convex-client');
+        const stop = watchConvexVersion('workspace-a', vi.fn(), vi.fn());
+        expect(stop).toThrow('SDK unsubscribe');
+        expect(realtime.close).toHaveBeenCalledTimes(1);
+        stop();
+        expect(realtime.close).toHaveBeenCalledTimes(1);
+        const next = watchConvexVersion('workspace-b', vi.fn(), vi.fn());
+        expect(realtime.opened).toHaveBeenCalledTimes(2);
+        expect(next).toThrow('SDK unsubscribe');
     });
 
     it('uses admin authentication for internal auxiliary functions', async () => {

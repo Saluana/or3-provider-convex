@@ -99,5 +99,5 @@ export function watchConvexVersion(workspaceId: string, onVersion: (version: num
             version => { if (Number.isSafeInteger(version) && version >= 0) onVersion(version); else onError(new Error('Invalid workspace version')); }, onError);
     } catch (error) { release(); throw error; }
     let stopped = false;
-    return () => { if (stopped) return; stopped = true; unsubscribe(); release(); };
+    return () => { if (stopped) return; stopped = true; try { unsubscribe(); } finally { release(); } };
 }
