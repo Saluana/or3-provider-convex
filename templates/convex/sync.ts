@@ -1,3 +1,4 @@
+import { compareSyncTuple } from './syncContract/shared/sync/schemas';
 import { prepareSyncWrite, nextSyncClock } from './syncContract/shared/sync/prepare_sync_write';
 import { normalizeHistoricalSyncPayload } from './snapshot';
 import { assertStorageNotDeleted } from './storageDeletion';
@@ -2264,7 +2265,7 @@ async function captureSnapshot(ctx: MutationCtx, args: {
         const tombstonesByPk = new Map(tombstones.map((row) => [row.pk, row]));
         const orderedPks = [
             ...new Set([...rowsByPk.keys(), ...tombstonesByPk.keys()]),
-        ].sort();
+        ].sort((a, b) => compareSyncTuple([a], [b]));
         const pagePks = orderedPks.slice(0, remaining);
 
         for (const pk of pagePks) {

@@ -154,6 +154,16 @@ try {
   assert.equal(await client.query(anyApi.syncProbe.jobCount,{user:f.user}),0);
   history.generationId='generation';assert.ok((await client.mutation(anyApi.backgroundJobs.create,input)).jobId);
  });
+ await check('UTF-8 merge and long-key snapshot continuation match the canonical reader', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const keys=[':'.repeat(1024),'漢'.repeat(1024),'\u{10000}','\ue000'];
+  for(const id of keys)assert.equal((await invoke(f,'push',{ops:[op({pk:id,payload:{id,name:'unicode',clock:6,created_at:1,updated_at:1,deleted:false}})]})).results[0].success,true);
+  await client.mutation(anyApi.syncProbe.insert,{table:'tombstones',value:{workspace_id:f.workspace,table_name:'kv',pk:'\ue001',clock:1,hlc:'1:0:dev',op_id:crypto.randomUUID(),server_version:1,deleted_at:1,server_deleted_at:1,created_at:1}});
+  const tuples=[];let token;
+  for(let i=0;i<30;i++){const page=await invoke(f,'snapshot',{tables:['kv'],page_size:2,page_token:token});SnapshotResponseSchema.parse(page);tuples.push(...page.items.map(row=>[row.tableName,row.pk,row.kind]));if(!page.nextPageToken)break;assert.notEqual(page.nextPageToken,token);token=page.nextPageToken;}
+  await writeFile(join(evidence,'ordering-tuples.json'),JSON.stringify(tuples));
+  assert.deepEqual(tuples,[...tuples].sort(compareSyncTuple));assert.equal(tuples.length,7,JSON.stringify(tuples.map(row=>[row[0],row[1].slice(0,12),row[2]])));
+ });
  await check('canonical normalization preserves raw receipt fingerprints and exact delete payloads', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
   const write=op({payload:{id:'a',name:'setting',deleted:false,createdAt:1,updatedAt:2,clock:6}});

@@ -1,3 +1,4 @@
+import { MAX_SYNC_SNAPSHOT_TOKEN_LENGTH, compareSyncTuple } from './syncContract/shared/sync/schemas';
 /** Snapshot candidates, revision ordering and preimages shared by all sync writers. */
 import type { MutationCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
@@ -50,7 +51,7 @@ export function normalizeSnapshotTables(
             throw new Error(`Invalid snapshot table: ${table}`);
         }
     }
-    return normalized.sort();
+    return normalized.sort((a, b) => compareSyncTuple([a], [b]));
 }
 
 export function compareSnapshotRevisions(
@@ -86,14 +87,16 @@ export function resolveSnapshotWinner(
 
 export function encodeSnapshotCursor(token: SnapshotCursorToken): string {
     const asciiJson = encodeURIComponent(JSON.stringify(token));
-    return btoa(asciiJson)
+    const encoded = btoa(asciiJson)
         .replace(/\+/g, '-')
         .replace(/\//g, '_')
         .replace(/=+$/u, '');
+    if (encoded.length > MAX_SYNC_SNAPSHOT_TOKEN_LENGTH) throw new Error('Invalid snapshot page token');
+    return encoded;
 }
 
 export function decodeSnapshotCursor(value: string): SnapshotCursorToken {
-    if (!value || value.length > 4096) throw new Error('Invalid snapshot page token');
+    if (!value || value.length > MAX_SYNC_SNAPSHOT_TOKEN_LENGTH) throw new Error('Invalid snapshot page token');
     try {
         const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
         const padding = '='.repeat((4 - (base64.length % 4)) % 4);
