@@ -2,6 +2,16 @@
 
 ## Sync recovery and retention
 
+The hardened source candidate supports the matched host's direct and gateway
+sync contracts after deploying all updated templates and completing one-time
+history initialization. Published 0.0.26 does not contain these changes; this
+checkout retains that version only for development, not republication. Verify
+the deployed backend digest matches the built package before enabling clients.
+A runtime capability or auth token alone cannot qualify an older backend.
+Local backend/lifecycle/HTTP qualification does not certify live Clerk browser
+sign-in/reconnect, Convex browser mixed holds, or hosted/full-storage restores.
+See the matching host's public Convex guide for the activation boundary.
+
 Deploy the rebuilt runtime and all matching Convex templates together. Public
 `sync.push` validates complete canonical put records and revision stamps before
 allocating versions. A put replaces the record, including clearing omitted
@@ -265,10 +275,11 @@ descriptions wrap fully on narrow screens.
 Server-authored notification and storage writes mint a fresh UUID `op_id`
 (never a `server:*` prefix), allocate `server_version`, and append
 `change_log`. Host enforcement settings do not: they live in the private
-`host_settings` table and never enter sync, snapshots, or `change_log`. Pull
-and watch skip historical non-UUID `op_id`s without failing the request. Pull
+`host_settings` table and never enter sync, snapshots, or `change_log`.
+Checked pull retains historical non-UUID `op_id` evidence before
+returning unavailable coverage. Version watches return no record content. Pull
 responses include `oldestRetainedVersion` and `requiresSnapshot`. Direct
-subscribe advances the watch cursor after each page.
+subscribe advances only after the host's page receipt resolves.
 
 The provider exposes the shared materialized snapshot contract in both direct
 and gateway modes. The first page records one Convex server-version
