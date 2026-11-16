@@ -2,7 +2,7 @@
 
 ## 0.0.27 release notes
 
-Requires OR3 host commit `2f34682144f8cef26f76248cebf2c62f4c1178f8` or
+Requires OR3 host commit `3ae32d0b943d538934cfdbd8df92a51fd903f41d` or
 later on `or3-cloud`. Update the provider runtime and **redeploy all updated
 Convex templates** together, then complete one-time history initialization
 before enabling the matching host/browser. Updating the npm package alone does

@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Saluana/or3-chat
-          ref: 2f34682144f8cef26f76248cebf2c62f4c1178f8
+          ref: 3ae32d0b943d538934cfdbd8df92a51fd903f41d
           path: qualification-host
       - name: Verify bundled validator against canonical host source
         run: node scripts/build-template-pack.mjs --check-host qualification-host
