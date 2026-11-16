@@ -1,5 +1,5 @@
 {
-  "hostCommit": "08e19b677af0de3667b4dc4bc2db4d075ee7b995",
+  "hostCommit": "2f34682144f8cef26f76248cebf2c62f4c1178f8",
   "files": {
     "shared/sync/prepare-sync-write.ts": {
       "source": "b2f10e44e11897d33bec316b0248b32a254430e17d729e4c4cf6450948ecd216",

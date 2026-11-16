@@ -81,7 +81,7 @@ mock.module(join(host, 'server/utils/background-jobs/store.ts'), () => ({ getJob
 const checks = [];
 async function check(name, operation) {
     try { await operation(); checks.push({ name, passed: true }); console.log('PASS ' + name); }
-    catch (error) { const message = String(error).replaceAll(adminKey, '[redacted]'); checks.push({ name, passed: false, error: message }); console.error('FAIL ' + name + ': ' + message); }
+    catch (error) { const message = [error, error?.cause].filter(Boolean).map(String).join('\nCaused by: ').replaceAll(adminKey, '[redacted]'); checks.push({ name, passed: false, error: message }); console.error('FAIL ' + name + ': ' + message); }
 }
 let backend;
 try {
@@ -95,6 +95,11 @@ try {
     const { ConvexHttpClient } = await import(join(provider, 'node_modules/convex/dist/esm/browser/index.js'));
     const client = new ConvexHttpClient(url);
     client.setAdminAuth(adminKey, { subject: 'parity-owner', issuer: 'https://or3.ai/auth/basic-auth', or3_server: true });
+    const historyIncarnation = crypto.randomUUID();
+    const initialized = await client.mutation('syncHistory:initialize', { incarnation: historyIncarnation });
+    while (!(await client.mutation('syncHistory:finishReplacement', { attempt_id: initialized.attemptId })).ready) {}
+    const protocol = { history_incarnation: historyIncarnation, history_incarnation_capability: 'incarnation-v1',
+        unavailable_record_capability: 'unavailable-v1' };
     const { workspace, user } = await client.mutation('parityProbe:seed', {});
     const { ConvexRateLimitProvider } = await import(join(provider, 'src/runtime/server/rate-limit/convex-provider.ts'));
     const limits = new ConvexRateLimitProvider();
@@ -156,9 +161,9 @@ try {
         assert.equal(download.name, 'proof.txt');
         assert.equal(download.fileKind, 'file');
         assert.equal(new URL(download.url).protocol, 'http:');
-        const before = await client.query('sync:getServerVersion', { workspace_id: workspace });
+        const before = await client.query('sync:getServerVersion', { workspace_id: workspace, ...protocol });
         await client.mutation('storage:commitUpload', commit);
-        assert.deepEqual(await client.query('sync:getServerVersion', { workspace_id: workspace }), before);
+        assert.deepEqual(await client.query('sync:getServerVersion', { workspace_id: workspace, ...protocol }), before);
         for (const change of [{ hash: 'f'.repeat(64) }, { size_bytes: bytes.length + 1 }, { mime_type: 'text/html' }, { storage_provider_id: 's3' }]) {
             await assert.rejects(client.mutation('storage:commitUpload', { ...commit, ...change }), /intent|metadata|receipt/i);
         }
@@ -233,7 +238,8 @@ try {
             setActive: async ({ id }) => { session.workspace = { id, name: 'Restore target' }; },
             update: async () => {},
         };
-        mock.module(join(host, 'app/db/client.ts'), () => ({ getActiveWorkspaceId: () => session.workspace.id, getDb: () => databases.get(session.workspace.id) }));
+        mock.module(join(host, 'app/db/client.ts'), () => ({ getActiveWorkspaceId: () => session.workspace.id, getDb: () => databases.get(session.workspace.id),
+            logicalStoreName: () => { throw new Error('Unexpected IndexedDB table access in Cloud restore'); } }));
         mock.module(join(host, 'app/composables/auth/useSessionContext.ts'), () => ({ getCachedSessionContext: () => session }));
         mock.module(join(host, 'app/core/workspace/gateway-workspace-api.ts'), () => ({ createGatewayWorkspaceApi: () => workspaceApi }));
         let rejectMetadata = false;
@@ -271,7 +277,7 @@ try {
         await writeFile(join(evidence, 'trash-restore.json'), JSON.stringify({ passed: true, restoredWorkspace, trashPreserved: true, restoredBytesVerified: true, sourceAndPendingUploadKept: true, unappliedMetadataRejected: true }, null, 2) + '\n');
         await writeFile(join(evidence, 'trash-backup.json'), JSON.stringify({ passed: true, fileHash: hash, archiveSha256: createHash('sha256').update(new Uint8Array(archiveBytes)).digest('hex'), trashIncluded: true, originalKept: true, pendingUploadKept: true, publicAccessDenied: true, snapshotMismatchesDenied: true }, null, 2) + '\n');
     });
-    await check('native reuploads advance synced revisions and preserve frozen Trash originals', async () => {
+    await check('native reuploads preserve deletion and frozen Trash originals until explicit restore', async () => {
         const workspaceId = await client.mutation('parityProbe:quotaWorkspace', { user_id: user });
         const upload = async text => {
             const bytes = new TextEncoder().encode(text), hash = 'sha256:' + createHash('sha256').update(bytes).digest('hex');
@@ -282,9 +288,10 @@ try {
         };
         const originals = [await upload('First retained original'), await upload('Second retained original')].sort((a, b) => a.hash.localeCompare(b.hash));
         const deleteClock = Math.floor(Date.now() / 1000) + 60;
-        const trash = await client.mutation('sync:push', { workspace_id: workspaceId, ops: originals.map(original => ({
+        const deleteHlc = `${Date.now()}:revision-probe`;
+        const trash = await client.mutation('sync:push', { workspace_id: workspaceId, ...protocol, stored_record_capability: 'stored-record-v1', ops: originals.map(original => ({
             op_id: crypto.randomUUID(), table_name: 'file_meta', operation: 'delete', pk: original.hash,
-            clock: deleteClock, hlc: `${Date.now()}:revision-probe`, device_id: 'revision-probe',
+            clock: deleteClock, hlc: deleteHlc, device_id: 'revision-probe',
         })) });
         assert(trash.results.every(result => result.success && result.applied));
         const first = await client.mutation('sync:backupSnapshot', { workspace_id: workspaceId, tables: ['file_meta'], page_size: 1 });
@@ -300,43 +307,54 @@ try {
             assert.equal(rows[index].payload.storage_id, originals[index].storageId);
             if (index === 1) assert.equal(await (await fetch(originalUrl.url)).text(), originals[index].text);
         }
-        let lastClock = deleteClock;
+        const lastClock = deleteClock;
+        let lastHlc = deleteHlc;
         // Fresh snapshots must select the canonical replacement, including
         // rapid consecutive commits that can share the same wall-clock second.
         for (let attempt = 0; attempt < 3; attempt++) {
             const current = await client.mutation('sync:backupSnapshot', { workspace_id: workspaceId, tables: ['file_meta'], page_size: 100 });
             const row = current.items.find(item => item.pk === replacement.hash);
             assert.equal(row?.payload.storage_id, replacement.storageId, 'Fresh backup selected an obsolete original');
-            assert.equal(row.payload.deleted, false);
-            assert(row.revision.clock > lastClock, 'Native revision did not advance past the prior revision');
-            lastClock = row.revision.clock;
+            assert.equal(row.payload.deleted, true, 'Byte completion resurrected Trash');
+            assert.equal(row.revision.clock, lastClock, 'Byte completion changed the semantic clock');
+            assert(row.revision.hlc > lastHlc, 'Fresh native metadata must win at its base clock');
+            lastHlc = row.revision.hlc;
             const file = await client.query('storage:getBackupFileUrl', { workspace_id: workspaceId, hash: replacement.hash, storage_id: row.payload.storage_id });
             assert.equal(await (await fetch(file.url)).text(), replacement.text);
             if (attempt < 2) replacement = await upload(replacement.text);
         }
         // Permanent deletion leaves a tombstone after removing materialized
-        // metadata. A later verified reupload must also advance that revision.
+        // metadata. Reupload preserves the deletion until a semantic restore.
         const opId = crypto.randomUUID();
-        const deleted = await client.mutation('sync:push', { workspace_id: workspaceId, ops: [{
+        const deleted = await client.mutation('sync:push', { workspace_id: workspaceId, ...protocol, stored_record_capability: 'stored-record-v1', ops: [{
             op_id: opId, table_name: 'file_meta', operation: 'delete', pk: replacement.hash,
             clock: lastClock + 1, hlc: `${Date.now()}:revision-probe`, device_id: 'revision-probe',
         }] });
         assert(deleted.results[0].success && deleted.results[0].applied);
         await client.mutation('storage:deleteObject', { workspace_id: workspaceId, hash: replacement.hash, storage_id: replacement.storageId });
-        const purged = await client.mutation('sync:snapshot', { workspace_id: workspaceId, tables: ['file_meta'], page_size: 100 });
+        const purged = await client.mutation('sync:snapshot', { workspace_id: workspaceId, ...protocol, tables: ['file_meta'], page_size: 100 });
         const tombstone = purged.items.find(item => item.pk === replacement.hash);
         assert.equal(tombstone.kind, 'tombstone');
         replacement = await upload(replacement.text);
         const restored = await client.mutation('sync:backupSnapshot', { workspace_id: workspaceId, tables: ['file_meta'], page_size: 100 });
         const restoredRow = restored.items.find(item => item.pk === replacement.hash);
         assert.equal(restoredRow?.payload.storage_id, replacement.storageId);
-        assert(restoredRow.revision.clock > tombstone.revision.clock);
-        assert.equal(restoredRow.payload.deleted, false);
+        assert.equal(restoredRow.revision.clock, tombstone.revision.clock);
+        assert.equal(restoredRow.payload.deleted, true, 'Reupload resurrected a permanently deleted file');
+        const { deleted_at, ...restorePayload } = restoredRow.payload;
+        const restoreClock = tombstone.revision.clock + 1;
+        const explicit = await client.mutation('sync:push', { workspace_id: workspaceId, ...protocol,
+            stored_record_capability: 'stored-record-v1', ops: [{ op_id: crypto.randomUUID(), table_name: 'file_meta',
+                operation: 'put', pk: replacement.hash, payload: { ...restorePayload, deleted: false, clock: restoreClock },
+                clock: restoreClock, hlc: `${Date.now()}:restore-probe`, device_id: 'revision-probe' }] });
+        assert(explicit.results[0].success && explicit.results[0].applied);
+        const live = await client.mutation('sync:backupSnapshot', { workspace_id: workspaceId, tables: ['file_meta'], page_size: 100 });
+        assert.equal(live.items.find(item => item.pk === replacement.hash).payload.deleted, false);
         const restoredFile = await client.query('storage:getBackupFileUrl', { workspace_id: workspaceId, hash: replacement.hash, storage_id: replacement.storageId });
         assert.equal(await (await fetch(restoredFile.url)).text(), replacement.text);
         assert.equal(await (await fetch(originalUrl.url)).text(), originals[1].text);
         await writeFile(join(evidence, 'concurrent-backup.json'), JSON.stringify({ passed: true, files: rows.length, frozenWatermark: first.highWatermark,
-            trashAndOriginalBytesPreserved: true, freshOriginalVerified: true, nativeRevisionsAdvance: true, tombstoneReuploadVerified: true }, null, 2) + '\n');
+            trashAndOriginalBytesPreserved: true, freshOriginalVerified: true, nativeBaseClockPreserved: true, tombstoneReuploadVerified: true, explicitRestoreVerified: true }, null, 2) + '\n');
     });
     for (const [name, args] of [
         ['generateUploadUrl', { workspace_id: workspace, hash: nativeReceipt?.hash, mime_type: 'text/plain', size_bytes: 18 }],

@@ -49,13 +49,10 @@ jobs:
       - run: bun run build
       - name: Validate package archive
         run: npm pack --dry-run --json > "$RUNNER_TEMP/package-pack.json"
-      - name: Select immutable canonical contract source
-        id: canonical-contract
-        run: node --input-type=module -e 'import fs from "node:fs"; const {hostCommit} = JSON.parse(fs.readFileSync("templates/convex/syncContract/source.json", "utf8")); if (!/^[0-9a-f]{40}$/.test(hostCommit)) throw Error("Invalid host commit"); fs.appendFileSync(process.env.GITHUB_OUTPUT, `commit=${hostCommit}\n`);'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Saluana/or3-chat
-          ref: ${{ steps.canonical-contract.outputs.commit }}
+          ref: 2f34682144f8cef26f76248cebf2c62f4c1178f8
           path: qualification-host
       - name: Verify bundled validator against canonical host source
         run: node scripts/build-template-pack.mjs --check-host qualification-host

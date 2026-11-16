@@ -1,12 +1,40 @@
 # or3-provider-convex
 
+## 0.0.27 release notes
+
+Requires OR3 host commit `2f34682144f8cef26f76248cebf2c62f4c1178f8` or
+later on `or3-cloud`. Update the provider runtime and **redeploy all updated
+Convex templates** together, then complete one-time history initialization
+before enabling the matching host/browser. Updating the npm package alone does
+not upgrade a deployed backend.
+
+- Pull, snapshot, preimage cleanup and GC use byte budgets within Convex
+  transaction limits. Snapshot order uses component-wise UTF-8 comparison and
+  continuation tokens support the shared 65,536-character bound.
+- The bundled host validator and dependency graph are pinned to the qualified
+  host and checked for source parity. New writes reject `fork_reason: null`;
+  legacy null values are omitted on wire reads without rewriting stored rows.
+- Checked reads retain unavailable-record evidence before advancing coverage.
+  Privileged inspect/export/revalidate/repair actions preserve originals and
+  publish repairs as fresh winning revisions and server versions.
+- `stored-record-v1` push negotiation holds affected operations with durable
+  evidence while healthy siblings proceed. Preserve the original UUID and
+  intent for manual recovery.
+- History incarnation `v1` fences old-history push, ACK and snapshot work.
+  For a deployment/database replacement, isolate the restored candidate and
+  stop/drain all writers, prepare a fresh external journal with
+  `scripts/history.mjs prepare`, import the complete verified backup, then run
+  `scripts/history.mjs complete` before reopening access. Use a new journal for
+  every replacement, rollback or safety recovery; ordinary template deploys
+  and restarts preserve the incarnation. See the operator procedure below.
+- Convex client release runs in `finally`, including when unsubscribe throws.
+
 ## Sync recovery and retention
 
-The hardened source candidate supports the matched host's direct and gateway
-sync contracts after deploying all updated templates and completing one-time
-history initialization. Published 0.0.26 does not contain these changes; this
-checkout retains that version only for development, not republication. Verify
-the deployed backend digest matches the built package before enabling clients.
+Version 0.0.27 supports the matched host's direct and gateway sync contracts
+after deploying all updated templates and completing one-time history
+initialization. Verify the deployed backend digest matches the built package
+before enabling clients.
 A runtime capability or auth token alone cannot qualify an older backend.
 Local backend/lifecycle/HTTP qualification does not certify live Clerk browser
 sign-in/reconnect, Convex browser mixed holds, or hosted/full-storage restores.
@@ -695,10 +723,10 @@ shared transaction read budget. Workspace deletion schedules a separate bounded
 purge for its cached pages. Deploy the scaffold to install the additive
 `sync_snapshot_pages` table.
 
-The matching candidate implements `unavailableRecords: 'v1'` and
+Version 0.0.27 implements `unavailableRecords: 'v1'` and
 `historyIncarnation: 'v1'` in gateway and direct modes. Deploy matching templates
-and initialize history before activating the matching host/browser. This source
-change does not qualify an already deployed older backend or publish a release.
+and initialize history before activating the matching host/browser. The package
+upgrade does not qualify an already deployed older backend.
 
 `sync.pullChecked` is a **mutation**: classification and durable evidence commit before a
 cursor or marker is returned. The old `sync.pull` query returns an explicit
