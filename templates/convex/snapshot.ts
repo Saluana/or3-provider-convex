@@ -14,6 +14,7 @@ export type SnapshotRevision = {
 
 export type SnapshotCandidate =
     | {
+          source?: unknown;
           kind: 'row';
           tableName: string;
           pk: string;
@@ -22,6 +23,7 @@ export type SnapshotCandidate =
           serverVersion?: number;
       }
     | {
+          source?: unknown;
           kind: 'tombstone';
           tableName: string;
           pk: string;
@@ -34,6 +36,7 @@ export type SnapshotCandidate =
 
 export type SnapshotCursorToken = {
     version: 1;
+    historyIncarnation?: string;
     snapshotId: string;
     tableIndex: number;
     afterPk: string | null;
@@ -137,15 +140,9 @@ export function legacySnapshotRevision(
     pk: string,
     value: { clock?: number; hlc?: string; op_id?: string }
 ): SnapshotRevision {
-    const clock = Number.isInteger(value.clock) && (value.clock as number) >= 0
-        ? (value.clock as number)
-        : 0;
-    const hlc = typeof value.hlc === 'string' && value.hlc.length > 0
-        ? value.hlc
-        : `legacy-${clock}`;
-    const opId = typeof value.op_id === 'string' && value.op_id.length > 0
-        ? value.op_id
-        : `legacy:${tableName}:${pk}:${clock}:${hlc}`;
+    const clock = value.clock ?? 0;
+    const hlc = value.hlc ?? `legacy-${clock}`;
+    const opId = value.op_id ?? `legacy:${tableName}:${pk}:${clock}:${hlc}`;
     return { clock, hlc, opId };
 }
 
@@ -199,19 +196,21 @@ export function materializedSnapshotCandidate(
     const serverVersion = serverVersionOverride ?? doc.server_version ?? 0;
     if (doc.deleted === true) {
         return {
+            source: doc,
             kind: 'tombstone',
             tableName,
             pk,
             revision,
             ...(tableName === 'file_meta' ? { payload: snapshotPayloadFromDoc(doc, tableName, getPkField(tableName), pk, revision) } : {}),
             serverDeletedAt:
-                typeof doc.deleted_at === 'number' && doc.deleted_at >= 0
-                    ? Math.floor(doc.deleted_at)
+                typeof doc.deleted_at === 'number'
+                    ? doc.deleted_at
                     : nowSec(),
             serverVersion,
         };
     }
     return {
+        source: doc,
         kind: 'row',
         tableName,
         pk,

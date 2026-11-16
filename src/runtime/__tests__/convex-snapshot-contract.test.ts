@@ -32,12 +32,16 @@ vi.mock("../server/utils/convex-gateway", () => ({
   buildGatewayAdminIdentity: () => ({}),
 }));
 
-const syncFunctions = await import(
+const importedSyncFunctions = await import(
   /* @vite-ignore */ new URL(
     "../../../templates/convex/sync.ts",
     import.meta.url,
   ).href
 );
+const syncFunctions = Object.fromEntries(Object.entries(importedSyncFunctions).map(([name, raw]) => {
+  const fn = raw as RegisteredFunction;
+  return [name, fn?._handler ? { ...fn, _handler: (ctx: any, args: any) => fn._handler(ctx, { history_incarnation: 'fixture-history', history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', ...args }) } : raw];
+}));
 const notificationFunctions = await import(
   /* @vite-ignore */ new URL(
     "../../../templates/convex/notifications.ts",
@@ -141,6 +145,8 @@ class MemoryQuery {
     return this;
   }
 
+  async unique(): Promise<Row | null> { return this.first(); }
+
   async first(): Promise<Row | null> {
     return this.materialize()[0] ?? null;
   }
@@ -193,6 +199,8 @@ class MemoryQuery {
 
 function createFixture(role: "viewer" | "editor" = "viewer") {
   const tables: FixtureTables = {
+    sync_history: [{ _id: 'history', key: 'history', incarnation: 'fixture-history', phase: 'ready' }],
+    sync_unavailable_records: [], sync_unavailable_sources: [],
     auth_accounts: [
       {
         _id: "account-1",
@@ -256,6 +264,7 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
         _id: "thread-doc-a",
         workspace_id: "ws-1",
         id: "thread-a",
+        status: "active", pinned: false, forked: false, created_at: 1, updated_at: 1,
         title: "before",
         deleted: false,
         clock: 4,
@@ -267,6 +276,7 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
         _id: "thread-doc-b",
         workspace_id: "ws-1",
         id: "thread-b",
+        status: "active", pinned: false, forked: false, created_at: 1, updated_at: 1,
         title: "stable",
         deleted: false,
         clock: 5,
@@ -410,7 +420,7 @@ describe("Convex background request usage persistence", () => {
     await adapter.retainChatToolResult!(actor, structuredClone(input));
     expect(fixture.tables.server_version_counter[0]!.value).toBe(version);
     expect(await adapter.readChatToolResult!(actor, { admission, callId: "read", reference: prepared.result })).toBe(content);
-    const pulled = await (syncFunctions.pull as RegisteredFunction)._handler(fixture.ctx, { workspace_id: "ws-1", cursor: 5, limit: 100 });
+    const pulled = await (syncFunctions.pullChecked as RegisteredFunction)._handler(fixture.ctx, { workspace_id: "ws-1", cursor: 5, limit: 100 });
     const chunks = new Map(pulled.changes.filter((change: any) => change.tableName === "kv").map((change: any) => {
       expect(ChangeStampSchema.safeParse(change.stamp).success).toBe(true);
       return [change.pk, change.payload];
@@ -673,7 +683,7 @@ describe("Convex background request usage persistence", () => {
     const finalize = (syncFunctions.finalizeChatGeneration as RegisteredFunction)._handler;
     expect(await finalize(fixture.ctx, input)).toMatchObject({ status: "committed", replayed: false });
     expect(fixture.tables.messages[0]!.data).toMatchObject({ usage: measuredUsage(), compaction: { marker: "keep" }, custom: "keep", generation_id: "generation-1", content: "final text" });
-    const pulled = await (syncFunctions.pull as RegisteredFunction)._handler(fixture.ctx, { workspace_id: "ws-1", cursor: 5, limit: 10 });
+    const pulled = await (syncFunctions.pullChecked as RegisteredFunction)._handler(fixture.ctx, { workspace_id: "ws-1", cursor: 5, limit: 10 });
     expect(pulled.changes[0].payload.data.usage).toEqual(measuredUsage());
     expect(await finalize(fixture.ctx, input)).toMatchObject({ status: "committed", replayed: true });
     expect(fixture.tables.change_log).toHaveLength(1);
@@ -1499,6 +1509,7 @@ describe("Convex materialized snapshot contract", () => {
       server_version: 4,
       kind: "row",
       payload: {
+        status: "active", pinned: false, forked: false, created_at: 1, updated_at: 1,
         id: "thread-a",
         title: "before",
         deleted: false,
@@ -1558,6 +1569,7 @@ describe("Convex materialized snapshot contract", () => {
         pk: "thread-a",
         payload: {
           id: "thread-a",
+          status: "active", pinned: false, forked: false, created_at: 1, updated_at: 1,
           title: "before",
           deleted: false,
           clock: 4,
@@ -1632,10 +1644,10 @@ describe("Convex materialized snapshot contract", () => {
     ).rejects.toThrow("unavailable");
   });
 
-  it("mints UUID op_ids and fails closed on legacy prefixed ids without unavailable evidence", async () => {
+  it("mints UUID op_ids and durably contains legacy prefixed ids", async () => {
     const fixture = createFixture("editor");
     const create = (notificationFunctions.create as RegisteredFunction)._handler;
-    const pull = (syncFunctions.pull as RegisteredFunction)._handler;
+    const pull = (syncFunctions.pullChecked as RegisteredFunction)._handler;
     const id = await create(fixture.ctx, {
       workspace_id: "ws-1",
       user_id: "user-1",
@@ -1667,11 +1679,11 @@ describe("Convex materialized snapshot contract", () => {
     });
     fixture.tables.server_version_counter[0]!.value = created!.server_version + 1;
 
-    await expect(pull(fixture.ctx, {
-      workspace_id: "ws-1",
-      cursor: created!.server_version - 1,
-      limit: 50,
-    })).rejects.toThrow("Invalid stored sync operation ID");
+    const page = await pull(fixture.ctx, {
+      workspace_id: "ws-1", cursor: created!.server_version - 1, limit: 50,
+    });
+    expect(page.unavailable).toEqual([expect.objectContaining({ pk: 'legacy-note', originalKind: 'put' })]);
+    expect(fixture.tables.sync_unavailable_records).toHaveLength(1);
   });
 
   it("rejects a non-UUID op_id before allocating a server version", async () => {
@@ -1707,6 +1719,7 @@ describe("Convex materialized snapshot contract", () => {
     const normal = (syncFunctions.snapshot as RegisteredFunction)._handler;
     const trash = { _id: 'trash-file', workspace_id: 'ws-1', hash: 'sha256:' + 'a'.repeat(64),
       storage_id: 'old-blob', storage_provider_id: 'convex', size_bytes: 8, name: 'original.txt', mime_type: 'text/plain', kind: 'file',
+      created_at: 1, updated_at: 2, ref_count: 0,
       deleted: true, deleted_at: 2, clock: 2, hlc: '2:0:dev', op_id: 'op-2', server_version: 2 };
     fixture.tables.file_meta.push(trash, { ...trash, _id: 'second-file', hash: 'sha256:' + 'b'.repeat(64) });
     const first = await backup(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'] });

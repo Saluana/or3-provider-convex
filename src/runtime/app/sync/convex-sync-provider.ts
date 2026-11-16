@@ -44,6 +44,7 @@ import {
     PullResponseSchema,
     SnapshotResponseSchema,
     PushResultSchema,
+    HistoryIncarnationSchema,
 } from '~~/shared/sync/schemas';
 import type { GenericId as Id } from 'convex/values';
 import { CONVEX_JWT_TEMPLATE, CONVEX_PROVIDER_ID } from '~~/shared/cloud/provider-ids';
@@ -67,6 +68,15 @@ function requestWithSignal<T>(request: () => Promise<T>, signal?: AbortSignal): 
     });
 }
 
+function protocolArgs(history: string | null | undefined) {
+    return { history_incarnation: history, history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1' };
+}
+function assertHistoryResponse(value: { historyIncarnation?: unknown }) {
+    if (!HistoryIncarnationSchema.safeParse(value?.historyIncarnation).success) {
+        throw Object.assign(new Error('Convex backend requires history incarnation qualification'), { code: 'OR3_SYNC_HISTORY_UNSUPPORTED' });
+    }
+}
+
 /**
  * Purpose:
  * Create a direct-mode SyncProvider backed by Convex.
@@ -83,7 +93,7 @@ function requestWithSignal<T>(request: () => Promise<T>, signal?: AbortSignal): 
 export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
     const subscriptions = new Map<string, () => void>();
 
-    return {
+    const thisProvider: SyncProvider = {
         id: CONVEX_PROVIDER_ID,
         mode: 'direct',
         auth: {
@@ -92,6 +102,7 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         },
         capabilities: {
             snapshotBootstrap: 'snapshot-v1',
+            historyIncarnation: 'v1',
             subscriptionPages: 'v1',
         },
 
@@ -109,52 +120,37 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
 
             let generation = 0;
             let delivering = false;
-            let pending: unknown;
+            let pending = false;
             const startWatch = (): (() => void) => {
                 const watchGeneration = ++generation;
-                const fromCursor = currentCursor;
                 const deliver = async () => {
                     if (delivering) return;
                     delivering = true;
-                    let restart = false;
                     try {
-                        while (pending !== undefined && !disposed && generation === watchGeneration) {
-                            const result = pending;
-                            pending = undefined;
-                            const page = PullResponseSchema.parse(result);
-                            if (page.nextCursor < fromCursor || page.changes.some(change => change.serverVersion <= fromCursor)) {
-                                throw new Error('Watch page does not follow its requested cursor');
-                            }
-                            const filtered = tables.length > 0
-                                ? { ...page, changes: page.changes.filter(change => tables.includes(change.tableName)) }
-                                : page;
-                            if (options?.onPage) await options.onPage(fromCursor, filtered);
-                            else await onChanges(filtered.changes);
+                        while (pending && !disposed && generation === watchGeneration) {
+                            pending = false;
+                            const fromCursor = currentCursor;
+                            const page = await thisProvider.pull({ scope, cursor: fromCursor, limit,
+                                tables, historyIncarnation: options?.historyIncarnation });
                             if (disposed || generation !== watchGeneration) return;
-                            if (page.requiresSnapshot) return;
-                            if (page.nextCursor > currentCursor) {
-                                currentCursor = page.nextCursor;
-                                pending = undefined;
-                                try { unwatch?.(); } catch { /* Already torn down. */ }
-                                restart = true;
-                                break;
-                            }
+                            if (options?.onPage) await options.onPage(fromCursor, page);
+                            else if (page.unavailable?.length || page.requiresSnapshot) throw new Error('Checked sync page acknowledgement required');
+                            else await onChanges(page.changes);
+                            if (disposed || generation !== watchGeneration || page.requiresSnapshot) return;
+                            currentCursor = page.nextCursor;
+                            if (page.hasMore) pending = true;
                         }
                     } catch (error) {
-                        pending = undefined;
                         console.error('[convex-sync] Watch page was not acknowledged:', error);
                     } finally { delivering = false; }
-                    if (restart && !disposed && generation === watchGeneration) unwatch = startWatch();
                 };
-                return client.onUpdate(api.sync.pull, {
+                return client.onUpdate(api.sync.watchChanges, {
                     workspace_id: scope.workspaceId as Id<'workspaces'>,
-                    workspace_item_capability: 'v1', cursor: fromCursor, limit,
-                    tables: tables.length > 0 ? tables : undefined,
-                }, result => {
+                    ...protocolArgs(options?.historyIncarnation),
+                }, () => {
                     if (disposed || generation !== watchGeneration) return;
-                    pending = result;
-                    void deliver();
-                });
+                    pending = true; void deliver();
+                }, error => { console.error('[convex-sync] Watch failed:', error); });
             };
 
             unwatch = startWatch();
@@ -188,16 +184,20 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         },
 
         async pull(request: PullRequest, options?: SyncRequestOptions): Promise<PullResponse> {
-            const result = await requestWithSignal(() => client.query(api.sync.pull, {
+            const result = await requestWithSignal(() => client.mutation(api.sync.pullChecked, {
                 workspace_id: request.scope.workspaceId as Id<'workspaces'>,
                 workspace_item_capability: 'v1',
+                ...protocolArgs(request.historyIncarnation),
                 cursor: request.cursor,
                 limit: request.limit,
                 tables: request.tables,
             }), options?.signal);
 
             // Validate response to catch malformed server data
+            assertHistoryResponse(result);
             const parsed = PullResponseSchema.safeParse({
+                historyIncarnation: result.historyIncarnation,
+                unavailable: result.unavailable,
                 changes: result.changes,
                 nextCursor: result.nextCursor,
                 hasMore: result.hasMore,
@@ -217,11 +217,13 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             const result = await requestWithSignal(() => client.mutation(api.sync.snapshot, {
                 workspace_id: request.scope.workspaceId as Id<'workspaces'>,
                 workspace_item_capability: 'v1',
+                ...protocolArgs(request.historyIncarnation),
                 page_size: request.pageSize,
                 page_token: request.pageToken,
                 tables: request.tables,
             }), options?.signal);
 
+            assertHistoryResponse(result);
             const parsed = SnapshotResponseSchema.safeParse(result);
             if (!parsed.success) {
                 console.error('[convex-sync] Invalid snapshot response:', parsed.error);
@@ -235,6 +237,7 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             const result = await requestWithSignal(() => client.mutation(api.sync.push, {
                 workspace_id: batch.scope.workspaceId as Id<'workspaces'>,
                 workspace_item_capability: 'v1',
+                ...protocolArgs(batch.historyIncarnation),
                 ops: batch.ops.map((op: PendingOp) => ({
                     op_id: op.stamp.opId,
                     table_name: op.tableName,
@@ -248,7 +251,9 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             }), options?.signal);
 
             // Validate response for consistency with pull()
+            assertHistoryResponse(result);
             const parsed = PushResultSchema.safeParse({
+                historyIncarnation: result.historyIncarnation,
                 results: result.results,
                 serverVersion: result.serverVersion,
             });
@@ -262,11 +267,14 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         },
 
         async updateCursor(scope: SyncScope, deviceId: string, version: number, options?: SyncRequestOptions): Promise<void> {
-            await requestWithSignal(() => client.mutation(api.sync.updateDeviceCursor, {
+            const result = await requestWithSignal(() => client.mutation(api.sync.updateDeviceCursor, {
                 workspace_id: scope.workspaceId as Id<'workspaces'>,
                 device_id: deviceId,
                 last_seen_version: version,
+                ...protocolArgs(options?.historyIncarnation),
             }), options?.signal);
+            assertHistoryResponse(result);
+            if (result.historyIncarnation !== options?.historyIncarnation) throw Object.assign(new Error('History changed'), { data: { code: 'OR3_SYNC_HISTORY_CHANGED', historyIncarnation: result.historyIncarnation } });
         },
 
         async dispose(): Promise<void> {
@@ -281,4 +289,5 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             subscriptions.clear();
         },
     };
+    return thisProvider;
 }

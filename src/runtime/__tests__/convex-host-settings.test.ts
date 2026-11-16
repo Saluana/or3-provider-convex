@@ -6,7 +6,7 @@ import * as workspaceFunctions from '../../../templates/convex/workspaces';
 
 type Handler = (ctx: any, args: any) => Promise<any>;
 const handler = (fn: unknown): Handler =>
-    (fn as { _handler: Handler })._handler;
+    (ctx, args) => (fn as { _handler: Handler })._handler(ctx, { history_incarnation: 'fixture-history', history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', ...args });
 
 const SERVER_IDENTITY = {
     subject: 'or3-host-settings',
@@ -37,6 +37,7 @@ function fixture(options: {
     memberships?: Array<{ workspace_id: string; user_id: string; role: string }>;
 } = {}) {
     const tables: Record<string, any[]> = {
+        sync_history: [{ _id: 'history', key: 'history', incarnation: 'fixture-history', phase: 'ready' }],
         auth_accounts: [
             {
                 _id: 'account-1',
@@ -91,6 +92,7 @@ function fixture(options: {
                         );
                         return builder;
                     },
+                    unique: async () => rows[0] ?? null,
                     first: async () => rows[0] ?? null,
                     collect: async () => [...rows],
                     take: async (limit: number) => rows.slice(0, limit),

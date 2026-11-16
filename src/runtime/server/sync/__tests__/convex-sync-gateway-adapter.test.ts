@@ -15,6 +15,9 @@ vi.mock('convex/server', () => ({
     anyApi: {
         sync: {
             pull: 'sync.pull',
+            pullChecked: 'sync.pullChecked',
+            getHistoryIncarnation: 'sync.getHistoryIncarnation',
+            watchChanges: 'sync.watchChanges',
             queryCanonicalStorage: 'sync.queryCanonicalStorage',
             snapshot: 'sync.snapshot',
             push: 'sync.push',
@@ -122,7 +125,7 @@ describe('ConvexSyncGatewayAdapter', () => {
             provider: 'basic-auth',
             providerUserId: 'user-1',
         });
-        queryMock.mockResolvedValue({ changes: [], nextCursor: 0, hasMore: false });
+        mutationMock.mockResolvedValue({ changes: [], nextCursor: 0, hasMore: false });
 
         await adapter.pull(makeEvent(), {
             scope: { workspaceId: 'ws-1' },
@@ -139,7 +142,7 @@ describe('ConvexSyncGatewayAdapter', () => {
 
     it('maps pull response and converts op strings to put|delete', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
-        queryMock.mockResolvedValue({
+        mutationMock.mockResolvedValue({
             changes: [
                 {
                     serverVersion: 1,
@@ -181,7 +184,11 @@ describe('ConvexSyncGatewayAdapter', () => {
             requiresSnapshot: false,
         });
 
-        expect(queryMock).toHaveBeenCalledWith('sync.pull', {
+        expect(mutationMock).toHaveBeenCalledWith('sync.pullChecked', {
+            workspace_item_capability: undefined,
+            history_incarnation: undefined,
+            history_incarnation_capability: 'incarnation-v1',
+            unavailable_record_capability: 'unavailable-v1',
             workspace_id: 'ws-1',
             cursor: 0,
             limit: 10,
@@ -218,6 +225,10 @@ describe('ConvexSyncGatewayAdapter', () => {
         });
 
         expect(mutationMock).toHaveBeenCalledWith('sync.snapshot', {
+            workspace_item_capability: undefined,
+            history_incarnation: undefined,
+            history_incarnation_capability: 'incarnation-v1',
+            unavailable_record_capability: 'unavailable-v1',
             workspace_id: 'ws-1',
             page_size: 50,
             page_token: undefined,
@@ -293,6 +304,9 @@ describe('ConvexSyncGatewayAdapter', () => {
             workspace_id: 'ws-1',
             device_id: 'dev-1',
             last_seen_version: 123,
+            history_incarnation: undefined,
+            history_incarnation_capability: 'incarnation-v1',
+            unavailable_record_capability: 'unavailable-v1',
         });
 
         runtimeConfig.sync.convexAdminKey = 'admin-key';
@@ -326,12 +340,8 @@ describe('ConvexSyncGatewayAdapter', () => {
 
     it('calls resolveProviderToken for each method with provider/template', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
-        queryMock.mockResolvedValue({
-            changes: [],
-            nextCursor: 0,
-            hasMore: false,
-            oldestRetainedVersion: 0,
-            requiresSnapshot: false,
+        mutationMock.mockResolvedValueOnce({
+            changes: [], nextCursor: 0, hasMore: false, oldestRetainedVersion: 0, requiresSnapshot: false,
         });
         mutationMock.mockResolvedValue({ results: [], serverVersion: 0 });
 
@@ -364,13 +374,14 @@ describe('ConvexSyncGatewayAdapter', () => {
         const gateway = new ConvexSyncGatewayAdapter();
         const direct = createConvexSyncProvider({ query: forwardQuery, mutation: forwardMutation } as any);
         const scope = { workspaceId: fixture.workspace };
+        const historyIncarnation = await gateway.getHistoryIncarnation(makeEvent(), scope);
         const outputs = [];
         for (const reader of [direct, { pull: (input: any) => gateway.pull(makeEvent(), input), snapshot: (input: any) => gateway.snapshot(makeEvent(), input) }]) {
-            const pulled = PullResponseSchema.parse(await reader.pull({ scope, cursor: 5, limit: 300 }));
+            const pulled = PullResponseSchema.parse(await reader.pull({ scope, historyIncarnation, cursor: 5, limit: 300 }));
             expect(pulled.changes).toHaveLength(5);
             const tuples: string[][] = []; let pageToken: string | undefined;
             for (let page = 0; page < 20; page++) {
-                const response = SnapshotResponseSchema.parse(await reader.snapshot!({ scope, tables: ['kv'], pageSize: 1, pageToken }));
+                const response = SnapshotResponseSchema.parse(await reader.snapshot!({ scope, historyIncarnation, tables: ['kv'], pageSize: 1, pageToken }));
                 for (const item of response.items) { if (item.kind === 'row') TABLE_PAYLOAD_SCHEMAS.kv!.parse(item.payload); tuples.push([item.tableName, item.pk, item.kind]); }
                 if (!response.nextPageToken) break;
                 expect(response.nextPageToken.length).toBeLessThanOrEqual(65536);
@@ -381,6 +392,20 @@ describe('ConvexSyncGatewayAdapter', () => {
             outputs.push({ pulled, tuples });
         }
         expect(outputs[0]).toEqual(outputs[1]);
+        const original = await client.query('syncProbe:read' as any, { workspace: fixture.workspace });
+        await client.mutation('syncProbe:patch' as any, { id: original.change_log[0]._id, value: { op_id: 'invalid-legacy' } });
+        const directPage = await direct.pull({ scope, historyIncarnation, cursor: 5, limit: 300 });
+        const gatewayPage = await gateway.pull(makeEvent(), { scope, historyIncarnation, cursor: 5, limit: 300 });
+        expect(directPage.unavailable).toHaveLength(1);
+        expect(gatewayPage).toEqual(directPage);
+        const next = crypto.randomUUID(), attempt = crypto.randomUUID();
+        await client.mutation('syncHistory:beginReplacement' as any, { attempt_id: attempt, incarnation: next });
+        while (!(await client.mutation('syncHistory:finishReplacement' as any, { attempt_id: attempt })).ready) { /* bounded provider pages */ }
+        for (const transport of [direct, { pull: (input: any) => gateway.pull(makeEvent(), input), push: (input: any) => gateway.push(makeEvent(), input) }]) {
+            expect(await transport.pull({ scope, historyIncarnation, cursor: 5, limit: 300 })).toMatchObject({ historyIncarnation: next, requiresSnapshot: true, changes: [], unavailable: [] });
+            await expect(transport.push({ scope, historyIncarnation, ops: [] })).rejects.toMatchObject({ data: { code: 'OR3_SYNC_HISTORY_CHANGED', historyIncarnation: next } });
+        }
+
     });
 
     it('preserves structured backend history failures at the adapter boundary', async () => {
@@ -596,7 +621,7 @@ describe('ConvexSyncGatewayAdapter', () => {
 
     it('retries transient transport errors before succeeding', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
-        queryMock
+        mutationMock
             .mockRejectedValueOnce(createTransientTransportError())
             .mockResolvedValueOnce({
                 changes: [],
@@ -620,19 +645,19 @@ describe('ConvexSyncGatewayAdapter', () => {
             requiresSnapshot: false,
         });
 
-        expect(queryMock).toHaveBeenCalledTimes(2);
+        expect(mutationMock).toHaveBeenCalledTimes(2);
     });
 
     it('returns an explicit update boundary for canonical workspace admission rejection', async () => {
-        queryMock.mockRejectedValue(new Error('[Convex] OR3_WORKSPACE_ITEM_UPDATE_REQUIRED: Update OR3 Chat'));
+        mutationMock.mockRejectedValue(new Error('[Convex] OR3_WORKSPACE_ITEM_UPDATE_REQUIRED: Update OR3 Chat'));
         const adapter = new ConvexSyncGatewayAdapter();
         await expect(adapter.pull(makeEvent(), { scope: { workspaceId: 'ws-1' }, cursor: 0, limit: 25, tables: ['posts'] })).rejects.toMatchObject({ statusCode: 426 });
-        expect(queryMock).toHaveBeenCalledTimes(1);
+        expect(mutationMock).toHaveBeenCalledTimes(1);
     });
 
     it('maps exhausted transient transport failures to 503', async () => {
         const adapter = new ConvexSyncGatewayAdapter();
-        queryMock.mockRejectedValue(createTransientTransportError());
+        mutationMock.mockRejectedValue(createTransientTransportError());
 
         await expect(
             adapter.pull(makeEvent(), {
@@ -645,6 +670,6 @@ describe('ConvexSyncGatewayAdapter', () => {
             statusMessage: 'Sync backend unavailable',
         });
 
-        expect(queryMock).toHaveBeenCalledTimes(3);
+        expect(mutationMock).toHaveBeenCalledTimes(3);
     });
 });

@@ -1,3 +1,7 @@
+import { isSyncUuid } from './syncAuthoring';
+import { historyArgs, readHistory, fenceHistory, changedHistory, requireHistoryCapability } from './syncHistory';
+import { assertIdentity, readDefect, retainEvidence } from './syncUnavailable';
+import { PullResponseSchema, SnapshotResponseSchema } from './syncContract/shared/sync/schemas';
 import { assertStorageNotDeleted } from './storageDeletion';
 import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './workspaceItemCapability';
 /**
@@ -24,7 +28,7 @@ import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './wor
  * - Per-table cursors or server-side merge strategies beyond LWW
  * - Server-side merge strategies beyond complete-record LWW
  */
-import { ConvexError, v } from 'convex/values';
+import { ConvexError, v, convexToJson, type Value, type Infer } from 'convex/values';
 import { makeFunctionReference } from 'convex/server';
 import schema from './schema';
 import { recordRetainedStorage } from './storageUsage';
@@ -52,7 +56,6 @@ import { compareSyncTuple, syncJsonByteLength } from './syncContract/shared/sync
 import { normalizeHistoricalSyncPayload } from './snapshot';
 import { getConvexSize } from 'convex/values';
 import { newSyncReadBudget, readSyncBatch, canReadSyncDocument, type SyncReadBudget } from './syncReadBudget';
-import { isSyncUuid } from './syncAuthoring';
 import { readRequestUsage } from './requestUsage';
 import { parseChatSeek, encodeChatSeek } from './historySeek';
 
@@ -371,11 +374,12 @@ function tombstoneSnapshotCandidate(
     tombstone: TombstoneDoc
 ): SnapshotCandidate {
     return {
+        source: tombstone,
         kind: 'tombstone',
         tableName,
         pk,
         revision: legacySnapshotRevision(tableName, pk, tombstone),
-        serverDeletedAt: Math.max(0, Math.floor(tombstone.server_deleted_at ?? tombstone.deleted_at)),
+        serverDeletedAt: tombstone.server_deleted_at ?? tombstone.deleted_at,
         serverVersion: tombstone.server_version,
     };
 }
@@ -389,16 +393,18 @@ function historySnapshotCandidate(history: SnapshotHistoryDoc): SnapshotCandidat
     if (history.kind === 'tombstone') {
         return {
             kind: 'tombstone',
+            source: history,
             tableName: history.table_name,
             pk: history.pk,
             revision,
             ...(history.table_name === 'file_meta' && history.payload ? { payload: history.payload } : {}),
-            serverDeletedAt: Math.max(0, Math.floor(history.server_deleted_at ?? 0)),
+            serverDeletedAt: history.server_deleted_at ?? 0,
             serverVersion: history.server_version,
         };
     }
     return {
         kind: 'row',
+        source: history,
         tableName: history.table_name,
         pk: history.pk,
         payload: normalizeHistoricalSyncPayload(history.table_name, history.payload),
@@ -491,8 +497,9 @@ async function resolveSnapshotKey(
         tableName === 'notifications' &&
         (!row || row.user_id !== String(callerUserId))
     ) {
-        // Orphan tombstones do not carry an owner, so fail closed rather than
-        // expose another user's notification existence.
+        // Unknown ownership is private evidence, never a workspace marker.
+        if (row && (typeof row.user_id !== 'string' || !row.user_id.length)) await retainEvidence(ctx, workspaceId, await readHistory(ctx), tableName, pk, row, 'unknown_notification_owner');
+        if (!row && tombstone) await retainEvidence(ctx, workspaceId, await readHistory(ctx), tableName, pk, tombstone, 'unknown_notification_owner');
         return null;
     }
     const candidates: SnapshotCandidate[] = [];
@@ -507,13 +514,21 @@ async function resolveSnapshotKey(
     if (history) candidates.push(history);
     if (row) candidates.push(materializedSnapshotCandidate(tableName, pk, row));
     if (tombstone) candidates.push(tombstoneSnapshotCandidate(tableName, pk, tombstone));
-    const winner = resolveSnapshotWinner(candidates, highWatermark);
+    for (const candidate of candidates) {
+        if (!Number.isSafeInteger(candidate.serverVersion) || (candidate.serverVersion as number) < 0) throw new Error('Snapshot coverage version failure');
+    }
+    const eligible = candidates.filter(candidate => (candidate.serverVersion ?? 0) <= highWatermark);
+    const latestVersion = Math.max(...eligible.map(candidate => candidate.serverVersion ?? 0));
+    // An unusable latest revision cannot authorize replay of an older preimage.
+    const uncertain = eligible.find(candidate => candidate.serverVersion === latestVersion &&
+        (!Number.isSafeInteger(candidate.revision.clock) || candidate.revision.clock < 0 || !candidate.revision.hlc || !candidate.revision.opId));
+    const winner = uncertain ?? resolveSnapshotWinner(eligible, highWatermark);
     if (retainedFiles && tableName === 'file_meta' && winner?.kind === 'tombstone') {
         const retained = candidates.find(candidate => candidate.kind === 'tombstone' && candidate.payload &&
             candidate.serverVersion !== undefined && candidate.serverVersion <= highWatermark &&
             compareSnapshotRevisions(candidate.revision, winner.revision) === 0);
         if (retained?.kind === 'tombstone') return {
-            kind: 'row', tableName, pk, payload: retained.payload, revision: winner.revision, serverVersion: winner.serverVersion,
+            source: retained.source, kind: 'row', tableName, pk, payload: retained.payload, revision: winner.revision, serverVersion: winner.serverVersion,
         };
         // Old pre-images may lack retained metadata. Never label a concurrent
         // replacement as the original or silently omit an ambiguous original.
@@ -1150,12 +1165,6 @@ function toWireChange(c: {
     };
 }
 
-function assertWireCompatibleChanges(changes: { op_id: string }[]): void {
-    // No durable unavailable-record support is advertised. Never acknowledge a
-    // visible poisoned version by filtering it before the host can validate it.
-    if (changes.some(change => !isSyncUuid(change.op_id))) throw new Error('Invalid stored sync operation ID');
-}
-
 async function pullRetentionForWorkspace(
     ctx: QueryCtx,
     workspaceId: Id<'workspaces'>,
@@ -1170,11 +1179,15 @@ async function pullRetentionForWorkspace(
         .query('server_version_counter')
         .withIndex('by_workspace', (q) => q.eq('workspace_id', workspaceId))
         .first();
-    return computePullRetention({
+    assertSafeNonnegativeInteger(cursor, 'pull cursor');
+    const head = counter?.value ?? 0;
+    assertSafeNonnegativeInteger(head, 'workspace head');
+    if (!Number.isSafeInteger(head + 1) || oldest && (!Number.isSafeInteger(oldest.server_version) || oldest.server_version < 1 || oldest.server_version > head)) throw new Error('Sync coverage retention failure');
+    return { head, retention: computePullRetention({
         cursor,
         oldestLogVersion: oldest?.server_version ?? null,
-        highWatermark: counter?.value ?? 0,
-    });
+        highWatermark: head,
+    }) };
 }
 
 // ============================================================
@@ -1198,9 +1211,9 @@ async function pullRetentionForWorkspace(
  * - Only allowlisted table names are accepted
  * - Viewer memberships cannot push workspace changes
  */
-export const push = mutation({
-    args: {
+const pushArgs = {
         workspace_id: v.id('workspaces'),
+        ...historyArgs,
         workspace_item_capability: v.optional(v.literal('v1')),
         ops: v.array(
             v.object({
@@ -1214,8 +1227,10 @@ export const push = mutation({
                 device_id: v.string(),
             })
         ),
-    },
-    handler: async (ctx, args) => {
+    };
+const pushArgumentValidator = v.object(pushArgs);
+export const push = mutation({ args: pushArgs, handler: applyPush });
+async function applyPush(ctx: MutationCtx, args: Infer<typeof pushArgumentValidator>) {
         console.debug('[sync] push', {
             workspace: args.workspace_id,
             ops: args.ops.length,
@@ -1227,6 +1242,8 @@ export const push = mutation({
 
         // Verify workspace membership
         const callerUserId = await requireSyncWriteAccess(ctx, args.workspace_id);
+        requireHistoryCapability(args);
+        const historyIncarnation = await fenceHistory(ctx, args.history_incarnation);
         if (args.workspace_item_capability !== 'v1') {
             for (const op of args.ops) {
                 if (op.table_name !== 'posts' && op.table_name !== 'projects') continue;
@@ -1471,9 +1488,10 @@ export const push = mutation({
         return {
             results: results.filter((result): result is Result => Boolean(result)),
             serverVersion: latestVersion,
+            historyIncarnation,
         };
-    },
-});
+
+}
 
 async function requireCanonicalGenerationActor(
     ctx: MutationCtx | QueryCtx,
@@ -2078,11 +2096,14 @@ export const repairLegacyTombstones = internalMutation({
 export const updateDeviceCursor = mutation({
     args: {
         workspace_id: v.id('workspaces'),
+        ...historyArgs,
         device_id: v.string(),
         last_seen_version: v.number(),
     },
     handler: async (ctx, args) => {
         const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
+        requireHistoryCapability(args);
+        const historyIncarnation = await fenceHistory(ctx, args.history_incarnation);
         const deviceId = args.device_id.trim();
         if (!deviceId || deviceId.length > 256) throw new Error('Invalid device_id');
         assertSafeNonnegativeInteger(args.last_seen_version, 'last_seen_version');
@@ -2120,6 +2141,7 @@ export const updateDeviceCursor = mutation({
                 updated_at: nowSec(),
             });
         }
+        return { ok: true, historyIncarnation };
     },
 });
 
@@ -2132,6 +2154,7 @@ export const updateDeviceCursor = mutation({
  * pre-image lookups if writes occurred after the first page.
  */
 const snapshotArgs = {
+    ...historyArgs,
     workspace_id: v.id('workspaces'),
     workspace_item_capability: v.optional(v.literal('v1')),
     page_size: v.number(),
@@ -2164,6 +2187,8 @@ type PageItem =
           serverDeletedAt: number;
       };
 type SnapshotPageResponse = {
+    historyIncarnation: string;
+    unavailable: import('./syncContract/shared/sync/types').SnapshotUnavailableRecord[];
     workspaceId: string;
     snapshotId: string;
     highWatermark: number;
@@ -2174,6 +2199,9 @@ type SnapshotPageResponse = {
 async function captureSnapshot(ctx: MutationCtx, args: {
     workspace_id: Id<'workspaces'>;
     workspace_item_capability?: 'v1';
+    history_incarnation?: string | null;
+    history_incarnation_capability?: string;
+    unavailable_record_capability?: string;
     page_size: number;
     page_token?: string;
     tables?: string[];
@@ -2191,6 +2219,11 @@ async function captureSnapshot(ctx: MutationCtx, args: {
     const tables = normalizeSnapshotTables(args.tables, Object.keys(TABLE_INDEX_MAP));
     const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
 
+    const historyIncarnation = await readHistory(ctx);
+    if (!retainedFiles) requireHistoryCapability(args);
+    const expected = retainedFiles && args.history_incarnation === undefined
+        ? (args.page_token ? decodeSnapshotCursor(args.page_token).historyIncarnation : null) : args.history_incarnation;
+    if (!(expected === null && !args.page_token) && expected !== historyIncarnation) changedHistory(historyIncarnation);
     const now = nowSec();
     let snapshotId: string;
     let highWatermark: number;
@@ -2200,6 +2233,7 @@ async function captureSnapshot(ctx: MutationCtx, args: {
 
     if (args.page_token) {
         const cursor = decodeSnapshotCursor(args.page_token);
+        if (cursor.historyIncarnation !== historyIncarnation) changedHistory(historyIncarnation);
         let session: {
             workspace_id: Id<'workspaces'>;
             user_id: string;
@@ -2270,6 +2304,7 @@ async function captureSnapshot(ctx: MutationCtx, args: {
     const requestPosition = { tableIndex, afterPk };
 
     const items: PageItem[] = [];
+    const unavailable: SnapshotPageResponse['unavailable'] = [];
     const budget = newSyncReadBudget();
     let responseBytes = 0;
     let examined = 0;
@@ -2302,10 +2337,13 @@ async function captureSnapshot(ctx: MutationCtx, args: {
         const rowsByPk = new Map<string, MaterializedDoc>();
         for (const row of rows) {
             const pk = row[pkField];
-            if (typeof pk !== 'string' || pk.length === 0) throw new Error('Invalid snapshot logical key');
+            assertIdentity(tableName, pk);
+            if (rowsByPk.has(pk)) throw new Error('Duplicate snapshot logical key');
             rowsByPk.set(pk, row);
         }
+        for (const row of tombstones) assertIdentity(tableName, row.pk);
         const tombstonesByPk = new Map(tombstones.map((row) => [row.pk, row]));
+        if (tombstonesByPk.size !== tombstones.length) throw new Error('Duplicate snapshot logical key');
         const orderedPks = [
             ...new Set([...rowsByPk.keys(), ...tombstonesByPk.keys()]),
         ].sort((a, b) => compareSyncTuple([a], [b]));
@@ -2331,31 +2369,22 @@ async function captureSnapshot(ctx: MutationCtx, args: {
                 retainedFiles,
                 budget
             );
-            const itemBytes = winner ? syncJsonByteLength(winner) : 0;
-            if (responseBytes + itemBytes > 1536 * 1024) {
-                if (!items.length) throw new Error('Snapshot record exceeds response budget');
-                break;
-            }
+            assertIdentity(tableName, pk);
+            if (!winner) { consumed++; continue; }
+            const { serverVersion: _version, source: _source, ...item } = winner;
+            const reason = readDefect(item, true);
+            // Estimate marker BEFORE retention; do not persist unconsumed entries.
+            const marker = { tableName, pk, originalKind: winner.kind, snapshotId, highWatermark,
+                evidenceRef: 'x'.repeat(64), reason: reason ?? 'invalid_record' };
+            const itemBytes = syncJsonByteLength(reason ? marker : item);
+            if (itemBytes > 1536 * 1024) throw new Error('Snapshot identity exceeds coverage byte ceiling');
+            if (responseBytes + itemBytes > 1536 * 1024) break;
             responseBytes += itemBytes;
             consumed++;
-            if (!winner) continue;
-            if (winner.kind === 'row') {
-                items.push({
-                    kind: 'row',
-                    tableName: winner.tableName,
-                    pk: winner.pk,
-                    payload: winner.payload,
-                    revision: winner.revision,
-                });
-            } else {
-                items.push({
-                    kind: 'tombstone',
-                    tableName: winner.tableName,
-                    pk: winner.pk,
-                    revision: winner.revision,
-                    serverDeletedAt: winner.serverDeletedAt,
-                });
-            }
+            if (reason) {
+                marker.evidenceRef = await retainEvidence(ctx, args.workspace_id, historyIncarnation, tableName, pk, winner.source, reason);
+                unavailable.push(marker);
+            } else items.push(item as PageItem);
         }
 
         examined += consumed;
@@ -2374,6 +2403,7 @@ async function captureSnapshot(ctx: MutationCtx, args: {
         ? encodeSnapshotCursor({
               version: 1,
               snapshotId,
+              historyIncarnation,
               tableIndex,
               afterPk,
           })
@@ -2381,12 +2411,15 @@ async function captureSnapshot(ctx: MutationCtx, args: {
 
     if (items.some(item => item.kind === 'row' && hasWorkspaceItemSemantics(item.tableName, item.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
     const response: SnapshotPageResponse = {
+        historyIncarnation,
+        unavailable,
         workspaceId: String(args.workspace_id),
         snapshotId,
         highWatermark,
         items,
         nextPageToken,
     };
+    SnapshotResponseSchema.parse(response);
     if (args.page_token) {
         const bytes = new TextEncoder().encode(JSON.stringify(response));
         if (bytes.byteLength > 2 * 1024 * 1024) throw new Error('Snapshot response exceeds byte ceiling');
@@ -2699,7 +2732,7 @@ export const queryCanonicalStorage = query({
 // ============================================================
 
 /**
- * `sync.pull` (query)
+ * `sync.pullChecked` (mutation)
  *
  * Purpose:
  * Returns a page of changes after a given server_version cursor.
@@ -2708,171 +2741,85 @@ export const queryCanonicalStorage = query({
  * - Results are ordered by `server_version` ascending
  * - `tables` can be used to filter specific tables
  */
-export const pull = query({
-    args: {
-        workspace_id: v.id('workspaces'),
-        workspace_item_capability: v.optional(v.literal('v1')),
-        cursor: v.number(),
-        limit: v.number(),
-        tables: v.optional(v.array(v.string())),
-    },
+const pullArgs = { workspace_id: v.id('workspaces'), workspace_item_capability: v.optional(v.literal('v1')),
+    ...historyArgs, cursor: v.number(), limit: v.number(), tables: v.optional(v.array(v.string())) };
+/** Preserve the old query address solely as an explicit client update boundary. */
+export const pull = query({ args: pullArgs, handler: async (ctx, args) => {
+    await requireSyncReadAccess(ctx, args.workspace_id);
+    throw new ConvexError({ code: 'OR3_SYNC_UPDATE_REQUIRED', statusCode: 426, requiredCapability: 'unavailable-v1' });
+} });
+export const pullChecked = mutation({
+    args: pullArgs,
     handler: async (ctx, args) => {
-        const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
-        const retention = await pullRetentionForWorkspace(
-            ctx,
-            args.workspace_id,
-            args.cursor
-        );
-        if (retention.requiresSnapshot) {
-            return {
-                changes: [],
-                nextCursor: args.cursor,
-                hasMore: false,
-                ...retention,
-            };
-        }
-
-        // Cap limit to prevent abuse
+        const caller = await requireSyncReadAccess(ctx, args.workspace_id);
+        requireHistoryCapability(args);
+        const historyIncarnation = await readHistory(ctx);
+        const { head, retention } = await pullRetentionForWorkspace(ctx, args.workspace_id, args.cursor);
+        if (args.history_incarnation !== historyIncarnation || retention.requiresSnapshot) return {
+            historyIncarnation, changes: [], unavailable: [], nextCursor: args.cursor, hasMore: false,
+            ...retention, requiresSnapshot: true,
+        };
         if (!Number.isSafeInteger(args.limit) || args.limit < 1) throw new Error('Invalid pull limit');
         const limit = Math.min(args.limit, MAX_PULL_LIMIT);
-
-        type ChangeLogRow = {
-            server_version: number;
-            table_name: string;
-            pk: string;
-            op: string;
-            payload?: unknown;
-            clock: number;
-            hlc: string;
-            device_id: string;
-            op_id: string;
-        };
-        const page = await readSyncBatch(ctx.db
-            .query('change_log')
-            .withIndex('by_workspace_version', (q) =>
-                q.eq('workspace_id', args.workspace_id).gt('server_version', args.cursor)
-            )
-            .order('asc')
-            , limit + 1, newSyncReadBudget());
-        const rawResults = page.rows as ChangeLogRow[];
-        const hasMore = rawResults.length > limit || page.hasMore;
-        const window = rawResults.slice(0, limit);
-        const tableFilter: string[] = Array.isArray(args.tables) ? args.tables : [];
-        const visibleWindow = window.filter((change) =>
-            isChangeVisibleToUser(change, callerUserId)
-        );
-        assertWireCompatibleChanges(visibleWindow);
-        const changes =
-            tableFilter.length > 0
-                ? visibleWindow.filter((c) => tableFilter.includes(c.table_name))
-                : visibleWindow;
-
-        const lastChange = window[window.length - 1];
-        const nextCursor = lastChange ? lastChange.server_version : args.cursor;
-
-        console.debug('[sync] pull', {
-            workspace: args.workspace_id,
-            cursor: args.cursor,
-            limit,
-            returned: changes.length,
-            nextCursor,
-            hasMore,
-        });
-
-        if (changes.some(change => hasWorkspaceItemSemantics(change.table_name, change.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
-        return {
-            changes: changes.map(toWireChange),
-            nextCursor,
-            hasMore,
-            ...retention,
-        };
+        const budget = newSyncReadBudget();
+        const page = await readSyncBatch(ctx.db.query('change_log').withIndex('by_workspace_version', q =>
+            q.eq('workspace_id', args.workspace_id).gt('server_version', args.cursor)).order('asc'), limit + 1, budget);
+        let previous = args.cursor;
+        // Include metadata lookahead, preventing a duplicated boundary version from disappearing.
+        for (const row of page.rows) {
+            if (!Number.isSafeInteger(row.server_version) || row.server_version <= previous || row.server_version > head) throw new Error('Sync coverage version failure');
+            previous = row.server_version;
+        }
+        const changes = [], unavailable = [];
+        let nextCursor = args.cursor, consumed = 0, bytes = 0;
+        for (const row of page.rows.slice(0, limit)) {
+            assertIdentity(row.table_name, row.pk);
+            if (row.op !== 'put' && row.op !== 'delete') throw new Error('Sync coverage operation failure');
+            const wire = toWireChange(row);
+            const reason = readDefect(wire, false);
+            const visible = isChangeVisibleToUser(row, caller);
+            const selected = !args.tables?.length || args.tables.includes(row.table_name);
+            const marker = { tableName: row.table_name, pk: row.pk, originalKind: row.op,
+                serverVersion: row.server_version, evidenceRef: 'x'.repeat(64), reason: reason ?? 'invalid_record' };
+            const size = visible && selected ? syncJsonByteLength(reason ? marker : wire) : 0;
+            if (size > 1536 * 1024) throw new Error('Pull identity exceeds coverage byte ceiling');
+            if (bytes + size > 1536 * 1024) break;
+            bytes += size;
+            if (reason) {
+                // Even unknown-owner notification defects are retained privately.
+                marker.evidenceRef = await retainEvidence(ctx, args.workspace_id, historyIncarnation, row.table_name, row.pk, row, reason);
+                if (visible && selected) unavailable.push(marker);
+            } else if (visible && selected) changes.push(wire);
+            nextCursor = row.server_version; consumed++;
+        }
+        if (changes.some(change => hasWorkspaceItemSemantics(change.tableName, change.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
+        const response = { historyIncarnation, changes, unavailable, nextCursor,
+            hasMore: consumed < page.rows.length || page.hasMore, ...retention };
+        PullResponseSchema.parse(response);
+        return response;
     },
 });
-
-/**
- * `sync.watchChanges` (query)
- *
- * Purpose:
- * Reactive subscription endpoint that re-runs when new changes arrive.
- *
- * Behavior:
- * - Returns changes after an optional cursor
- * - Caller controls the page size via `limit`
- */
+/** Reactive, content-free wakeups. Delivery MUST use the evidence-writing pull mutation. */
 export const watchChanges = query({
-    args: {
-        workspace_id: v.id('workspaces'),
-        workspace_item_capability: v.optional(v.literal('v1')),
-        cursor: v.optional(v.number()),
-        limit: v.optional(v.number()),
-    },
-    handler: async (ctx, args) => {
-        const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
-        const since = args.cursor ?? 0;
-        const limit = Math.min(args.limit ?? 100, MAX_PULL_LIMIT);
-        if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('Invalid watch limit');
-
-        type ChangeLogRow = {
-            server_version: number;
-            table_name: string;
-            pk: string;
-            op: string;
-            payload?: unknown;
-            clock: number;
-            hlc: string;
-            device_id: string;
-            op_id: string;
-        };
-        const page = await readSyncBatch(ctx.db
-            .query('change_log')
-            .withIndex('by_workspace_version', (q) =>
-                q.eq('workspace_id', args.workspace_id).gt('server_version', since)
-            )
-            .order('asc')
-            , limit, newSyncReadBudget());
-        const changes = page.rows as ChangeLogRow[];
-
-        const latestChange = changes[changes.length - 1];
-        const latestVersion = latestChange ? latestChange.server_version : since;
-        const visibleChanges = changes.filter((change) =>
-            isChangeVisibleToUser(change, callerUserId)
-        );
-        assertWireCompatibleChanges(visibleChanges);
-
-        console.debug('[sync] watchChanges', {
-            workspace: args.workspace_id,
-            cursor: since,
-            limit,
-            returned: visibleChanges.length,
-            latestVersion,
-        });
-
-        if (visibleChanges.some(change => hasWorkspaceItemSemantics(change.table_name, change.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
-        return {
-            changes: visibleChanges.map(toWireChange),
-            latestVersion,
-        };
-    },
-});
-
-/**
- * `sync.getServerVersion` (query)
- *
- * Purpose:
- * Returns the current server version counter for a workspace.
- */
-export const getServerVersion = query({
-    args: {
-        workspace_id: v.id('workspaces'),
-    },
+    args: { workspace_id: v.id('workspaces'), ...historyArgs,
+        workspace_item_capability: v.optional(v.literal('v1')), cursor: v.optional(v.number()), limit: v.optional(v.number()), tables: v.optional(v.array(v.string())) },
     handler: async (ctx, args) => {
         await requireSyncReadAccess(ctx, args.workspace_id);
-        const counter = await ctx.db
-            .query('server_version_counter')
-            .withIndex('by_workspace', (q) => q.eq('workspace_id', args.workspace_id))
-            .first();
+        requireHistoryCapability(args);
+        const historyIncarnation = await readHistory(ctx);
+        const counter = await ctx.db.query('server_version_counter').withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id)).first();
+        return { historyIncarnation, version: counter?.value ?? 0 };
+    },
+});
 
-        return counter?.value ?? 0;
+export const getServerVersion = query({
+    args: { workspace_id: v.id('workspaces'), ...historyArgs },
+    handler: async (ctx, args) => {
+        await requireSyncReadAccess(ctx, args.workspace_id);
+        requireHistoryCapability(args);
+        const historyIncarnation = await fenceHistory(ctx, args.history_incarnation);
+        const counter = await ctx.db.query('server_version_counter').withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id)).first();
+        return { historyIncarnation, version: counter?.value ?? 0 };
     },
 });
 
@@ -3132,6 +3079,133 @@ export const watchVersion = internalQuery({
     handler: async (ctx, args) => {
         const counter = await ctx.db.query('server_version_counter')
             .withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id)).first();
-        return counter?.value ?? 0;
+        return { historyIncarnation: await readHistory(ctx), version: counter?.value ?? 0 };
+    },
+});
+
+/** Privileged operator surfaces. Internal functions require deployment admin auth,
+ * plus the impersonated caller's current workspace access. No automatic repair. */
+const evidenceArgs = { workspace_id: v.id('workspaces'), evidence_ref: v.string() };
+async function authorizedEvidence(ctx: MutationCtx | QueryCtx, workspace: Id<'workspaces'>, ref: string) {
+    await requireSyncReadAccess(ctx, workspace);
+    const row = await ctx.db.get(ref as Id<'sync_unavailable_records'>);
+    if (!row || row.workspace_id !== workspace) throw new Error('Evidence not found');
+    return row;
+}
+export const inspectUnavailable = internalQuery({
+    args: { workspace_id: v.id('workspaces'), cursor: v.optional(v.string()) }, handler: async (ctx, args) => {
+        await requireSyncReadAccess(ctx, args.workspace_id);
+        const page = await ctx.db.query('sync_unavailable_records').withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id))
+            .paginate({ numItems: 25, cursor: args.cursor ?? null });
+        return { items: page.page.map(row => ({ evidenceRef: String(row._id), historyIncarnation: row.history_incarnation,
+            tableName: row.table_name.slice(0, 128), pk: row.pk.slice(0, 256), reason: row.reason, status: row.status, chunks: row.chunks })),
+            nextCursor: page.isDone ? null : page.continueCursor };
+    },
+});
+export const exportUnavailable = internalQuery({
+    args: { ...evidenceArgs, chunk: v.number() }, handler: async (ctx, args) => {
+        const row = await authorizedEvidence(ctx, args.workspace_id, args.evidence_ref);
+        if (!Number.isSafeInteger(args.chunk) || args.chunk < 0 || args.chunk >= row.chunks) throw new Error('Invalid evidence chunk');
+        const source = await ctx.db.get(row.source_document_id);
+        if (!source) throw new Error('Evidence source missing');
+        const { _id, _creationTime, ...fields } = source;
+        const original = { ...fields, _id: row.source_id, ...(row.source_creation_time !== undefined ? { _creationTime: row.source_creation_time } : {}) };
+        const bytes = new TextEncoder().encode(JSON.stringify(convexToJson(original as Value)));
+        return { data: bytes.slice(args.chunk * 32768, (args.chunk + 1) * 32768).buffer, chunks: row.chunks, encoding: 'convex-json-utf8' };
+    },
+});
+export const revalidateUnavailable = internalQuery({
+    args: evidenceArgs, handler: async (ctx, args) => {
+        const row = await authorizedEvidence(ctx, args.workspace_id, args.evidence_ref);
+        // Original defect stays retained; validate only the CURRENT wire record.
+        const candidate = await currentEvidenceCandidate(ctx, args.workspace_id, row.table_name, row.pk);
+        let currentDefect: string | null = 'missing_current';
+        if (candidate) {
+            const { source: _source, serverVersion: _version, ...wire } = candidate;
+            currentDefect = readDefect(wire, true);
+        }
+        return { historyIncarnation: await readHistory(ctx), status: row.status, reason: row.reason, currentDefect };
+    },
+});
+async function currentEvidenceCandidate(ctx: MutationCtx | QueryCtx, workspace: Id<'workspaces'>, table: string, pk: string) {
+    const info = TABLE_INDEX_MAP[table];
+    if (!info) return null;
+    const row = await (ctx.db.query(info.table as TableNames) as any).withIndex(info.indexName, (q: any) =>
+        q.eq('workspace_id', workspace).eq(getPkField(table), pk)).unique() as MaterializedDoc | null;
+    const tombstone = await ctx.db.query('tombstones').withIndex('by_workspace_table_pk', q =>
+        q.eq('workspace_id', workspace).eq('table_name', table).eq('pk', pk)).unique();
+    const candidates = [row ? materializedSnapshotCandidate(table, pk, row) : null,
+        tombstone ? tombstoneSnapshotCandidate(table, pk, tombstone) : null].filter((value): value is SnapshotCandidate => value !== null);
+    return resolveSnapshotWinner(candidates, Number.MAX_SAFE_INTEGER);
+}
+export const repairUnavailable = internalMutation({
+    args: { ...evidenceArgs, history_incarnation: v.string(), replacement: v.optional(v.any()), operation: v.optional(v.union(v.literal('put'), v.literal('delete'))) },
+    handler: async (ctx, args) => {
+        await requireSyncWriteAccess(ctx, args.workspace_id);
+        const historyIncarnation = await fenceHistory(ctx, args.history_incarnation);
+        const evidence = await authorizedEvidence(ctx, args.workspace_id, args.evidence_ref);
+        if (evidence.history_incarnation !== historyIncarnation) changedHistory(historyIncarnation);
+        if (evidence.status !== 'unresolved') return { status: evidence.status };
+        const current = await currentEvidenceCandidate(ctx, args.workspace_id, evidence.table_name, evidence.pk);
+        if (!current) throw new Error('Current canonical state unavailable; explicit offline recovery required');
+        if (current.serverVersion !== evidence.source_version || current.revision.clock !== evidence.source_clock ||
+            (evidence.source_op_id !== undefined && current.revision.opId !== evidence.source_op_id)) {
+            await ctx.db.patch(evidence._id, { status: 'superseded' });
+            return { status: 'superseded' };
+        }
+        const clock = nextSyncClock(current.revision.clock);
+        const opId = crypto.randomUUID();
+        const hlc = `${Date.now()}:0:repair`;
+        const operation = args.operation ?? 'put';
+        const replacement = args.replacement;
+        const payload = operation === 'put' && replacement && typeof replacement === 'object' && !Array.isArray(replacement)
+            ? { ...replacement, [getPkField(evidence.table_name)]: evidence.pk, clock, hlc, op_id: opId } : replacement;
+        const result = await applyPush(ctx, { workspace_id: args.workspace_id, history_incarnation: historyIncarnation,
+            history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', workspace_item_capability: 'v1',
+            ops: [{ op_id: opId, table_name: evidence.table_name, pk: evidence.pk, operation, payload, clock, hlc, device_id: 'operator-repair' }] });
+        if (!result.results[0]?.success || !result.results[0]?.applied) throw new Error('Repair rejected; evidence remains unresolved');
+        await ctx.db.patch(evidence._id, { status: 'repaired', repaired_op_id: opId });
+        return { status: 'repaired', opId, serverVersion: result.serverVersion, historyIncarnation };
+    },
+});
+
+export const getHistoryIncarnation = query({
+    args: { workspace_id: v.id('workspaces') }, handler: async (ctx, args) => {
+        await requireSyncReadAccess(ctx, args.workspace_id);
+        return readHistory(ctx);
+    },
+});
+/** Host reader fallback. Verify the actual source, frozen scope and visibility;
+ * a caller-supplied key or bytes alone can never authorize a marker. */
+export const retainUnavailableRecord = mutation({
+    args: { workspace_id: v.id('workspaces'), ...historyArgs, source: v.union(v.literal('pull'), v.literal('snapshot')), record: v.any(), marker: v.any() },
+    handler: async (ctx, args) => {
+        const caller = await requireSyncReadAccess(ctx, args.workspace_id);
+        requireHistoryCapability(args);
+        const history = await fenceHistory(ctx, args.history_incarnation);
+        const marker = args.marker as Record<string, any>;
+        assertIdentity(marker.tableName, marker.pk);
+        let candidate: unknown, original: unknown;
+        if (args.source === 'pull') {
+            if (!Number.isSafeInteger(marker.serverVersion) || marker.serverVersion <= 0) throw new Error('Invalid source version');
+            const row = await ctx.db.query('change_log').withIndex('by_workspace_version', q => q.eq('workspace_id', args.workspace_id).eq('server_version', marker.serverVersion)).unique();
+            if (!row || !isChangeVisibleToUser(row, caller) || row.table_name !== marker.tableName || row.pk !== marker.pk || row.op !== marker.originalKind) throw new Error('Unavailable source mismatch');
+            candidate = toWireChange(row); original = row;
+        } else {
+            const session = await ctx.db.get(marker.snapshotId as Id<'sync_snapshot_sessions'>);
+            if (!session || session.workspace_id !== args.workspace_id || session.user_id !== caller || session.expires_at <= nowSec() || session.high_watermark !== marker.highWatermark || !session.tables.includes(marker.tableName)) throw new Error('Unavailable source mismatch');
+            const winner = await currentEvidenceCandidate(ctx, args.workspace_id, marker.tableName, marker.pk);
+            // A changed canonical key needs the frozen preimage, never a newly read replacement.
+            const selected = !winner || (winner.serverVersion ?? 0) > session.high_watermark
+                ? await readSnapshotHistory(ctx, args.workspace_id, marker.tableName, marker.pk, session.high_watermark) : winner;
+            if (!selected || selected.kind !== marker.originalKind || (marker.tableName === 'notifications' &&
+                (!(selected.source as MaterializedDoc)?.user_id || (selected.source as MaterializedDoc).user_id !== caller))) throw new Error('Unavailable source mismatch');
+            const { source, serverVersion: _version, ...wire } = selected;
+            candidate = wire; original = source;
+        }
+        if (stableJson(candidate) !== stableJson(args.record)) throw new Error('Unavailable original mismatch');
+        const reason = readDefect(candidate, args.source === 'snapshot');
+        if (!reason) throw new Error('Reader/provider validation disagreement; fail closed');
+        return { evidenceRef: await retainEvidence(ctx, args.workspace_id, history, marker.tableName, marker.pk, original, reason) };
     },
 });

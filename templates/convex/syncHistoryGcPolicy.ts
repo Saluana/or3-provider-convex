@@ -21,7 +21,7 @@ export function computePullRetention(input: {
     return {
         oldestRetainedVersion,
         requiresSnapshot:
-            oldestRetainedVersion > 0 &&
-            input.cursor < Math.max(0, oldestRetainedVersion - 1),
+            input.cursor > input.highWatermark || (oldestRetainedVersion > 0 &&
+            input.cursor < Math.max(0, oldestRetainedVersion - 1)),
     };
 }

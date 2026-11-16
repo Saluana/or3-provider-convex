@@ -4,7 +4,7 @@ const templateRoot = new URL('../../../templates/convex/', import.meta.url);
 const sync = await import(/* @vite-ignore */ new URL('sync.ts', templateRoot).href);
 
 type Handler = (ctx: any, args: any) => Promise<any>;
-const handler = (fn: unknown): Handler => (fn as { _handler: Handler })._handler;
+const handler = (fn: unknown): Handler => (ctx, args) => (fn as { _handler: Handler })._handler(ctx, { history_incarnation: 'fixture-history', history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', ...args });
 
 function makeCursorContext(input: {
     userId?: string;
@@ -20,6 +20,7 @@ function makeCursorContext(input: {
             const q = { eq: vi.fn(() => q) };
             build(q);
             return {
+                unique: async () => table === 'sync_history' ? { incarnation: 'fixture-history', phase: 'ready' } : null,
                 first: vi.fn(async () => {
                     if (table === 'auth_accounts') return { user_id: userId };
                     if (table === 'workspace_members' && input.role) {

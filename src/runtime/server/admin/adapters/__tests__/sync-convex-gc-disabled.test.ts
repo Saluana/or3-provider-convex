@@ -28,7 +28,7 @@ describe('Convex sync admin GC safety gate', () => {
     it('advertises history GC actions when snapshot bootstrap is verified', async () => {
         const status = await convexSyncAdminAdapter.getStatus(event, statusContext);
 
-        expect(status.actions.map((action) => action.id)).toEqual([
+        expect(status.actions.filter((action) => action.id.startsWith('sync.gc-')).map((action) => action.id)).toEqual([
             'sync.gc-change-log',
             'sync.gc-tombstones',
         ]);
