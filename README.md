@@ -731,13 +731,46 @@ transaction/server version and resolution atomically. A newer winner marks old
 evidence superseded; invalid/exhausted clocks require explicit offline recovery.
 Old-history evidence remains exportable but cannot authorize new-history repair.
 
+### Stored-record push holds
+
+Push negotiates the separate `stored_record_capability: 'stored-record-v1'`
+(host `storedRecordCapability`) before returning `STORED_RECORD_UNAVAILABLE`.
+The gateway forwards the caller's capability; it never upgrades an old client.
+The matched direct provider advertises support. An affected unsupported batch
+receives structured 426 `OR3_SYNC_UPDATE_REQUIRED` with
+`requiredCapability:'stored-record-v1'`, with no committed batch writes.
+
+Receipt, current winner, revision and notification-owner defects are classified
+before version allocation. Supported affected ops return only
+`{opId,success:false,errorCode:'STORED_RECORD_UNAVAILABLE',evidenceRef,error}`;
+the fixed error contains no stored content, and healthy siblings commit. Export
+the reference with the existing privileged `.export` action: its `intent` is the
+exact submitted operation, and `evidence_ref` links to the separately retained
+original source. Repeated requests deduplicate both records. Evidence survives
+GC, snapshot expiry and reset. Hold the original local UUID/intent for manual
+recovery; do not automatically retry, re-ID or report replay success. Other-user
+notification owners are denied without returning their content or references.
+Storage/evidence failures still roll back the entire mutation.
+
+A valid winning replacement can replace a malformed older payload only after
+its original is retained and its ordering validated. Complete-record puts do not
+parse obsolete stored attachment JSON. Invalid ordering needs explicit offline
+recovery. Push reserves 12 MiB of worst-case point-read work before each op from
+a 14 MiB budget, conservatively charging repeated reads/preimages and submitted
+bytes. Remaining ops receive retryable `RATE_LIMITED` results, without version
+allocation, rather than overflowing a transaction or fabricating a hold. Near-
+1 MiB poison documents therefore make bounded progress over multiple requests.
+
 ### History initialization and managed replacement
 
 History is deployment-wide, not per workspace. After the first matching schema
 upgrade, explicitly call admin-only `syncHistory:initialize` with one fresh UUID,
 then repeat `syncHistory:finishReplacement` with the returned `attemptId` until
 `ready:true`. This is a one-time migration: repeated initialization preserves an
-existing token. Ordinary reads, deploys, restarts, repairs, backup capture and GC
+existing token. First initialization invalidates only pre-contract snapshot
+sessions/cached pages/device ACKs; canonical rows, logs, receipt fingerprints,
+counters, tombstones and unavailable evidence are preserved. It does not prove
+continuity for old browsers. Ordinary reads, deploys, restarts, repairs, backup capture and GC
 never mint/rotate one. Missing/invalid initialized state fails closed.
 
 A **database replacement** means importing/restoring the complete deployment's
@@ -746,7 +779,9 @@ self-hosted deployment's complete database plus matching object-storage snapshot
 A restored deployment must be an **isolated candidate**: stop application,
 background and maintenance writers; drain old handlers and close watchers;
 prevent direct clients/gateway access and scheduled writers until the replacement
-gate completes. Hot imports into a serving deployment and partial-workspace
+gate completes. `convex deploy`, function/schema pushes and ordinary process
+restarts are code/runtime changes, not database replacements. Do not run reset
+as an ordinary deploy hook. Hot imports into a serving deployment and partial-workspace
 restores are unsupported. Preserve and pin a checksum-verified pre-replacement
 backup, including any unresolved evidence; reset never merges/discards it.
 
@@ -803,3 +838,13 @@ exact published 0.0.26 template pack when `OR3_CONVEX_UPGRADE_PACK` points to it
 `templates/convex.pack.json.gz`. It verifies the pack digest, deploys that backend,
 commits legacy rows/receipts, then deploys the candidate and checks exact replay.
 Release CI supplies this fixture and retains the upgrade receipt artifact.
+
+Replacement import details: Convex `import --replace` affects only included
+tables, while `--replace-all` also clears schema tables omitted from the archive.
+Use an authenticated complete snapshot with matching storage, never infer full
+replacement from a successful partial import. The helper resets sync identity;
+it does not isolate hosted traffic, stop scheduled writers, extract storage, or
+certify the archive. Hosted replacement remains unqualified until those external
+controls and exact import codecs are demonstrated. See the official
+[import guide](https://docs.convex.dev/database/import-export/import) and
+[CLI reference](https://docs.convex.dev/cli/reference/import).

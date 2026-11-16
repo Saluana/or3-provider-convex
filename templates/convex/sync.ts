@@ -1,7 +1,7 @@
 import { isSyncUuid } from './syncAuthoring';
 import { historyArgs, readHistory, fenceHistory, changedHistory, requireHistoryCapability } from './syncHistory';
 import { assertIdentity, readDefect, retainEvidence } from './syncUnavailable';
-import { PullResponseSchema, SnapshotResponseSchema } from './syncContract/shared/sync/schemas';
+import { PullResponseSchema, SnapshotResponseSchema, PushResultItemSchema } from './syncContract/shared/sync/schemas';
 import { assertStorageNotDeleted } from './storageDeletion';
 import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './workspaceItemCapability';
 /**
@@ -802,6 +802,48 @@ function validateSyncOperation(
 type CurrentWinner = { kind: 'put'; payload: unknown; revision: SnapshotRevision } |
     { kind: 'delete'; revision: SnapshotRevision; serverDeletedAt: number };
 
+async function readPushReceipt(ctx: MutationCtx, opId: string) {
+    return ctx.db.query('change_log').withIndex('by_op_id', q => q.eq('op_id', opId)).first();
+}
+async function readPushSources(ctx: MutationCtx, workspace: Id<'workspaces'>, op: SyncOperation) {
+    const info = TABLE_INDEX_MAP[op.table_name]!;
+    const row = await (ctx.db.query(info.table as TableNames) as any).withIndex(info.indexName, (q: any) =>
+        q.eq('workspace_id', workspace).eq(getPkField(op.table_name), op.pk)).first() as MaterializedDoc | null;
+    const tombstone = await ctx.db.query('tombstones').withIndex('by_workspace_table_pk', q =>
+        q.eq('workspace_id', workspace).eq('table_name', op.table_name).eq('pk', op.pk)).first();
+    return { row, tombstone };
+}
+function pushStoredDefect(op: SyncOperation, receipt: Awaited<ReturnType<typeof readPushReceipt>>,
+    { row, tombstone }: Awaited<ReturnType<typeof readPushSources>>) {
+    const fault = (source: unknown, reason: string, hold = true) => ({ source, reason, hold });
+    if (op.table_name === 'notifications' && row && !row.user_id) return fault(row, 'unknown_notification_owner');
+    if (receipt) {
+        const reason = readDefect(toWireChange(receipt), false);
+        if (reason) return fault(receipt, reason);
+    }
+    const candidates = [row ? materializedSnapshotCandidate(op.table_name, op.pk, row) : null,
+        tombstone ? tombstoneSnapshotCandidate(op.table_name, op.pk, tombstone) : null]
+        .filter((value): value is SnapshotCandidate => value !== null);
+    // Invalid explicit ordering cannot authorize replacing a corrupt record.
+    for (const candidate of candidates) {
+        if (!Number.isSafeInteger(candidate.serverVersion) || (candidate.serverVersion as number) < 0) {
+            return fault(candidate.source, 'invalid_server_version');
+        }
+        const revisionDefect = readDefect({ kind: 'tombstone', tableName: op.table_name, pk: op.pk,
+            revision: candidate.revision, serverDeletedAt: 0 }, true);
+        if (revisionDefect) return fault(candidate.source, revisionDefect);
+    }
+    const winner = resolveSnapshotWinner(candidates, Number.MAX_SAFE_INTEGER);
+    if (!winner) return receipt ? fault(receipt, 'missing_current_winner') : null;
+    const { source, serverVersion: _version, ...wire } = winner;
+    const reason = readDefect(wire, true);
+    if (!reason) return null;
+    const incoming = { clock: op.clock, hlc: op.hlc, opId: op.op_id };
+    const replaces = !receipt && (!row || incomingWinsStoredRevision(incoming, row)) &&
+        (!tombstone || incomingWinsStoredRevision(incoming, tombstone));
+    return fault(source, reason, !replaces);
+}
+
 async function currentWinner(ctx: MutationCtx, workspaceId: Id<'workspaces'>, tableName: string, pk: string): Promise<CurrentWinner | undefined> {
     const table = TABLE_INDEX_MAP[tableName]!;
     const row = await (ctx.db.query(table.table as TableNames) as any)
@@ -962,7 +1004,9 @@ async function applyOpToTable(
                 { clock: op.clock, hlc: op.hlc, opId: op.op_id }, existingTombstone));
             // LWW with deterministic HLC tie-break on equal clocks.
             if (shouldApply) {
-                await assertStorageNotDeleted(ctx, workspaceId, table, { ...existing, ...(payload ?? {}) });
+                // Puts replace the complete record. Obsolete attachment JSON in
+                // the stored row is neither retained nor new-write authority.
+                await assertStorageNotDeleted(ctx, workspaceId, table, { ...(payload ?? {}), [pkField]: op.pk });
                 console.debug('[sync] apply put', {
                     table: op.table_name,
                     pk: op.pk,
@@ -1088,12 +1132,11 @@ type SyncOperation = {
 };
 
 /** Derives notification ownership from the authenticated sync subject. */
-async function scopeNotificationWrite(
-    ctx: MutationCtx,
-    workspaceId: Id<'workspaces'>,
+function scopeNotificationWrite(
     callerUserId: Id<'users'>,
-    op: SyncOperation
-): Promise<SyncOperation> {
+    op: SyncOperation,
+    existing: MaterializedDoc | null
+): SyncOperation {
     if (op.table_name !== 'notifications') return op;
 
     const callerId = String(callerUserId);
@@ -1105,14 +1148,7 @@ async function scopeNotificationWrite(
         throw new Error('Forbidden: notification owner mismatch');
     }
 
-    const existing = await ctx.db
-        .query('notifications')
-        .withIndex('by_workspace_id', (q) =>
-            q.eq('workspace_id', workspaceId).eq('id', op.pk)
-        )
-        .first();
-
-    if (existing && existing.user_id !== callerId) {
+    if (existing && existing.user_id && existing.user_id !== callerId) {
         throw new Error('Forbidden: notification owner mismatch');
     }
     if (!existing && op.operation === 'delete') {
@@ -1214,6 +1250,7 @@ async function pullRetentionForWorkspace(
 const pushArgs = {
         workspace_id: v.id('workspaces'),
         ...historyArgs,
+        stored_record_capability: v.optional(v.string()),
         workspace_item_capability: v.optional(v.literal('v1')),
         ops: v.array(
             v.object({
@@ -1244,16 +1281,6 @@ async function applyPush(ctx: MutationCtx, args: Infer<typeof pushArgumentValida
         const callerUserId = await requireSyncWriteAccess(ctx, args.workspace_id);
         requireHistoryCapability(args);
         const historyIncarnation = await fenceHistory(ctx, args.history_incarnation);
-        if (args.workspace_item_capability !== 'v1') {
-            for (const op of args.ops) {
-                if (op.table_name !== 'posts' && op.table_name !== 'projects') continue;
-                const canonical = await ctx.db.query(op.table_name).withIndex('by_workspace_id', q =>
-                    q.eq('workspace_id', args.workspace_id).eq('id', op.pk)).first();
-                if (hasWorkspaceItemSemantics(op.table_name, op.payload) || hasWorkspaceItemSemantics(op.table_name, canonical)) {
-                    requireWorkspaceItemCapability(args.workspace_item_capability);
-                }
-            }
-        }
 
         type Result = {
             opId: string;
@@ -1261,6 +1288,7 @@ async function applyPush(ctx: MutationCtx, args: Infer<typeof pushArgumentValida
             serverVersion?: number;
             error?: string;
             errorCode?:
+                | 'STORED_RECORD_UNAVAILABLE'
                 | 'VALIDATION_ERROR'
                 | 'UNAUTHORIZED'
                 | 'CONFLICT'
@@ -1270,6 +1298,7 @@ async function applyPush(ctx: MutationCtx, args: Infer<typeof pushArgumentValida
                 | 'NETWORK_ERROR'
                 | 'SERVER_ERROR'
                 | 'UNKNOWN';
+            evidenceRef?: string;
             tableName?: string;
             operation?: 'put' | 'delete';
             payload?: unknown;
@@ -1321,41 +1350,71 @@ async function applyPush(ctx: MutationCtx, args: Infer<typeof pushArgumentValida
         });
 
         const candidates: Array<{ op: SyncOperation; indices: number[]; fingerprint: string }> = [];
+        // A native stored document can be 1 MiB, including a corrupt tombstone.
+        // Reserve the worst-case point reads BEFORE each op; charge repeated
+        // apply/winner reads and preimages conservatively against the same cap.
+        // Keep 2 MiB for bounded authorization/counter/evidence headers.
+        let remainingBytes = 14 * 1024 * 1024;
+        const existingLogs: Array<Awaited<ReturnType<typeof readPushReceipt>>> = [];
         for (const group of groups.values()) {
             if (group.conflicting) {
-                failGroup(
-                    group.indices,
-                    group.op,
-                    `Conflicting operations reuse op_id ${group.op.op_id}`,
-                    'CONFLICT'
-                );
+                failGroup(group.indices, group.op, 'Conflicting operations reuse op_id', 'CONFLICT');
                 continue;
             }
+            if (remainingBytes < 12 * 1024 * 1024) {
+                failGroup(group.indices, group.op, 'Sync batch storage budget reached; retry this operation', 'RATE_LIMITED');
+                continue;
+            }
+            // Only known tables have canonical storage. Invalid input remains
+            // the ordinary per-op validation disposition, never stored evidence.
+            if (!Object.hasOwn(TABLE_INDEX_MAP, group.op.table_name)) {
+                failGroup(group.indices, group.op, `Invalid table: ${group.op.table_name}`); continue;
+            }
+            const receipt = await readPushReceipt(ctx, group.op.op_id);
+            remainingBytes -= receipt ? getConvexSize(receipt) : 0;
+            // Never inspect/retain another workspace's receipt.
+            if (receipt && String(receipt.workspace_id) !== String(args.workspace_id)) {
+                failGroup(group.indices, group.op, 'Conflicting operation reuses processed op_id', 'CONFLICT'); continue;
+            }
+            const sources = await readPushSources(ctx, args.workspace_id, group.op);
+            if (args.workspace_item_capability !== 'v1' &&
+                (hasWorkspaceItemSemantics(group.op.table_name, group.op.payload) || hasWorkspaceItemSemantics(group.op.table_name, sources.row))) {
+                requireWorkspaceItemCapability(args.workspace_item_capability);
+            }
+            remainingBytes -= (sources.row ? 6 * getConvexSize(sources.row as Value) : 0) +
+                (sources.tombstone ? 4 * getConvexSize(sources.tombstone) : 0) +
+                4 * getConvexSize(group.op as Value);
+            // Known foreign ownership is an authorization failure, never an
+            // evidence reference or a winner containing another user's data.
+            if (group.op.table_name === 'notifications' && sources.row?.user_id && sources.row.user_id !== String(callerUserId)) {
+                failGroup(group.indices, group.op, 'Forbidden: notification owner mismatch'); continue;
+            }
+            const defect = pushStoredDefect(group.op, receipt, sources);
+            if (defect) {
+                if (args.stored_record_capability !== 'stored-record-v1') {
+                    throw new ConvexError({ code: 'OR3_SYNC_UPDATE_REQUIRED', statusCode: 426, requiredCapability: 'stored-record-v1' });
+                }
+                const sourceRef = await retainEvidence(ctx, args.workspace_id, historyIncarnation,
+                    group.op.table_name, group.op.pk, defect.source, defect.reason);
+                if (defect.hold) {
+                    // The returned reference exports both immutable intent and
+                    // its source link. The source itself is copied only once.
+                    const evidenceRef = await retainEvidence(ctx, args.workspace_id, historyIncarnation,
+                        group.op.table_name, group.op.pk, { intent: group.op, evidence_ref: sourceRef }, 'push_stored_record');
+                    for (const index of group.indices) results[index] = { opId: group.op.op_id, success: false,
+                        errorCode: 'STORED_RECORD_UNAVAILABLE', evidenceRef, error: 'Stored sync record unavailable; retained for manual recovery' };
+                    continue;
+                }
+            }
             try {
-                const scopedOp = await scopeNotificationWrite(
-                    ctx,
-                    args.workspace_id,
-                    callerUserId,
-                    group.op
-                );
+                const scopedOp = scopeNotificationWrite(callerUserId, group.op, sources.row);
                 candidates.push({ op: scopedOp, indices: group.indices, fingerprint: operationFingerprint(scopedOp) });
+                existingLogs.push(receipt);
             } catch (error) {
-                failGroup(
-                    group.indices,
-                    group.op,
-                    error instanceof Error ? error.message : String(error)
-                );
+                failGroup(group.indices, group.op, error instanceof Error ? error.message : String(error));
             }
         }
 
-        const existingLogs = await Promise.all(
-            candidates.map(({ op }) =>
-                ctx.db
-                    .query('change_log')
-                    .withIndex('by_op_id', (q) => q.eq('op_id', op.op_id))
-                    .first()
-            )
-        );
         const unprocessedOps: typeof candidates = [];
         for (const [index, candidate] of candidates.entries()) {
             const existing = existingLogs[index];
@@ -1485,11 +1544,13 @@ async function applyPush(ctx: MutationCtx, args: Infer<typeof pushArgumentValida
             }
         }
 
-        return {
+        const response = {
             results: results.filter((result): result is Result => Boolean(result)),
             serverVersion: latestVersion,
             historyIncarnation,
         };
+        for (const result of response.results) PushResultItemSchema.parse(result);
+        return response;
 
 }
 
@@ -3161,7 +3222,7 @@ export const repairUnavailable = internalMutation({
         const payload = operation === 'put' && replacement && typeof replacement === 'object' && !Array.isArray(replacement)
             ? { ...replacement, [getPkField(evidence.table_name)]: evidence.pk, clock, hlc, op_id: opId } : replacement;
         const result = await applyPush(ctx, { workspace_id: args.workspace_id, history_incarnation: historyIncarnation,
-            history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', workspace_item_capability: 'v1',
+            history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', stored_record_capability: 'stored-record-v1', workspace_item_capability: 'v1',
             ops: [{ op_id: opId, table_name: evidence.table_name, pk: evidence.pk, operation, payload, clock, hlc, device_id: 'operator-repair' }] });
         if (!result.results[0]?.success || !result.results[0]?.applied) throw new Error('Repair rejected; evidence remains unresolved');
         await ctx.db.patch(evidence._id, { status: 'repaired', repaired_op_id: opId });

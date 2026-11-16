@@ -14,7 +14,7 @@ import { ConvexHttpClient } from 'convex/browser';
 import { anyApi } from 'convex/server';
 const host = resolve(process.env.OR3_CANONICAL_HOST_ROOT || new URL('../../../or3-chat', import.meta.url).pathname);
 const { prepareToolResultStorage, readToolResultStorage } = await import(join(host, 'shared/chat/tool-result-artifact.ts'));
-const { TABLE_PAYLOAD_SCHEMAS, compareSyncTuple, SnapshotResponseSchema, PullResponseSchema } = await import(join(host, 'shared/sync/schemas.ts'));
+const { TABLE_PAYLOAD_SCHEMAS, compareSyncTuple, SnapshotResponseSchema, PullResponseSchema, PushResultSchema } = await import(join(host, 'shared/sync/schemas.ts'));
 
 const binary = resolve(process.argv[2] ?? '');
 assert(binary.startsWith(join(process.env.HOME, '.cache/convex/binaries/')) && binary.endsWith('/convex-local-backend'), 'Pass an official cached Convex backend binary');
@@ -76,6 +76,10 @@ export const invoke=internalMutation({args:{workspace:v.id('workspaces'),name:v.
 export const authored=internalMutation({args:{workspace:v.id('workspaces'),op:v.any()},handler:(ctx,args)=>applyServerAuthoredOp(ctx,args.workspace,args.op)});
 export const patch=internalMutation({args:{id:v.string(),value:v.any()},handler:(ctx,args)=>ctx.db.patch(args.id as any,args.value)});
 export const insert=internalMutation({args:{table:v.string(),value:v.any()},handler:(ctx,args)=>ctx.db.insert(args.table as any,args.value)});
+export const poisonReceipt=internalMutation({args:{id:v.id('change_log')},handler:(ctx,args)=>ctx.db.patch(args.id,{request_fingerprint:undefined,payload:{value:1n}})});
+export const dropKey=internalMutation({args:{workspace:v.id('workspaces'),pk:v.string()},handler:async(ctx,args)=>{
+ for(const row of await ctx.db.query('tombstones').withIndex('by_workspace_table_pk',q=>q.eq('workspace_id',args.workspace).eq('table_name','kv').eq('pk',args.pk)).collect())await ctx.db.delete(row._id);
+}});
 export const removeOwnedFixture=internalMutation({args:{workspace:v.id('workspaces')},handler:async(ctx,args)=>{
  const owner=await ctx.db.get(args.workspace);
  const member=await ctx.db.query('workspace_members').withIndex('by_workspace_user',q=>q.eq('workspace_id',args.workspace).eq('user_id',owner!.owner_user_id)).first();
@@ -211,6 +215,71 @@ try {
   const delivered=await invoke(f,'pull',{cursor:5,limit:10});assert.equal(delivered.changes[0].payload.value,'repaired');assert(delivered.changes[0].stamp.clock>5);
   await writeFile(join(evidence,'c2-unavailable.json'),JSON.stringify({page,ref,repaired,delivered}));
  });
+ for(const kind of ['winner','losing-delete','replay-winner','revision','version','receipt','missing-winner','ownership']) await check('RC2 push: '+kind+' holds independently and preserves healthy siblings', async () => {
+  const receipts=[];
+   const f=await client.mutation(anyApi.syncProbe.seed,{});
+   let bad=op({clock:1,hlc:'1:0:dev'});
+   if(kind==='losing-delete')bad=op({clock:1,hlc:'1:0:dev',operation:'delete'});
+   if(kind==='replay-winner')await invoke(f,'push',{ops:[bad]});
+   if(['winner','losing-delete','replay-winner'].includes(kind))await client.mutation(anyApi.syncProbe.patch,{id:f.row,value:{value:'x'.repeat(300*1024)}});
+   if(kind==='version')await client.mutation(anyApi.syncProbe.patch,{id:f.row,value:{server_version:Number.MAX_SAFE_INTEGER+1}});
+   if(kind==='revision')await client.mutation(anyApi.syncProbe.patch,{id:f.row,value:{clock:-1}});
+   if(kind==='receipt'||kind==='missing-winner'){
+    await invoke(f,'push',{ops:[bad]});
+    if(kind==='receipt'){
+     const log=(await read(f)).change_log[0];await client.mutation(anyApi.syncProbe.poisonReceipt,{id:log._id});
+    } else {
+     bad=op({pk:'absent',operation:'delete'});await invoke(f,'push',{ops:[bad]});
+     // Receipt exists without any authoritative canonical/tombstone winner.
+     await client.mutation(anyApi.syncProbe.dropKey,{workspace:f.workspace,pk:'absent'});
+    }
+   }
+   if(kind==='ownership'){
+    bad=op({table_name:'notifications',pk:'bad-owner',operation:'delete'});
+    await client.mutation(anyApi.syncProbe.insert,{table:'notifications',value:{workspace_id:f.workspace,id:'bad-owner',user_id:'',type:'info',title:'private',created_at:1,updated_at:1,deleted:false,clock:5}});
+   }
+   const before=await read(f);
+   const healthy=op({pk:'healthy',payload:{id:'healthy',name:'healthy',deleted:false,clock:6,created_at:1,updated_at:2}});
+   await assert.rejects(invoke(f,'push',{ops:[healthy,bad]}),e=>e.data?.code==='OR3_SYNC_UPDATE_REQUIRED'&&e.data?.requiredCapability==='stored-record-v1');
+   assert.deepEqual(await read(f),before);
+   await assert.rejects(invoke(f,'push',{stored_record_capability:'stored-record-v1',ops:[healthy,bad]},{fail_evidence:true}),/Injected evidence write failure/);
+   assert.deepEqual(await read(f),before);
+   const result=await invoke(f,'push',{stored_record_capability:'stored-record-v1',ops:[healthy,bad]});PushResultSchema.parse(result);
+   assert.equal(result.results[0].success,true);const held=result.results[1];assert.equal(held.errorCode,'STORED_RECORD_UNAVAILABLE');assert.equal(held.success,false);assert(held.evidenceRef);assert.equal(held.serverVersion,undefined);assert.equal(held.winner,undefined);
+   const exported=await invoke(f,'exportUnavailable',{evidence_ref:held.evidenceRef,chunk:0});const original=JSON.parse(new TextDecoder().decode(exported.data));
+   assert.deepEqual(original.intent,bad);assert(original.evidence_ref);
+   const again=await invoke(f,'push',{stored_record_capability:'stored-record-v1',ops:[bad]});assert.equal(again.results[0].evidenceRef,held.evidenceRef);
+   assert.equal((await read(f)).server_version_counter[0].value,before.server_version_counter[0].value+1);
+   receipts.push({kind,result,original});
+  await writeFile(join(evidence,'rc2-push-'+kind+'.json'),JSON.stringify(receipts,null,2));
+ });
+ await check('RC2 push replacement: stale stored attachment JSON cannot abort a complete-record put', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const payload={id:'attachment-message',thread_id:'thread',role:'user',index:0,order_key:'a',clock:5,deleted:false,created_at:1,updated_at:1};
+  await client.mutation(anyApi.syncProbe.insert,{table:'messages',value:{...payload,workspace_id:f.workspace,file_hashes:'{broken',hlc:'5:0:dev',op_id:crypto.randomUUID(),server_version:5}});
+  const replacement=op({table_name:'messages',pk:payload.id,payload:{...payload,clock:6}}),healthy=op({pk:'healthy',payload:{id:'healthy',name:'ok',clock:6,deleted:false,created_at:1,updated_at:1}});
+  const result=await invoke(f,'push',{stored_record_capability:'stored-record-v1',ops:[healthy,replacement]});
+  assert(result.results.every(r=>r.success&&r.applied));assert.equal(result.serverVersion,7);
+  const page=await invoke(f,'pull',{cursor:5,limit:10});assert.equal(page.changes[1].payload.file_hashes,undefined);
+  await writeFile(join(evidence,'rc2-attachment-replacement.json'),JSON.stringify({result,page}));
+ });
+ await check('RC2 push bounds: near-limit stored sources make bounded progress with stable holds', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{}),ops=[],metrics=[];
+  for(let i=0;i<18;i++){
+   const pk='poison-'+i;
+   await client.mutation(anyApi.syncProbe.insert,{table:'kv',value:{workspace_id:f.workspace,id:pk,name:'bad',value:'x'.repeat(950*1024),clock:5,hlc:'5:0:dev',op_id:crypto.randomUUID(),deleted:false,created_at:1,updated_at:1}});
+   ops.push(op({pk,clock:1,payload:{id:pk,name:'intent',clock:1,deleted:false,created_at:1,updated_at:1}}));await Bun.sleep(750);
+  }
+  let remaining=ops;
+  for(let i=0;i<30&&remaining.length;i++){
+   const measured=await invoke(f,'push',{stored_record_capability:'stored-record-v1',ops:remaining,__budget:true});metrics.push(measured);
+   assert(measured.bytes<16*1024*1024);assert(measured.written<16*1024*1024);PushResultSchema.parse(measured.result);
+   const held=measured.result.results.filter(r=>r.errorCode==='STORED_RECORD_UNAVAILABLE');assert(held.length>0);
+   remaining=remaining.filter(op=>!held.some(r=>r.opId===op.op_id));await Bun.sleep(750);
+  }
+  assert.equal(remaining.length,0);assert.equal((await client.query(anyApi.syncProbe.upgradeState,{workspace:f.workspace})).server_version_counter[0].value,5);
+  await writeFile(join(evidence,'rc2-push-budgets.json'),JSON.stringify(metrics,null,2));
+ });
  await check('C2 incarnation: stale pushes and ACKs never mutate replacement and old snapshots reject', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
   const lost=op();await invoke(f,'push',{ops:[lost]});
@@ -328,7 +397,7 @@ try {
  await check('70 large KV rows pull, snapshot and combined GC advance below transaction limits', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
   const budgets=[];
-  const measure=async(name,input)=>{const result=await invoke(f,name,{...input,__budget:true});budgets.push({name,bytes:result.bytes,reads:result.reads,written:result.written});assert(result.bytes<16*1024*1024);assert(result.written<16*1024*1024);return result.result;};
+  const measure=async(name,input)=>{let result;try{result=await invoke(f,name,{...input,__budget:true});}catch(error){throw new Error(name+' after '+budgets.length+' measured calls: '+String(error));}budgets.push({name,bytes:result.bytes,reads:result.reads,written:result.written});assert(result.bytes<16*1024*1024);assert(result.written<16*1024*1024);return result.result;};
   for(let i=0;i<70;i++){await Bun.sleep(750);const id='large-'+String(i).padStart(3,'0');const write=op({pk:id,payload:{id,name:'large',value:'x'.repeat(240*1024),clock:6,created_at:1,updated_at:2,deleted:false}});assert.equal((await invoke(f,'push',{ops:[write]})).results[0].success,true);}
   let cursor=5,count=0;
   for(let i=0;i<100;i++){const page=await measure('pull',{cursor,limit:300});PullResponseSchema.parse(page);count+=page.changes.length;if(!page.hasMore)break;assert(page.nextCursor>cursor);cursor=page.nextCursor;}
@@ -341,7 +410,7 @@ try {
   const old=Math.floor(Date.now()/1000)-7200;
   // Patch one indexed page at a time; never use the unbounded fixture reader.
   for(let cursor=5;;){const page=await invoke(f,'pull',{cursor,limit:1});for(const change of page.changes)await client.mutation(anyApi.syncProbe.age,{workspace:f.workspace,version:change.serverVersion,old});if(!page.hasMore)break;cursor=page.nextCursor;}
-  for(let i=0;i<1000;i++){if(!await client.mutation(anyApi.syncProbe.expire,{workspace:f.workspace,old}))break;assert(i<999,'Fixture expiry must drain');}
+  for(let i=0;i<1000;i++){await Bun.sleep(750);if(!await client.mutation(anyApi.syncProbe.expire,{workspace:f.workspace,old}))break;assert(i<999,'Fixture expiry must drain');}
   let gc;
   for(let i=0;i<200;i++){gc=await measure('runWorkspaceGc',{retention_seconds:3600,batch_size:100,continuation_count:999});if(!gc.hasMore)break;}
   assert.equal(gc.hasMore,false);

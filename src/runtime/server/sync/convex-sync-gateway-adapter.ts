@@ -683,6 +683,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                 client.mutation(api.sync.push, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     workspace_item_capability: input.workspaceItemCapability,
+                    stored_record_capability: input.storedRecordCapability,
                     history_incarnation: input.historyIncarnation,
                     history_incarnation_capability: 'incarnation-v1',
                     unavailable_record_capability: 'unavailable-v1',

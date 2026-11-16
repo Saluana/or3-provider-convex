@@ -1,13 +1,13 @@
 {
-  "hostCommit": "cef4a44899785e83e5524638d6acbaf6490c7d39",
+  "hostCommit": "f0d0a393f8a140f196e1dccb26df9d169643adac",
   "files": {
     "shared/sync/prepare-sync-write.ts": {
       "source": "7a25ef53bf3049dc4d698846ff73634b7f79a90268af391f6c52848261f61596",
       "generated": "03d35001700c4c0653f6b463003d826a08a563b14057fcc443f2fb543a8bb289"
     },
     "shared/sync/schemas.ts": {
-      "source": "b794b303230fd850cdbfde39bf15902910b337667454663225be3fca016ffca2",
-      "generated": "28097b272ee60701830358bd55369a077048c85a8fa7ab93d0cc4be1a9090747"
+      "source": "a4c37e78996c449623fcfd86458ba2a424564df676489095a7eb2c06203b9542",
+      "generated": "e3284566fe51ec8067341ffeb148f6a71d492c44bbce7af6fbd069bb830d4ff3"
     },
     "shared/files/file-capability.ts": {
       "source": "a6c33ba0f0fd06ec8401f4ed848a949add97321691a6f5015b1560ace9927568",
@@ -34,8 +34,8 @@
       "generated": "c4da85b658ccdb48e4f2e629c5f043140d78e50a3996f359738f7505bcf66b77"
     },
     "shared/sync/types.ts": {
-      "source": "6c25487b98e660e51cd0be606c3de27655b50ec40622a9c4d00acaf079723af5",
-      "generated": "d5d09b830ef939d3284945b2bef0636a01e64ffda345de6cdaefad0366cd4173"
+      "source": "75daafcb11fd01b316beadaa46b4fc10f097f342ac9f59f820232d9c715bac82",
+      "generated": "595379cd6ef48b5e0d9d0a49f8f8695a006ef4fa96b07f2eac0461c565f916ea"
     },
     "shared/errors/index.ts": {
       "source": "b3874ccc1f59a798a1ab1faa181e2599e685e6f5f53c5de381cb875ce4220a85",

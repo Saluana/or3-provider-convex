@@ -8,6 +8,9 @@ export function assertIdentity(table: string, pk: unknown): asserts pk is string
         !isLosslessSyncIdentifier(table) || !isLosslessSyncIdentifier(pk)) throw new Error('Sync coverage identity failure');
 }
 export function readDefect(entry: unknown, snapshot: boolean): string | null {
+    // Convex native values include Int64, which the JSON sync wire cannot carry.
+    // Catch only serialization of this stored value, never DB/evidence failures.
+    try { JSON.stringify(entry); } catch { return 'non_json_record'; }
     const parsed = (snapshot ? SnapshotItemSchema : SyncChangeSchema).safeParse(entry);
     const revision = (entry as { revision?: {clock?: number}; stamp?: {clock?: number} })?.revision ?? (entry as {stamp?: {clock?: number}})?.stamp;
     if (revision && !Number.isSafeInteger(revision.clock)) return 'invalid_revision';

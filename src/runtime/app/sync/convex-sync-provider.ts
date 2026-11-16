@@ -237,6 +237,7 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             const result = await requestWithSignal(() => client.mutation(api.sync.push, {
                 workspace_id: batch.scope.workspaceId as Id<'workspaces'>,
                 workspace_item_capability: 'v1',
+                stored_record_capability: 'stored-record-v1',
                 ...protocolArgs(batch.historyIncarnation),
                 ops: batch.ops.map((op: PendingOp) => ({
                     op_id: op.stamp.opId,

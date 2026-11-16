@@ -362,7 +362,7 @@ describe('ConvexSyncGatewayAdapter', () => {
         const { readFileSync } = await import('node:fs');
         const { ConvexHttpClient } = await import('convex/browser');
         const { createConvexSyncProvider } = await import('../../../app/sync/convex-sync-provider');
-        const { SnapshotResponseSchema, PullResponseSchema, compareSyncTuple, TABLE_PAYLOAD_SCHEMAS } = await import('~~/shared/sync/schemas');
+        const { SnapshotResponseSchema, PullResponseSchema, PushResultSchema, compareSyncTuple, TABLE_PAYLOAD_SCHEMAS } = await import('~~/shared/sync/schemas');
         const fixture = JSON.parse(readFileSync(process.env.OR3_CONVEX_QUALIFICATION_FILE!, 'utf8'));
         const client = new ConvexHttpClient(fixture.url, { logger: false });
         (client as any).setAdminAuth(fixture.adminKey, { subject: fixture.workspace + 'a', issuer: 'https://clerk.example.test', tokenIdentifier: 'qualification' });
@@ -398,6 +398,21 @@ describe('ConvexSyncGatewayAdapter', () => {
         const gatewayPage = await gateway.pull(makeEvent(), { scope, historyIncarnation, cursor: 5, limit: 300 });
         expect(directPage.unavailable).toHaveLength(1);
         expect(gatewayPage).toEqual(directPage);
+        // Actual HTTP codecs must negotiate and preserve mixed push holds.
+        const source = original.kv.find((row: any) => row.id === 'a');
+        await client.mutation('syncProbe:patch' as any, { id: source._id, value: { value: 'x'.repeat(300 * 1024) } });
+        const intent = (pk: string, clock: number) => ({ id: crypto.randomUUID(), status: 'pending', attempts: 0,
+            tableName: 'kv', pk, operation: 'put', payload: { id: pk, name: 'intent', deleted: false, clock, created_at: 1, updated_at: 1 },
+            stamp: { clock, hlc: `${clock}:0:dev`, deviceId: 'device', opId: crypto.randomUUID() } });
+        const oldIntent = intent('a', 1), healthy = intent('http-healthy', 7);
+        const batch = { scope, historyIncarnation, ops: [oldIntent, healthy] } as any;
+        await expect(gateway.push(makeEvent(), batch)).rejects.toMatchObject({ statusCode: 426,
+            data: { code: 'OR3_SYNC_UPDATE_REQUIRED', requiredCapability: 'stored-record-v1' } });
+        const held = PushResultSchema.parse(await gateway.push(makeEvent(), { ...batch, storedRecordCapability: 'stored-record-v1' }));
+        expect(held.results[0]).toMatchObject({ success: false, errorCode: 'STORED_RECORD_UNAVAILABLE', evidenceRef: expect.any(String) });
+        expect(held.results[1]).toMatchObject({ success: true, applied: true });
+        const directHeld = PushResultSchema.parse(await direct.push({ ...batch, ops: [oldIntent] }));
+        expect(directHeld.results[0]).toEqual(held.results[0]);
         const next = crypto.randomUUID(), attempt = crypto.randomUUID();
         await client.mutation('syncHistory:beginReplacement' as any, { attempt_id: attempt, incarnation: next });
         while (!(await client.mutation('syncHistory:finishReplacement' as any, { attempt_id: attempt })).ready) { /* bounded provider pages */ }
