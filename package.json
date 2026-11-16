@@ -38,7 +38,8 @@
         "templates/convex.contract.json",
         "templates/convex.previous.json",
         "scripts/init.mjs",
-        "scripts/backend.mjs"
+        "scripts/backend.mjs",
+        "scripts/history.mjs"
     ],
     "bin": {
         "or3-provider-convex": "./scripts/init.mjs"

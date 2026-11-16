@@ -5,7 +5,7 @@
 // expired snapshots retain bodies forever. This runs the shipped handlers against
 // a fresh official loopback Convex backend, including its validators and rollback.
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, writeFile, readFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { randomBytes, createHash } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
@@ -47,8 +47,10 @@ export const seed=internalMutation({args:{},handler:async(ctx)=>{
  await ctx.db.insert('kv',{workspace_id:workspace,id:'z',name:'legacy',value:'retained',deleted:false,created_at:1,updated_at:1,clock:1,hlc:'1:0:dev'});
  return {workspace,user,other,row};
 }});
-export const invoke=internalMutation({args:{workspace:v.id('workspaces'),name:v.string(),input:v.any(),actor:v.optional(v.string()),fail_after:v.optional(v.boolean()),fail_write:v.optional(v.boolean())},handler:async(ctx,args)=>{
+export const invoke=internalMutation({args:{workspace:v.id('workspaces'),name:v.string(),input:v.any(),actor:v.optional(v.string()),fail_after:v.optional(v.boolean()),fail_write:v.optional(v.boolean()),fail_evidence:v.optional(v.boolean())},handler:async(ctx,args)=>{
  const context=actor(ctx,args.workspace+(args.actor??'a'));
+ const history='getHistoryIncarnation' in sync ? await (ctx.db as any).query('sync_history').first() : null;
+ args.input={history_incarnation:history?.incarnation,history_incarnation_capability:'incarnation-v1',unavailable_record_capability:'unavailable-v1',...args.input};
  let bytes=0, reads=0, written=0;
  const measured=(value:any)=>{if(value){bytes+=getConvexSize(value);reads++;}return value;};
  const queryProxy=(target:any):any=>new Proxy(target,{get(t,key){
@@ -65,7 +67,8 @@ export const invoke=internalMutation({args:{workspace:v.id('workspaces'),name:v.
   const value=(t as any)[key];return typeof value==='function'?value.bind(t):value;
  }});
  if(args.fail_write)context.db=new Proxy(ctx.db,{get(target,key){if(key==='insert')return async(table:any,value:any)=>{if(table==='change_log')throw Error('Injected change-log write failure');return target.insert(table,value);};return Reflect.get(target,key);}});
- const handlers:any={...sync,createNotification:notifications.create,markNotificationRead:notifications.markRead,generateUploadUrl:storage.generateUploadUrl,commitUpload:storage.commitUpload,deleteObject:storage.deleteObject};
+ if(args.fail_evidence)context.db=new Proxy(context.db,{get(target,key){if(key==='insert')return async(table:any,value:any)=>{if(table==='sync_unavailable_records')throw Error('Injected evidence write failure');return target.insert(table,value);};return Reflect.get(target,key);}});
+ const handlers:any={...sync,pull:(sync as any).pullChecked??sync.pull,createNotification:notifications.create,markNotificationRead:notifications.markRead,generateUploadUrl:storage.generateUploadUrl,commitUpload:storage.commitUpload,deleteObject:storage.deleteObject};
  const result=await handlers[args.name]._handler(context,{...Object.fromEntries(Object.entries(args.input).filter(([key])=>key!=='__budget')),workspace_id:args.workspace});
  if(args.fail_after)throw Error('Injected crash before transaction commit');
  return args.input.__budget ? {result,bytes,reads,written} : result;
@@ -120,6 +123,8 @@ try {
  backend = start(); await ready();
  const deploy = Bun.spawn([process.execPath, join(provider, 'node_modules/convex/bin/main.js'), 'deploy', '--yes', '--typecheck', 'enable', '--env-file', envPath], { cwd: root, env, stdout: Bun.file(join(root, 'deploy.log')), stderr: Bun.file(join(root, 'deploy-errors.log')) });
  assert.equal(await deploy.exited, 0, 'Sandbox deployment failed: ' + root);
+ const initialized=await client.mutation(anyApi.syncHistory.initialize,{incarnation:crypto.randomUUID()});
+ if(!initialized.ready)for(let i=0;i<100;i++){if((await client.mutation(anyApi.syncHistory.finishReplacement,{attempt_id:initialized.incarnation})).ready)break;}
 
  if(process.env.OR3_CONVEX_UPGRADE_PACK)await check('review: published 0.0.26 receipts and rows survive deployment upgrade', async () => {
   const candidate=join(root,'candidate');await cp(join(root,'convex'),candidate,{recursive:true});
@@ -132,6 +137,7 @@ try {
   };
   let f,writes,before;
   try {
+   await rm(join(root,'convex'),{recursive:true});
    for(const [name,source] of Object.entries(published.files)){await mkdir(join(root,'convex',name,'..'),{recursive:true});await writeFile(join(root,'convex',name),source);}
    await writeFile(join(root,'convex/auth.config.ts'),'export default { providers: [] };\n');await writeFile(join(root,'convex/syncProbe.ts'),probe);
    await deployTemplates('published');
@@ -144,7 +150,7 @@ try {
    for(const write of writes){const result=await invoke(f,'push',{ops:[write]});assert.equal(result.results[0].success,true,JSON.stringify(result));}
    before=await client.query(anyApi.syncProbe.upgradeState,{workspace:f.workspace});
   } finally {
-   await cp(candidate,join(root,'convex'),{recursive:true});await deployTemplates('candidate-upgrade');
+   await rm(join(root,'convex'),{recursive:true});await cp(candidate,join(root,'convex'),{recursive:true});await deployTemplates('candidate-upgrade');
   }
   for(const write of writes){const replay=await invoke(f,'push',{ops:[write]});assert.equal(replay.results[0].replayed,true,JSON.stringify(replay));}
   const after=await client.query(anyApi.syncProbe.upgradeState,{workspace:f.workspace});
@@ -155,17 +161,148 @@ try {
   assert.deepEqual((await client.query(anyApi.syncProbe.upgradeState,{workspace:f.workspace})).notifications[0].actions,writes[1].payload.actions);
   await writeFile(join(evidence,'published-upgrade.json'),JSON.stringify({version:'0.0.26',templateSha256:createHash('sha256').update(packed).digest('hex'),operations:writes.map(write=>write.op_id),fingerprints:before.change_log.map(row=>createHash('sha256').update(row.request_fingerprint).digest('hex')),unchangedAfterReplay:true}));
  });
- await check('review: bad stored operation IDs fail closed without unavailable negotiation', async () => {
+ await check('C2 journal: real snapshot import rotates twice and reconciles an interrupted reset', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
-  await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:{workspace_id:f.workspace,server_version:5,table_name:'kv',pk:'a',op:'put',payload:{id:'a',name:'setting',clock:5,created_at:1,updated_at:1},clock:5,hlc:'5:0:dev',device_id:'device',op_id:'background-tool:legacy',created_at:1}});
-  for(const name of ['pull','watchChanges'])await assert.rejects(invoke(f,name,{cursor:4,limit:10}),/Invalid stored sync operation ID/);
-  const bad=await client.mutation(anyApi.syncProbe.seed,{});
-  const payload={id:'bad-note',user_id:bad.user,type:'info',title:'bad',actions:{legacy:true},deleted:false,created_at:1,updated_at:1,clock:5};
-  await client.mutation(anyApi.syncProbe.insert,{table:'notifications',value:{...payload,workspace_id:bad.workspace,server_version:5}});
-  await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:{workspace_id:bad.workspace,server_version:5,table_name:'notifications',pk:'bad-note',op:'put',payload,clock:5,hlc:'5:0:dev',device_id:'device',op_id:crypto.randomUUID(),created_at:1}});
-  const pull=await invoke(bad,'pull',{cursor:4,limit:10});assert.equal(pull.changes.length,1);assert.equal(TABLE_PAYLOAD_SCHEMAS.notifications.safeParse(pull.changes[0].payload).success,false);
-  const snapshot=await invoke(bad,'snapshot',{tables:['notifications'],page_size:10});assert.equal(snapshot.items.length,1);assert.equal(TABLE_PAYLOAD_SCHEMAS.notifications.safeParse(snapshot.items[0].payload).success,false);
-
+  const initial=await invoke(f,'snapshot',{tables:['kv'],page_size:1});
+  await invoke(f,'updateDeviceCursor',{device_id:'archived',last_seen_version:5});
+  const backup=join(root,'replacement.zip');
+  const cli=async(args,label)=>{const process=Bun.spawn(['node',join(provider,'node_modules/convex/bin/main.js'),...args,'--env-file',envPath],{cwd:root,env,stdout:Bun.file(join(root,label+'.log')),stderr:Bun.file(join(root,label+'-errors.log'))});assert.equal(await process.exited,0,label+' failed: '+root);};
+  await cli(['export','--path',backup],'export');
+  const backupSha=createHash('sha256').update(await readFile(backup)).digest('hex');
+  const contract=await client.query(anyApi.or3Backend.version,{});
+  const identities=[];
+  const runJournal=async(command,path)=>{const process=Bun.spawn(['node',join(provider,'scripts/history.mjs'),command,path],{cwd:root,env:{...env,OR3_CONVEX_BACKUP_SHA256:backupSha,OR3_CONVEX_TEMPLATE_DIGEST:contract.digest},stdout:'pipe',stderr:'pipe'});const out=await new Response(process.stdout).text(),err=await new Response(process.stderr).text();assert.equal(await process.exited,0,out+err);};
+  for(let iteration=0;iteration<2;iteration++){
+   const journal=join(root,'external-reset-'+iteration+'.json');await runJournal('prepare',journal);
+   // Preserve the authenticated archive. This official local backend misreads
+   // retained_storage/generated_schema as a _storage object in whole-zip import.
+   // Import its exact documents.jsonl members through the supported table API.
+   const extraction=Bun.spawn(['unzip','-o','-q',backup,'-d',join(root,'restore-members')],{stdout:'ignore',stderr:'pipe'});assert.equal(await extraction.exited,0);
+   const members=await (await import('node:fs/promises')).readdir(join(root,'restore-members'));
+   for(const table of members)if(!table.startsWith('_')&&table!=='README.md')await cli(['import','--table',table,'--replace','--yes',join(root,'restore-members',table,'documents.jsonl')],'import-'+iteration+'-'+table);
+   const prepared=JSON.parse(await readFile(journal,'utf8'));
+   if(iteration===1)await client.mutation(anyApi.syncHistory.beginReplacement,{attempt_id:prepared.attemptId,incarnation:prepared.incarnation});
+   await runJournal('complete',journal);await runJournal('complete',journal);
+   const receipt=JSON.parse(await readFile(journal,'utf8'));assert.equal(receipt.phase,'ready');identities.push(receipt.incarnation);
+   const state=await read(f);assert.equal(state.server_version_counter[0].value,5);assert.equal(state.sync_snapshot_sessions.length,0);assert.equal(state.device_cursors.length,0);
+   const reset=await invoke(f,'pull',{history_incarnation:initial.historyIncarnation,cursor:5,limit:10});assert.equal(reset.requiresSnapshot,true);assert.equal(reset.historyIncarnation,receipt.incarnation);
+  }
+  assert.notEqual(identities[0],identities[1]);
+  await writeFile(join(evidence,'c2-journal.json'),JSON.stringify({backupSha,initial:initial.historyIncarnation,identities,interruptedResetReconciled:true,exactTemplateDigest:contract.digest}));
+ });
+ await check('C2 unavailable: poison retained before coverage, all-invalid snapshot completes and repair publishes', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const source={workspace_id:f.workspace,server_version:5,table_name:'kv',pk:'a',op:'put',payload:{id:'a',name:'setting',value:'original',clock:5,created_at:1,updated_at:1},clock:5,hlc:'5:0:dev',device_id:'device',op_id:'background-tool:legacy',created_at:1};
+  await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:source});
+  const page=await invoke(f,'pull',{cursor:4,limit:1});PullResponseSchema.parse(page);
+  assert.equal(page.changes.length,0);assert.equal(page.unavailable.length,1);assert.equal(page.nextCursor,5);
+  const ref=page.unavailable[0].evidenceRef;
+  assert.equal((await invoke(f,'pull',{cursor:4,limit:1})).unavailable[0].evidenceRef,ref);
+  const inspected=await invoke(f,'inspectUnavailable',{});assert.equal(inspected.items.length,1);
+  const exported=await invoke(f,'exportUnavailable',{evidence_ref:ref,chunk:0});assert.equal(JSON.parse(new TextDecoder().decode(exported.data)).op_id,source.op_id);
+  await client.mutation(anyApi.syncProbe.patch,{id:f.row,value:{value:'x'.repeat(300*1024),op_id:source.op_id}});
+  let token,markers=0,rows=0;
+  do {const snapshot=await invoke(f,'snapshot',{tables:['kv'],page_size:1,page_token:token});SnapshotResponseSchema.parse(snapshot);markers+=snapshot.unavailable.length;rows+=snapshot.items.length;token=snapshot.nextPageToken;}while(token);
+  assert.equal(markers,1);assert.equal(rows,1);
+  const history=page.historyIncarnation;
+  const repaired=await invoke(f,'repairUnavailable',{history_incarnation:history,evidence_ref:ref,replacement:{id:'a',name:'setting',value:'repaired',deleted:false,created_at:1,updated_at:2,clock:6}});
+  assert.equal(repaired.status,'repaired');assert.match(repaired.opId,/^[0-9a-f-]{36}$/);
+  assert.equal((await invoke(f,'revalidateUnavailable',{evidence_ref:ref})).currentDefect,null);
+  const delivered=await invoke(f,'pull',{cursor:5,limit:10});assert.equal(delivered.changes[0].payload.value,'repaired');assert(delivered.changes[0].stamp.clock>5);
+  await writeFile(join(evidence,'c2-unavailable.json'),JSON.stringify({page,ref,repaired,delivered}));
+ });
+ await check('C2 incarnation: stale pushes and ACKs never mutate replacement and old snapshots reject', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const lost=op();await invoke(f,'push',{ops:[lost]});
+  const poison={workspace_id:f.workspace,server_version:5,table_name:'kv',pk:'legacy',op:'put',payload:'bad',clock:5,hlc:'5:0:dev',device_id:'device',op_id:'legacy',created_at:1};
+  await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:poison});
+  const oldEvidence=(await invoke(f,'pull',{cursor:4,limit:1})).unavailable[0].evidenceRef;
+  const oldExport=await invoke(f,'exportUnavailable',{evidence_ref:oldEvidence,chunk:0});
+  const before=await read(f);
+  await assert.rejects(invoke(f,'push',{history_incarnation:'discarded-history',ops:[op()]}),/OR3_SYNC_HISTORY_CHANGED/);
+  assert.deepEqual(await read(f),before);
+  const initial=await invoke(f,'snapshot',{tables:['kv'],page_size:1});
+  const old=initial.historyIncarnation;
+  const next=crypto.randomUUID();const attempt=crypto.randomUUID();
+  await client.mutation(anyApi.syncHistory.beginReplacement,{attempt_id:attempt,incarnation:next});
+  await assert.rejects(invoke(f,'push',{ops:[op()]}),/OR3_SYNC_HISTORY/);
+  for(let i=0;i<100;i++){const reset=await client.mutation(anyApi.syncHistory.finishReplacement,{attempt_id:attempt});if(reset.ready)break;assert(i<99);}
+  await assert.rejects(invoke(f,'push',{history_incarnation:old,ops:[lost]}),/OR3_SYNC_HISTORY_CHANGED/);
+  assert.deepEqual(await invoke(f,'exportUnavailable',{evidence_ref:oldEvidence,chunk:0}),oldExport);
+  const newEvidence=(await invoke(f,'pull',{cursor:4,limit:1})).unavailable[0].evidenceRef;assert.notEqual(newEvidence,oldEvidence);
+  await assert.rejects(invoke(f,'repairUnavailable',{history_incarnation:next,evidence_ref:oldEvidence,replacement:{}}),/OR3_SYNC_HISTORY_CHANGED/);
+  assert.equal((await invoke(f,'push',{ops:[op({clock:7,hlc:'7:0:dev',payload:{id:'a',name:'new-history',clock:7,deleted:false,created_at:1,updated_at:2}})]})).results[0].success,true);
+  for(const cursor of [0,5,6,120]){const page=await invoke(f,'pull',{history_incarnation:old,cursor,limit:1});assert.equal(page.historyIncarnation,next);assert.equal(page.requiresSnapshot,true);assert.equal(page.changes.length,0);assert.equal(page.nextCursor,cursor);}
+  await assert.rejects(invoke(f,'updateDeviceCursor',{history_incarnation:old,device_id:'old',last_seen_version:5}),/OR3_SYNC_HISTORY_CHANGED/);
+  await assert.rejects(invoke(f,'snapshot',{history_incarnation:next,page_size:1,tables:['kv'],page_token:initial.nextPageToken}),/OR3_SYNC_HISTORY_CHANGED/);
+  assert.equal((await read(f)).device_cursors.length,0);assert.equal((await read(f)).sync_snapshot_sessions.length,0);
+  await writeFile(join(evidence,'c2-incarnation.json'),JSON.stringify({old,next,attempt,unchangedAfterStalePush:true}));
+ });
+ await check('C2 containment: variants, private notifications, evidence GC survival and old-client boundary', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const base={workspace_id:f.workspace,table_name:'kv',op:'put',clock:5,hlc:'5:0:dev',device_id:'device',op_id:crypto.randomUUID(),created_at:1};
+  const variants=[{payload:'{broken'}, {payload:{id:'bad',name:7}}, {table_name:'unknown',payload:{}}, {hlc:'x'.repeat(513),payload:{}}, {payload:{id:'bad',name:'oversize',value:'x'.repeat(300*1024)}}, {op:'delete',clock:-1}];
+  for(let index=0;index<variants.length;index++)await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:{...base,server_version:index+6,pk:'bad-'+index,...variants[index]}});
+  const counter=(await read(f)).server_version_counter[0];await client.mutation(anyApi.syncProbe.patch,{id:counter._id,value:{value:20}});
+  let cursor=5,refs=[];
+  for(let index=0;index<variants.length;index++){
+   const page=await invoke(f,'pull',{cursor,limit:1});PullResponseSchema.parse(page);assert.equal(page.changes.length,0);assert.equal(page.unavailable.length,1);assert(page.nextCursor>cursor);cursor=page.nextCursor;refs.push(page.unavailable[0].evidenceRef);
+  }
+  for(const [index,owner]of [[0,undefined],[1,f.other]])await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:{...base,server_version:12+index,pk:'private-'+index,table_name:'notifications',payload:{...(owner?{user_id:owner}:{}),actions:{bad:true}}}});
+  const privatePage=await invoke(f,'pull',{cursor:11,limit:10});assert.equal(privatePage.changes.length,0);assert.equal(privatePage.unavailable.length,0);assert.equal(privatePage.nextCursor,13);
+  const inspect=await invoke(f,'inspectUnavailable',{});assert.equal(inspect.items.length,8);
+  const original=await invoke(f,'exportUnavailable',{evidence_ref:refs[0],chunk:0});
+  // Source GC and session expiry must not delete independent evidence.
+  for(let version=6;version<=13;version++)await client.mutation(anyApi.syncProbe.age,{workspace:f.workspace,version,old:1});
+  await invoke(f,'updateDeviceCursor',{device_id:'gc',last_seen_version:20});
+  await invoke(f,'runWorkspaceGc',{retention_seconds:3600,batch_size:100});
+  assert.deepEqual(await invoke(f,'exportUnavailable',{evidence_ref:refs[0],chunk:0}),original);
+  for(const [name,input]of [['pull',{cursor:0,limit:1}],['snapshot',{page_size:1}],['push',{ops:[]}],['updateDeviceCursor',{device_id:'old',last_seen_version:0}],['watchChanges',{}]])await assert.rejects(invoke(f,name,{...input,history_incarnation_capability:'old'}),error=>error.data?.code==='OR3_SYNC_UPDATE_REQUIRED'&&error.data?.statusCode===426);
+  await writeFile(join(evidence,'c2-containment.json'),JSON.stringify({variants:variants.length,refs,privatePage,evidenceSurvivedGc:true,oldClientEndpoints:5}));
+ });
+ await check('C2 legacy query: old pull clients receive an explicit structured update boundary', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const oldClient=new ConvexHttpClient(url,{logger:false});oldClient.setAdminAuth(adminKey,{subject:f.workspace+'a',issuer:'https://clerk.example.test'});
+  await assert.rejects(oldClient.query(anyApi.sync.pull,{workspace_id:f.workspace,cursor:0,limit:1}),error=>error.data?.code==='OR3_SYNC_UPDATE_REQUIRED'&&error.data?.statusCode===426);
+ });
+ await check('C2 bounds: near-limit native evidence survives lossless chunk export below transaction limits', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const value='\0'.repeat(950*1024);
+  await client.mutation(anyApi.syncProbe.insert,{table:'change_log',value:{workspace_id:f.workspace,server_version:5,table_name:'kv',pk:'large-poison',op:'put',payload:{id:'large-poison',value,bytes:new Uint8Array([0,255]).buffer,int:123n,nonfinite:NaN},clock:5,hlc:'5:0:dev',device_id:'dev',op_id:crypto.randomUUID(),created_at:Math.floor(Date.now()/1000)}});
+  const measured=await invoke(f,'pull',{cursor:4,limit:1,__budget:true});const page=measured.result;
+  PullResponseSchema.parse(page);assert.equal(page.nextCursor,5);assert.equal(page.unavailable.length,1);
+  assert(measured.bytes<16*1024*1024);assert(measured.written<16*1024*1024);
+  const ref=page.unavailable[0].evidenceRef;
+  const parts=[];let chunks;
+  for(let chunk=0;chunks===undefined||chunk<chunks;chunk++){
+   const part=await invoke(f,'exportUnavailable',{evidence_ref:ref,chunk});chunks=part.chunks;
+   assert(part.data.byteLength<=32768);parts.push(new Uint8Array(part.data));
+  }
+  const serialized=Buffer.concat(parts);const {jsonToConvex}=await import('convex/values');
+  const original=jsonToConvex(JSON.parse(serialized.toString('utf8')));
+  assert.equal(original.payload.value,value);assert.deepEqual(new Uint8Array(original.payload.bytes),new Uint8Array([0,255]));assert.equal(original.payload.int,123n);assert(Number.isNaN(original.payload.nonfinite));
+  assert.equal((await invoke(f,'pull',{cursor:4,limit:1})).unavailable[0].evidenceRef,ref);
+  await writeFile(join(evidence,'c2-native-evidence-budgets.json'),JSON.stringify({readBytes:measured.bytes,writtenBytes:measured.written,exportBytes:serialized.byteLength,chunks,sourceStringBytes:value.length,losslessValues:true}));
+ });
+ await check('C2 mixed: healthy siblings survive poison and failed evidence cannot advance coverage', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const writes=[op({pk:'before'}),op({pk:'poison'}),op({pk:'after'})];
+  for(const write of writes){write.payload.id=write.pk;assert.equal((await invoke(f,'push',{ops:[write]})).results[0].success,true);}
+  const state=await read(f);const middle=state.change_log.find(row=>row.pk==='poison');await client.mutation(anyApi.syncProbe.patch,{id:middle._id,value:{op_id:'invalid'}});
+  await assert.rejects(invoke(f,'pull',{cursor:5,limit:3},{fail_evidence:true}),/Injected evidence write failure/);
+  const page=await invoke(f,'pull',{cursor:5,limit:3});PullResponseSchema.parse(page);assert.deepEqual(page.changes.map(row=>row.pk),['before','after']);assert.deepEqual(page.unavailable.map(row=>row.pk),['poison']);assert.equal(page.nextCursor,8);
+  await assert.rejects(invoke(f,'retainUnavailableRecord',{history_incarnation:page.historyIncarnation,source:'pull',record:page.changes[0],marker:{tableName:'kv',pk:'forged',originalKind:'put',serverVersion:6,reason:'invalid'}}),/source mismatch/);
+  const healthy=await invoke(f,'push',{ops:[op({pk:'poison',clock:7,hlc:'7:0:dev',payload:{id:'poison',name:'healthy',clock:7,deleted:false,created_at:1,updated_at:2}})]});assert.equal(healthy.results[0].success,true);
+  const repair=await invoke(f,'repairUnavailable',{history_incarnation:page.historyIncarnation,evidence_ref:page.unavailable[0].evidenceRef,replacement:{}});assert.equal(repair.status,'superseded');
+  assert.equal((await read(f)).server_version_counter[0].value,9);
+ });
+ await check('C2 snapshot: corrupt deletion revision is unavailable on the final page', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  await client.mutation(anyApi.syncProbe.insert,{table:'tombstones',value:{workspace_id:f.workspace,table_name:'kv',pk:'zz',deleted_at:-1,server_deleted_at:-1,clock:-1,hlc:'',op_id:'',server_version:5,created_at:1}});
+  let token,final;
+  do{final=await invoke(f,'snapshot',{tables:['kv'],page_size:1,page_token:token});token=final.nextPageToken;}while(token);
+  assert.equal(final.items.length,0);assert.equal(final.unavailable.length,1);assert.equal(final.unavailable[0].pk,'zz');assert.equal(final.unavailable[0].originalKind,'tombstone');
+  const original=await invoke(f,'exportUnavailable',{evidence_ref:final.unavailable[0].evidenceRef,chunk:0});assert.equal(JSON.parse(new TextDecoder().decode(original.data)).clock,-1);
  });
  await check('review: workspace removal drains persisted snapshot pages', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
@@ -192,15 +329,15 @@ try {
   const f=await client.mutation(anyApi.syncProbe.seed,{});
   const budgets=[];
   const measure=async(name,input)=>{const result=await invoke(f,name,{...input,__budget:true});budgets.push({name,bytes:result.bytes,reads:result.reads,written:result.written});assert(result.bytes<16*1024*1024);assert(result.written<16*1024*1024);return result.result;};
-  for(let i=0;i<70;i++){await Bun.sleep(350);const id='large-'+String(i).padStart(3,'0');const write=op({pk:id,payload:{id,name:'large',value:'x'.repeat(240*1024),clock:6,created_at:1,updated_at:2,deleted:false}});assert.equal((await invoke(f,'push',{ops:[write]})).results[0].success,true);}
+  for(let i=0;i<70;i++){await Bun.sleep(750);const id='large-'+String(i).padStart(3,'0');const write=op({pk:id,payload:{id,name:'large',value:'x'.repeat(240*1024),clock:6,created_at:1,updated_at:2,deleted:false}});assert.equal((await invoke(f,'push',{ops:[write]})).results[0].success,true);}
   let cursor=5,count=0;
   for(let i=0;i<100;i++){const page=await measure('pull',{cursor,limit:300});PullResponseSchema.parse(page);count+=page.changes.length;if(!page.hasMore)break;assert(page.nextCursor>cursor);cursor=page.nextCursor;}
   assert.equal(count,70);
   let token,countSnapshot=0;
-  for(let i=0;i<100;i++){if(token)await Bun.sleep(350);const request={tables:['kv'],page_size:300,page_token:token};const page=await measure('snapshot',request);if(token)assert.deepEqual(await measure('snapshot',request),page);SnapshotResponseSchema.parse(page);for(const item of page.items)if(item.kind==='row')TABLE_PAYLOAD_SCHEMAS.kv.parse(item.payload);countSnapshot+=page.items.length;if(!page.nextPageToken)break;assert.notEqual(page.nextPageToken,token);token=page.nextPageToken;}
+  for(let i=0;i<100;i++){if(token)await Bun.sleep(750);const request={tables:['kv'],page_size:300,page_token:token};const page=await measure('snapshot',request);if(token)assert.deepEqual(await measure('snapshot',request),page);SnapshotResponseSchema.parse(page);for(const item of page.items)if(item.kind==='row')TABLE_PAYLOAD_SCHEMAS.kv.parse(item.payload);countSnapshot+=page.items.length;if(!page.nextPageToken)break;assert.notEqual(page.nextPageToken,token);token=page.nextPageToken;}
   assert.equal(countSnapshot,72);
   // Overwrite the same records: each transaction creates a large preimage.
-  for(let i=0;i<70;i++){await Bun.sleep(350);const id='large-'+String(i).padStart(3,'0');assert.equal((await invoke(f,'push',{ops:[op({pk:id,clock:7,hlc:'7:0:dev',payload:{id,name:'large',value:'y'.repeat(240*1024),clock:7,created_at:1,updated_at:3,deleted:false}})]})).results[0].success,true);}
+  for(let i=0;i<70;i++){await Bun.sleep(750);const id='large-'+String(i).padStart(3,'0');assert.equal((await invoke(f,'push',{ops:[op({pk:id,clock:7,hlc:'7:0:dev',payload:{id,name:'large',value:'y'.repeat(240*1024),clock:7,created_at:1,updated_at:3,deleted:false}})]})).results[0].success,true);}
   const old=Math.floor(Date.now()/1000)-7200;
   // Patch one indexed page at a time; never use the unbounded fixture reader.
   for(let cursor=5;;){const page=await invoke(f,'pull',{cursor,limit:1});for(const change of page.changes)await client.mutation(anyApi.syncProbe.age,{workspace:f.workspace,version:change.serverVersion,old});if(!page.hasMore)break;cursor=page.nextCursor;}

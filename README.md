@@ -20,8 +20,8 @@ storage authoring validate through that source before persistence. Finalizers
 reject exhausted safe-integer clocks. New thread writes reject `fork_reason:
 null`; historical null values are omitted only from wire read payloads because
 null means no fork reason. Stored rows, revisions and replay fingerprints remain
-unchanged. Other historical corruption still fails closed: this provider does
-**not** advertise `unavailableRecords` or implement durable evidence/repair.
+unchanged. Other historical corruption is contained by durable unavailable
+markers and explicit operator repair; see the matching-contract setup below.
 
 Pull/watch, snapshot windows, preimage cleanup and combined GC reserve space for
 the next maximum-size Convex document before reading it. Pages can be shorter
@@ -30,7 +30,7 @@ use component-wise UTF-8 order; inclusive indexed seeks preserve NUL extensions
 of the preceding key. Snapshot tokens support the shared 65,536-character
 ceiling. Deploy this backend with a host/client supporting that ordering and
 limit; existing backend deployments and open legacy clients need separate
-qualification. This does not activate the host unavailable-record capability.
+qualification with the matching unavailable-record and history contracts.
 
 To refresh or verify generated-source parity against an explicitly selected
 committed host (no host runtime imports in the generated backend):
@@ -684,11 +684,113 @@ shared transaction read budget. Workspace deletion schedules a separate bounded
 purge for its cached pages. Deploy the scaffold to install the additive
 `sync_snapshot_pages` table.
 
-The provider does not advertise `unavailableRecords`. A visible historical
-change with an invalid operation ID fails the page instead of acknowledging a
-silently omitted version. Other malformed payloads still reach the host's strict
-validation and fail closed. Historical null thread fork reasons normalize to
-omission on reads without changing stored revisions or receipt fingerprints.
+The matching candidate implements `unavailableRecords: 'v1'` and
+`historyIncarnation: 'v1'` in gateway and direct modes. Deploy matching templates
+and initialize history before activating the matching host/browser. This source
+change does not qualify an already deployed older backend or publish a release.
+
+`sync.pullChecked` is a **mutation**: classification and durable evidence commit before a
+cursor or marker is returned. The old `sync.pull` query returns an explicit
+structured 426 update requirement. Reactive `watchChanges` queries carry only
+`{historyIncarnation, version}`; direct delivery pulls checked pages and awaits
+`onPage` before advancing. Both protocols require `history_incarnation_capability:
+'incarnation-v1'`, `unavailable_record_capability: 'unavailable-v1'` and the expected
+`history_incarnation` outside operation fingerprints. Incapable callers receive
+structured `OR3_SYNC_UPDATE_REQUIRED` / 426 data. Unbound pull returns an empty
+snapshot-required envelope; old-history push/ACK rejects with structured
+`OR3_SYNC_HISTORY_CHANGED` / 409 before receipt lookup or mutation.
+
+Malformed stored envelopes/payloads become exact host unavailable markers.
+Healthy entries and markers share count/byte limits and complete coverage.
+Untrustworthy identity/order/version still fails the operation. Unknown-owner
+notification evidence stays private. Historical `fork_reason: null` is losslessly
+omitted on wire reads without changing storage/revisions/fingerprints; absent
+legacy revisions retain the existing baseline, while explicitly invalid stored
+revisions are contained.
+
+`sync_unavailable_records` stores bounded metadata/provenance and resolution.
+`sync_unavailable_sources` stores original Convex user fields without a wrapper,
+so the original 1 MiB document/depth ceiling still applies; the header preserves
+the original system ID/time. Originals are copied as native Convex values,
+including bytes/Int64/nonfinite numbers, rather than expanding them into escaped
+JSON for persistence. Neither table is collected by log GC, snapshot expiry,
+workspace removal or history reset. Deduplication includes history and the exact
+source revision. Ordinary read budgets remain 10 MiB / 4,000 documents with 6 MiB
+reserved for bounded metadata/point reads. Storage failures reject coverage.
+
+Privileged operator actions are `sync.unavailable.inspect`, `.export`,
+`.revalidate`, `.repair` through the existing provider-admin API. Inspect accepts
+`cursor` and returns 25 bounded summaries. Other actions require `evidenceRef`;
+export also requires integer `chunk` and returns at most 32,768 bytes of
+`convex-json-utf8` plus `chunks`. Concatenate chunks, UTF-8 decode, JSON parse and
+use `jsonToConvex` from `convex/values` to reconstruct original values. Revalidate
+reports the current canonical defect/status. Repair requires `historyIncarnation`
+and explicit `replacement` (or `operation:'delete'`); it authorizes the current
+workspace and commits a fresh UUID, strictly winning safe clock, normal writer
+transaction/server version and resolution atomically. A newer winner marks old
+evidence superseded; invalid/exhausted clocks require explicit offline recovery.
+Old-history evidence remains exportable but cannot authorize new-history repair.
+
+### History initialization and managed replacement
+
+History is deployment-wide, not per workspace. After the first matching schema
+upgrade, explicitly call admin-only `syncHistory:initialize` with one fresh UUID,
+then repeat `syncHistory:finishReplacement` with the returned `attemptId` until
+`ready:true`. This is a one-time migration: repeated initialization preserves an
+existing token. Ordinary reads, deploys, restarts, repairs, backup capture and GC
+never mint/rotate one. Missing/invalid initialized state fails closed.
+
+A **database replacement** means importing/restoring the complete deployment's
+application tables (including restored sync metadata/evidence), or replacing a
+self-hosted deployment's complete database plus matching object-storage snapshot.
+A restored deployment must be an **isolated candidate**: stop application,
+background and maintenance writers; drain old handlers and close watchers;
+prevent direct clients/gateway access and scheduled writers until the replacement
+gate completes. Hot imports into a serving deployment and partial-workspace
+restores are unsupported. Preserve and pin a checksum-verified pre-replacement
+backup, including any unresolved evidence; reset never merges/discards it.
+
+The provider supplies `scripts/history.mjs`, shipped in the package. Use the
+exact matching package and set target `CONVEX_SELF_HOSTED_URL` (or `CONVEX_URL`),
+its admin/deploy key, `OR3_CONVEX_BACKUP_SHA256` and
+`OR3_CONVEX_TEMPLATE_DIGEST`. Keep the journal **outside** all replaced data and
+archived configuration:
+
+```sh
+node node_modules/or3-provider-convex/scripts/history.mjs prepare /external/new-attempt.json
+# Import the authenticated complete backup into the isolated candidate.
+node node_modules/or3-provider-convex/scripts/history.mjs complete /external/new-attempt.json
+```
+
+`prepare` exclusively creates/fsyncs a new attempt and UUID before extraction.
+`complete` verifies the exact template, fsyncs resetting state, fences all sync
+endpoints, drains all snapshot headers/cached pages/device ACKs in bounded
+transactions, then atomically installs the token and opens the provider gate.
+It verifies and fsyncs completion; a retry reconciles the same stopped candidate.
+A new extraction, repeated restore, rollback or safety recovery always uses a
+**fresh journal path/attempt**. Never reuse a completed attempt for restored
+bytes. Once candidate startup might have served, never automatically restore
+older bytes. Only then release the isolated candidate to compatible writers.
+Keep the prior deployment/safety backup until post-startup acceptance.
+
+Canonical rows, tombstones, logs/counters and evidence survive rotation. No
+numeric floor/counter bump is invented. Tokens include incarnation, so restored
+pre-reset snapshot tokens reject even under the new request token. Evidence at
+reused versions has separate provenance. Explicit resets remain admin-only;
+incarnation grants no workspace access.
+
+Qualification uses an official disposable local backend, real snapshot table
+imports, interrupted reset reconciliation, exact repeated restoration, both
+shipped HTTP readers, poison/repair/GC cases and C1 large-record bounds. The cached
+2026-09-21 local backend rejects its own whole ZIP export at
+`retained_storage/generated_schema`; the lifecycle fixture therefore imports
+unchanged `documents.jsonl` archive members through its supported table API.
+That fixture precedes byte-valued cache fixtures because this backend's standalone
+JSONL importer also lacks generated-schema byte conversion. The authenticated
+archive is never rewritten. These are local backend import limitations, not a
+claim of hosted Convex import/browser sign-in/deployment certification. Real
+production restore tooling must support the exact snapshot value codecs and
+storage bytes; provider reset does not itself extract or certify a backup.
 
 CI and tag qualification check out the exact host commit recorded in
 `templates/convex/syncContract/source.json` and compare every generated validator
