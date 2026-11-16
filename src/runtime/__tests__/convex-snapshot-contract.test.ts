@@ -4,7 +4,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
-import { ChangeStampSchema } from "~~/shared/sync/schemas";
+import { compareSyncTuple, ChangeStampSchema } from "~~/shared/sync/schemas";
 import { readRequestUsage } from "~~/shared/chat/compaction";
 import templateSchema from "../../../templates/convex/schema";
 import { convexJobProvider } from "../server/background-jobs/convex-provider";
@@ -32,12 +32,16 @@ vi.mock("../server/utils/convex-gateway", () => ({
   buildGatewayAdminIdentity: () => ({}),
 }));
 
-const syncFunctions = await import(
+const importedSyncFunctions = await import(
   /* @vite-ignore */ new URL(
     "../../../templates/convex/sync.ts",
     import.meta.url,
   ).href
 );
+const syncFunctions = Object.fromEntries(Object.entries(importedSyncFunctions).map(([name, raw]) => {
+  const fn = raw as RegisteredFunction;
+  return [name, fn?._handler ? { ...fn, _handler: (ctx: any, args: any) => fn._handler(ctx, { history_incarnation: 'fixture-history', history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', ...args }) } : raw];
+}));
 const notificationFunctions = await import(
   /* @vite-ignore */ new URL(
     "../../../templates/convex/notifications.ts",
@@ -58,7 +62,7 @@ type Row = Record<string, any> & { _id: string };
 type FixtureTables = Record<string, Row[]> & Record<
   "auth_accounts" | "workspaces" | "workspace_members" | "server_version_counter" |
   "device_cursors" | "messages" | "projects" | "threads" | "tombstones" |
-  "upload_intents" | "sync_record_versions" | "sync_snapshot_sessions" |
+  "upload_intents" | "sync_record_versions" | "sync_snapshot_sessions" | "sync_snapshot_pages" |
   "change_log" | "file_meta" | "kv" | "notifications" | "posts", Row[]>;
 
 afterEach(() => vi.unstubAllGlobals());
@@ -91,11 +95,12 @@ const INDEX_FIELDS: Record<string, string[]> = {
   by_history_order: ["workspace_id", "thread_id", "index", "order_key", "id"],
   by_workspace_thread: ["workspace_id", "thread_id"],
   by_op_id: ["op_id"],
+  by_page: ["session_id", "table_index", "after_pk", "page_size", "chunk"],
 };
 
 class MemoryQuery {
   private conditions: Array<{
-    op: "eq" | "gt" | "lt" | "lte";
+    op: "eq" | "gt" | "gte" | "lt" | "lte";
     field: string;
     value: unknown;
   }> = [];
@@ -118,6 +123,10 @@ class MemoryQuery {
         this.conditions.push({ op: "gt", field, value });
         return chain;
       },
+      gte: (field: string, value: unknown) => {
+        this.conditions.push({ op: "gte", field, value });
+        return chain;
+      },
       lt: (field: string, value: unknown) => {
         this.conditions.push({ op: "lt", field, value });
         return chain;
@@ -135,6 +144,8 @@ class MemoryQuery {
     this.direction = direction;
     return this;
   }
+
+  async unique(): Promise<Row | null> { return this.first(); }
 
   async first(): Promise<Row | null> {
     return this.materialize()[0] ?? null;
@@ -158,13 +169,23 @@ class MemoryQuery {
     const filtered = this.rows.filter((row) =>
       this.conditions.every(({ op, field, value }) => {
         if (op === "eq") return row[field] === value;
+        if (typeof row[field] === "string" && typeof value === "string") {
+          const order = compareSyncTuple([row[field]], [value]);
+          return op === "gt" ? order > 0 : op === "gte" ? order >= 0 : op === "lt" ? order < 0 : order <= 0;
+        }
         if (op === "gt") return row[field] > (value as any);
+        if (op === "gte") return row[field] >= (value as any);
         if (op === "lt") return row[field] < (value as any);
         return row[field] <= (value as any);
       }),
     );
     filtered.sort((left, right) => {
       for (const field of fields) {
+        if (typeof left[field] === "string" && typeof right[field] === "string") {
+          const order = compareSyncTuple([left[field]], [right[field]]);
+          if (order) return this.direction === "asc" ? order : -order;
+          continue;
+        }
         if (left[field] < right[field])
           return this.direction === "asc" ? -1 : 1;
         if (left[field] > right[field])
@@ -178,6 +199,8 @@ class MemoryQuery {
 
 function createFixture(role: "viewer" | "editor" = "viewer") {
   const tables: FixtureTables = {
+    sync_history: [{ _id: 'history', key: 'history', incarnation: 'fixture-history', phase: 'ready' }],
+    sync_unavailable_records: [], sync_unavailable_sources: [],
     auth_accounts: [
       {
         _id: "account-1",
@@ -212,6 +235,7 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
         _id: "message-doc-1",
         workspace_id: "ws-1",
         id: "message-1",
+        thread_id: "thread-a", role: "assistant", index: 1, order_key: "a", created_at: 1, updated_at: 1,
         deleted: false,
         data: { text: "hello" },
         clock: 1,
@@ -240,6 +264,7 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
         _id: "thread-doc-a",
         workspace_id: "ws-1",
         id: "thread-a",
+        status: "active", pinned: false, forked: false, created_at: 1, updated_at: 1,
         title: "before",
         deleted: false,
         clock: 4,
@@ -251,6 +276,7 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
         _id: "thread-doc-b",
         workspace_id: "ws-1",
         id: "thread-b",
+        status: "active", pinned: false, forked: false, created_at: 1, updated_at: 1,
         title: "stable",
         deleted: false,
         clock: 5,
@@ -276,6 +302,7 @@ function createFixture(role: "viewer" | "editor" = "viewer") {
     upload_intents: [],
     sync_record_versions: [],
     sync_snapshot_sessions: [],
+    sync_snapshot_pages: [],
     change_log: [],
     file_meta: [],
     kv: [],
@@ -381,7 +408,7 @@ describe("Convex background request usage persistence", () => {
     const adapter = new ConvexSyncGatewayAdapter();
     const admission = { version: 1 as const, kind: "continuation" as const, admissionId: "admission", generationId: "generation-1", expectedAssistant: { clock: 1 },
       workspaceId: "ws-1", threadId: "thread-a", messageId: "message-1",
-      assistantMessage: { id: "message-1", clock: 2, pending: true, thread_id: "thread-a", role: "assistant" as const, data: { generation_id: "generation-1" } } };
+      assistantMessage: { id: "message-1", index: 1, order_key: "b", deleted: false, created_at: 1, updated_at: 1, clock: 2, pending: true, thread_id: "thread-a", role: "assistant" as const, data: { generation_id: "generation-1" } } };
     const actor = { userId: "user-1", workspaceId: "ws-1" };
     await adapter.admitChatGeneration(actor, admission);
     const content = "read content ".repeat(1800);
@@ -393,7 +420,7 @@ describe("Convex background request usage persistence", () => {
     await adapter.retainChatToolResult!(actor, structuredClone(input));
     expect(fixture.tables.server_version_counter[0]!.value).toBe(version);
     expect(await adapter.readChatToolResult!(actor, { admission, callId: "read", reference: prepared.result })).toBe(content);
-    const pulled = await (syncFunctions.pull as RegisteredFunction)._handler(fixture.ctx, { workspace_id: "ws-1", cursor: 5, limit: 100 });
+    const pulled = await (syncFunctions.pullChecked as RegisteredFunction)._handler(fixture.ctx, { workspace_id: "ws-1", cursor: 5, limit: 100 });
     const chunks = new Map(pulled.changes.filter((change: any) => change.tableName === "kv").map((change: any) => {
       expect(ChangeStampSchema.safeParse(change.stamp).success).toBe(true);
       return [change.pk, change.payload];
@@ -427,10 +454,10 @@ describe("Convex background request usage persistence", () => {
     const admission = {
       version: 1 as const, kind: "new-turn" as const, admissionId: "admission-1", generationId: "generation-1",
       workspaceId: "ws-1", threadId: "thread-a", messageId: "message-1",
-      thread: { id: "thread-a", clock: 1 },
-      assistantMessage: { id: "message-1", thread_id: "thread-a", role: "assistant", clock: 1,
+      thread: { id: "thread-a", status: "active", pinned: false, forked: false, deleted: false, created_at: 1, updated_at: 1, clock: 1 },
+      assistantMessage: { id: "message-1", thread_id: "thread-a", role: "assistant", index: 1, order_key: "b", deleted: false, created_at: 1, updated_at: 1, clock: 1,
         data: { generation_id: "generation-1" } },
-      userMessage: { id: "user-message", thread_id: "thread-a", role: "user", clock: 1 },
+      userMessage: { id: "user-message", thread_id: "thread-a", role: "user", index: 0, order_key: "a", deleted: false, created_at: 1, updated_at: 1, clock: 1 },
     };
     const jobId = await convexJobProvider.createJob({
       userId: "user-1", threadId: "thread-a", messageId: "message-1", model: "test-model",
@@ -656,7 +683,7 @@ describe("Convex background request usage persistence", () => {
     const finalize = (syncFunctions.finalizeChatGeneration as RegisteredFunction)._handler;
     expect(await finalize(fixture.ctx, input)).toMatchObject({ status: "committed", replayed: false });
     expect(fixture.tables.messages[0]!.data).toMatchObject({ usage: measuredUsage(), compaction: { marker: "keep" }, custom: "keep", generation_id: "generation-1", content: "final text" });
-    const pulled = await (syncFunctions.pull as RegisteredFunction)._handler(fixture.ctx, { workspace_id: "ws-1", cursor: 5, limit: 10 });
+    const pulled = await (syncFunctions.pullChecked as RegisteredFunction)._handler(fixture.ctx, { workspace_id: "ws-1", cursor: 5, limit: 10 });
     expect(pulled.changes[0].payload.data.usage).toEqual(measuredUsage());
     expect(await finalize(fixture.ctx, input)).toMatchObject({ status: "committed", replayed: true });
     expect(fixture.tables.change_log).toHaveLength(1);
@@ -1071,6 +1098,7 @@ describe("Convex materialized snapshot contract", () => {
           operation: "put",
           pk: "message-dead",
           payload: {
+            id: "message-dead",
             thread_id: "thread-a",
             role: "user",
             index: 1,
@@ -1097,6 +1125,7 @@ describe("Convex materialized snapshot contract", () => {
           operation: "put",
           pk: "message-dead",
           payload: {
+            id: "message-dead",
             thread_id: "thread-a",
             role: "user",
             index: 1,
@@ -1480,6 +1509,7 @@ describe("Convex materialized snapshot contract", () => {
       server_version: 4,
       kind: "row",
       payload: {
+        status: "active", pinned: false, forked: false, created_at: 1, updated_at: 1,
         id: "thread-a",
         title: "before",
         deleted: false,
@@ -1539,6 +1569,7 @@ describe("Convex materialized snapshot contract", () => {
         pk: "thread-a",
         payload: {
           id: "thread-a",
+          status: "active", pinned: false, forked: false, created_at: 1, updated_at: 1,
           title: "before",
           deleted: false,
           clock: 4,
@@ -1557,7 +1588,8 @@ describe("Convex materialized snapshot contract", () => {
     expect(
       new Set(allItems.map((item: any) => `${item.tableName}:${item.pk}`)).size,
     ).toBe(allItems.length);
-    expect(fixture.takeCounts.every((count) => count <= 3)).toBe(true);
+    // Continuation replay reads at most four bounded response chunks.
+    expect(fixture.takeCounts.every((count) => count <= 4)).toBe(true);
   });
 
   it("binds opaque continuation tokens to the original table filter", async () => {
@@ -1612,10 +1644,10 @@ describe("Convex materialized snapshot contract", () => {
     ).rejects.toThrow("unavailable");
   });
 
-  it("mints UUID op_ids for notifications.create and skips legacy prefixed ids on pull", async () => {
+  it("mints UUID op_ids and durably contains legacy prefixed ids", async () => {
     const fixture = createFixture("editor");
     const create = (notificationFunctions.create as RegisteredFunction)._handler;
-    const pull = (syncFunctions.pull as RegisteredFunction)._handler;
+    const pull = (syncFunctions.pullChecked as RegisteredFunction)._handler;
     const id = await create(fixture.ctx, {
       workspace_id: "ws-1",
       user_id: "user-1",
@@ -1648,20 +1680,10 @@ describe("Convex materialized snapshot contract", () => {
     fixture.tables.server_version_counter[0]!.value = created!.server_version + 1;
 
     const page = await pull(fixture.ctx, {
-      workspace_id: "ws-1",
-      cursor: created!.server_version - 1,
-      limit: 50,
+      workspace_id: "ws-1", cursor: created!.server_version - 1, limit: 50,
     });
-    expect(page.changes.every((change: { stamp: { opId: string } }) =>
-      ChangeStampSchema.shape.opId.safeParse(change.stamp.opId).success
-    )).toBe(true);
-    expect(page.changes.map((change: { pk: string }) => change.pk)).toContain(id);
-    expect(page.changes.map((change: { pk: string }) => change.pk)).not.toContain(
-      "legacy-note",
-    );
-    expect(page.nextCursor).toBe(created!.server_version + 1);
-    expect(page.oldestRetainedVersion).toBeGreaterThan(0);
-    expect(page.requiresSnapshot).toBe(false);
+    expect(page.unavailable).toEqual([expect.objectContaining({ pk: 'legacy-note', originalKind: 'put' })]);
+    expect(fixture.tables.sync_unavailable_records).toHaveLength(1);
   });
 
   it("rejects a non-UUID op_id before allocating a server version", async () => {
@@ -1697,6 +1719,7 @@ describe("Convex materialized snapshot contract", () => {
     const normal = (syncFunctions.snapshot as RegisteredFunction)._handler;
     const trash = { _id: 'trash-file', workspace_id: 'ws-1', hash: 'sha256:' + 'a'.repeat(64),
       storage_id: 'old-blob', storage_provider_id: 'convex', size_bytes: 8, name: 'original.txt', mime_type: 'text/plain', kind: 'file',
+      created_at: 1, updated_at: 2, ref_count: 0,
       deleted: true, deleted_at: 2, clock: 2, hlc: '2:0:dev', op_id: 'op-2', server_version: 2 };
     fixture.tables.file_meta.push(trash, { ...trash, _id: 'second-file', hash: 'sha256:' + 'b'.repeat(64) });
     const first = await backup(fixture.ctx, { workspace_id: 'ws-1', page_size: 1, tables: ['file_meta'] });

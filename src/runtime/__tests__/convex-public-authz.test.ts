@@ -45,7 +45,8 @@ type RegisteredFunction = {
 };
 
 function registered(value: unknown): RegisteredFunction {
-    return value as RegisteredFunction;
+    const fn = value as RegisteredFunction;
+    return { ...fn, _handler: (ctx, args) => fn._handler(ctx, { history_incarnation: 'fixture-history', history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', ...args }) };
 }
 
 function makeCtx(options: {
@@ -67,6 +68,7 @@ function makeCtx(options: {
             };
             build(chain);
             return {
+                unique: async () => table === 'sync_history' ? { incarnation: 'fixture-history', phase: 'ready' } : null,
                 first: vi.fn(async () => {
                     if (table === 'auth_accounts') {
                         return { _id: 'account-1', user_id: userId };
@@ -118,6 +120,7 @@ function makeDirectCtx(options: {
             };
             build(chain);
             return {
+                unique: async () => table === 'sync_history' ? { incarnation: 'fixture-history', phase: 'ready' } : null,
                 first: vi.fn(async () => {
                     if (table === 'auth_accounts') {
                         return { _id: 'account-1', user_id: userId };
@@ -131,15 +134,19 @@ function makeDirectCtx(options: {
                 order: vi.fn(() => ({
                     first: vi.fn(async () => null),
                     take: vi.fn(async () => []),
+                    [Symbol.asyncIterator]: async function* () {},
                 })),
                 take: vi.fn(async () => []),
+                    [Symbol.asyncIterator]: async function* () {},
             };
         },
         order: vi.fn(() => ({
             first: vi.fn(async () => null),
             take: vi.fn(async () => []),
+                    [Symbol.asyncIterator]: async function* () {},
         })),
         take: vi.fn(async () => []),
+                    [Symbol.asyncIterator]: async function* () {},
     }));
 
     return {
@@ -177,6 +184,7 @@ function makeNotificationSyncCtx(changes: Array<Record<string, unknown>> = []) {
             };
             build(chain);
             return {
+                unique: async () => table === 'sync_history' ? { incarnation: 'fixture-history', phase: 'ready' } : null,
                 first: vi.fn(async () => {
                     if (table === 'auth_accounts') {
                         return { _id: 'account-1', user_id: 'user-1' };
@@ -185,12 +193,13 @@ function makeNotificationSyncCtx(changes: Array<Record<string, unknown>> = []) {
                         return { _id: 'member-1', user_id: 'user-1', role: 'editor' };
                     }
                     if (table === 'server_version_counter') {
-                        return { _id: 'counter-1', value: 0 };
+                        return { _id: 'counter-1', value: changes.at(-1)?.server_version ?? 0 };
                     }
                     return null;
                 }),
                 order: vi.fn(() => ({
                     take: vi.fn(async () => changes),
+                    [Symbol.asyncIterator]: async function* () { yield* changes; },
                     first: vi.fn(async () => {
                         if (table === 'change_log' && changes[0]) {
                             return changes[0];
@@ -651,12 +660,12 @@ describe('Convex authorization boundary', () => {
         ];
         const readCtx = makeNotificationSyncCtx(changes);
 
-        const pulled = await registered(syncFunctions.pull)._handler(readCtx.ctx, {
+        const pulled = await registered(syncFunctions.pullChecked)._handler(readCtx.ctx, {
             workspace_id: 'workspace-1',
             cursor: 0,
             limit: 10,
         });
-        expect(pulled.changes.map((change: { pk: string }) => change.pk)).toEqual([
+        expect([...pulled.changes, ...pulled.unavailable].map((change: { pk: string }) => change.pk)).toEqual([
             'thread-1',
             'notification-own',
         ]);
@@ -670,11 +679,7 @@ describe('Convex authorization boundary', () => {
                 limit: 10,
             }
         );
-        expect(watched.changes.map((change: { pk: string }) => change.pk)).toEqual([
-            'thread-1',
-            'notification-own',
-        ]);
-        expect(watched.latestVersion).toBe(3);
+        expect(watched).toEqual({ historyIncarnation: 'fixture-history', version: 3 });
 
         const writeCtx = makeNotificationSyncCtx();
         const pushed = await registered(syncFunctions.push)._handler(writeCtx.ctx, {
@@ -836,7 +841,7 @@ describe('Convex authorization boundary', () => {
             role: 'viewer',
         });
 
-        await expect(registered(syncFunctions.pull)._handler(viewer.ctx, {
+        await expect(registered(syncFunctions.pullChecked)._handler(viewer.ctx, {
             workspace_id: 'workspace-1',
             cursor: 0,
             limit: 10,

@@ -19,7 +19,7 @@ const root = await mkdtemp(join(tmpdir(), 'or3-convex-upgrade-'));
 await mkdir(evidence, { recursive: true });
 await cp(join(host, 'shared'), join(root, 'shared'), { recursive: true });
 const dependencies = {};
-for (const name of ['convex', 'typescript', '@types/node']) {
+for (const name of ['convex', 'zod', 'typescript', '@types/node']) {
     dependencies[name] = JSON.parse(await readFile(join(host, 'node_modules', name, 'package.json'), 'utf8')).version;
 }
 await writeFile(join(root, 'package.json'), JSON.stringify({ private: true, type: 'module', dependencies }));

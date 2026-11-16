@@ -1,3 +1,4 @@
+import { MAX_SYNC_SNAPSHOT_TOKEN_LENGTH, compareSyncTuple } from './syncContract/shared/sync/schemas';
 /** Snapshot candidates, revision ordering and preimages shared by all sync writers. */
 import type { MutationCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
@@ -13,6 +14,7 @@ export type SnapshotRevision = {
 
 export type SnapshotCandidate =
     | {
+          source?: unknown;
           kind: 'row';
           tableName: string;
           pk: string;
@@ -21,6 +23,7 @@ export type SnapshotCandidate =
           serverVersion?: number;
       }
     | {
+          source?: unknown;
           kind: 'tombstone';
           tableName: string;
           pk: string;
@@ -33,6 +36,7 @@ export type SnapshotCandidate =
 
 export type SnapshotCursorToken = {
     version: 1;
+    historyIncarnation?: string;
     snapshotId: string;
     tableIndex: number;
     afterPk: string | null;
@@ -50,7 +54,7 @@ export function normalizeSnapshotTables(
             throw new Error(`Invalid snapshot table: ${table}`);
         }
     }
-    return normalized.sort();
+    return normalized.sort((a, b) => compareSyncTuple([a], [b]));
 }
 
 export function compareSnapshotRevisions(
@@ -86,14 +90,16 @@ export function resolveSnapshotWinner(
 
 export function encodeSnapshotCursor(token: SnapshotCursorToken): string {
     const asciiJson = encodeURIComponent(JSON.stringify(token));
-    return btoa(asciiJson)
+    const encoded = btoa(asciiJson)
         .replace(/\+/g, '-')
         .replace(/\//g, '_')
         .replace(/=+$/u, '');
+    if (encoded.length > MAX_SYNC_SNAPSHOT_TOKEN_LENGTH) throw new Error('Invalid snapshot page token');
+    return encoded;
 }
 
 export function decodeSnapshotCursor(value: string): SnapshotCursorToken {
-    if (!value || value.length > 4096) throw new Error('Invalid snapshot page token');
+    if (!value || value.length > MAX_SYNC_SNAPSHOT_TOKEN_LENGTH) throw new Error('Invalid snapshot page token');
     try {
         const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
         const padding = '='.repeat((4 - (base64.length % 4)) % 4);
@@ -134,20 +140,25 @@ export function legacySnapshotRevision(
     pk: string,
     value: { clock?: number; hlc?: string; op_id?: string }
 ): SnapshotRevision {
-    const clock = Number.isInteger(value.clock) && (value.clock as number) >= 0
-        ? (value.clock as number)
-        : 0;
-    const hlc = typeof value.hlc === 'string' && value.hlc.length > 0
-        ? value.hlc
-        : `legacy-${clock}`;
-    const opId = typeof value.op_id === 'string' && value.op_id.length > 0
-        ? value.op_id
-        : `legacy:${tableName}:${pk}:${clock}:${hlc}`;
+    const clock = value.clock ?? 0;
+    const hlc = value.hlc ?? `legacy-${clock}`;
+    const opId = value.op_id ?? `legacy:${tableName}:${pk}:${clock}:${hlc}`;
     return { clock, hlc, opId };
+}
+
+/** Null carried no fork reason in historical Convex rows. Omission is lossless;
+ * keep stored revisions and receipt fingerprints unchanged. Other defects fail
+ * closed until durable unavailable-record recovery is implemented. */
+export function normalizeHistoricalSyncPayload(table: string, payload: unknown): unknown {
+    if (table !== 'threads' || !payload || typeof payload !== 'object' || Array.isArray(payload) ||
+        (payload as Record<string, unknown>).fork_reason !== null) return payload;
+    const { fork_reason, ...normalized } = payload as Record<string, unknown>;
+    return normalized;
 }
 
 function snapshotPayloadFromDoc(
     doc: MaterializedDoc,
+    tableName: string,
     pkField: string,
     pk: string,
     revision: SnapshotRevision
@@ -166,7 +177,7 @@ function snapshotPayloadFromDoc(
     void server_version;
     void op_id;
     return {
-        ...payload,
+        ...normalizeHistoricalSyncPayload(tableName, payload) as Record<string, unknown>,
         [pkField]: pk,
         clock: revision.clock,
         hlc: revision.hlc,
@@ -185,23 +196,25 @@ export function materializedSnapshotCandidate(
     const serverVersion = serverVersionOverride ?? doc.server_version ?? 0;
     if (doc.deleted === true) {
         return {
+            source: doc,
             kind: 'tombstone',
             tableName,
             pk,
             revision,
-            ...(tableName === 'file_meta' ? { payload: snapshotPayloadFromDoc(doc, getPkField(tableName), pk, revision) } : {}),
+            ...(tableName === 'file_meta' ? { payload: snapshotPayloadFromDoc(doc, tableName, getPkField(tableName), pk, revision) } : {}),
             serverDeletedAt:
-                typeof doc.deleted_at === 'number' && doc.deleted_at >= 0
-                    ? Math.floor(doc.deleted_at)
+                typeof doc.deleted_at === 'number'
+                    ? doc.deleted_at
                     : nowSec(),
             serverVersion,
         };
     }
     return {
+        source: doc,
         kind: 'row',
         tableName,
         pk,
-        payload: snapshotPayloadFromDoc(doc, getPkField(tableName), pk, revision),
+        payload: snapshotPayloadFromDoc(doc, tableName, getPkField(tableName), pk, revision),
         revision,
         serverVersion,
     };

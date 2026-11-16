@@ -140,6 +140,11 @@ export function throwAsConvexServiceUnavailable(
     error: unknown,
     statusMessage: string
 ): never {
+    const data = error && typeof error === 'object' && 'data' in error ? error.data : undefined;
+    if (data && typeof data === 'object' && 'code' in data && typeof data.code === 'string' && data.code.startsWith('OR3_SYNC_')) {
+        const statusCode = 'statusCode' in data && typeof data.statusCode === 'number' ? data.statusCode : 503;
+        throw createError({ statusCode, statusMessage: data.code, data });
+    }
     if ([...walkErrorChain(error)].some(node => typeof node.message === 'string' && node.message.includes('OR3_WORKSPACE_ITEM_UPDATE_REQUIRED'))) {
         throw createError({ statusCode: 426, statusMessage: 'Update OR3 Chat to use workspace Files and Trash',
             data: { code: 'OR3_WORKSPACE_ITEM_UPDATE_REQUIRED', requiredCapability: 'v1' } });

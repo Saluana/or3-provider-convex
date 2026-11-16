@@ -19,6 +19,8 @@ import type {
 } from '~~/server/sync/gateway/types';
 import type {
     PendingOp,
+    PullUnavailableRecord,
+    SnapshotUnavailableRecord,
     PullRequest,
     PullResponse,
     SnapshotRequest,
@@ -381,13 +383,15 @@ async function getSyncGcAdminClient(event: H3Event) {
  */
 export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
     id = 'convex';
-    async watchVersion(_event: H3Event, scope: { workspaceId: string }, onVersion: (version: number) => void,
+    async watchVersion(_event: H3Event, scope: { workspaceId: string }, onVersion: (position: { historyIncarnation: string; version: number }) => void,
         onError: (error: unknown) => void): Promise<() => void> {
         return watchConvexVersion(scope.workspaceId, onVersion, onError);
     }
 
     readonly capabilities = {
         snapshotBootstrap: 'snapshot-v1',
+        unavailableRecords: 'v1',
+        historyIncarnation: 'v1',
         historyRetention: 'snapshot-v1',
         backgroundGenerationHistory: 'v1',
         canonicalChatHistory: 'v1',
@@ -540,13 +544,46 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
             admission_clock: admission.assistantMessage.clock, fingerprint: fingerprint(admission) };
     }
 
+    async retainUnavailableRecord(event: H3Event, input: { scope: { workspaceId: string }; source: 'pull' | 'snapshot'; historyIncarnation?: string; record: unknown; marker: Omit<PullUnavailableRecord, 'evidenceRef'> | Omit<SnapshotUnavailableRecord, 'evidenceRef'> }): Promise<{ evidenceRef: string }> {
+        const client = await getSyncGatewayClient(event);
+        try {
+            return await client.mutation(api.sync.retainUnavailableRecord, {
+                workspace_id: toWorkspaceId(input.scope.workspaceId), history_incarnation: input.historyIncarnation,
+                history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1',
+                source: input.source, marker: input.marker, record: input.record,
+            });
+        } catch (error) { throwAsConvexServiceUnavailable(error, 'Evidence retention unavailable'); }
+    }
+
+    async manageUnavailable(event: H3Event, workspaceId: string, action: 'inspect' | 'export' | 'revalidate' | 'repair', payload: Record<string, unknown> = {}) {
+        const client = await getSyncGcAdminClient(event);
+        const workspace_id = toWorkspaceId(workspaceId);
+        if (action === 'inspect') return client.query(internalApi.sync.inspectUnavailable, { workspace_id, cursor: payload.cursor });
+        if (typeof payload.evidenceRef !== 'string') throw createError({ statusCode: 400, statusMessage: 'Evidence reference required' });
+        const args = { workspace_id, evidence_ref: payload.evidenceRef };
+        if (action === 'export') return client.query(internalApi.sync.exportUnavailable, { ...args, chunk: payload.chunk });
+        if (action === 'revalidate') return client.query(internalApi.sync.revalidateUnavailable, args);
+        try {
+            return await client.mutation(internalApi.sync.repairUnavailable, { ...args, history_incarnation: payload.historyIncarnation,
+                replacement: payload.replacement, operation: payload.operation });
+        } catch (error) { throwAsConvexServiceUnavailable(error, 'Evidence repair unavailable'); }
+    }
+
+    async getHistoryIncarnation(event: H3Event, scope: { workspaceId: string }): Promise<string> {
+        const client = await getSyncGatewayClient(event);
+        return await client.query(api.sync.getHistoryIncarnation, { workspace_id: toWorkspaceId(scope.workspaceId) });
+    }
+
     async pull(event: H3Event, input: PullRequest): Promise<PullResponse> {
         const client = await getSyncGatewayClient(event);
         try {
-            const result = await withConvexTransportRetry('sync.pull', () =>
-                client.query(api.sync.pull, {
+            const result = await withConvexTransportRetry('sync.pullChecked', () =>
+                client.mutation(api.sync.pullChecked, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     workspace_item_capability: input.workspaceItemCapability,
+                    history_incarnation: input.historyIncarnation,
+                    history_incarnation_capability: 'incarnation-v1',
+                    unavailable_record_capability: 'unavailable-v1',
                     cursor: input.cursor,
                     limit: input.limit,
                     tables: input.tables,
@@ -564,6 +601,8 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                     payload: change.payload,
                     stamp: change.stamp,
                 })),
+                historyIncarnation: result.historyIncarnation,
+                unavailable: result.unavailable,
                 nextCursor: result.nextCursor,
                 hasMore: result.hasMore,
                 oldestRetainedVersion: result.oldestRetainedVersion,
@@ -581,6 +620,9 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                 client.mutation(api.sync.snapshot, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     workspace_item_capability: input.workspaceItemCapability,
+                    history_incarnation: input.historyIncarnation,
+                    history_incarnation_capability: 'incarnation-v1',
+                    unavailable_record_capability: 'unavailable-v1',
                     page_size: input.pageSize,
                     page_token: input.pageToken,
                     tables: input.tables,
@@ -600,6 +642,9 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                 client.mutation(internalApi.sync.backupSnapshot, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     workspace_item_capability: input.workspaceItemCapability,
+                    history_incarnation: input.historyIncarnation,
+                    history_incarnation_capability: 'incarnation-v1',
+                    unavailable_record_capability: 'unavailable-v1',
                     page_size: input.pageSize,
                     page_token: input.pageToken,
                     tables: input.tables,
@@ -638,6 +683,10 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                 client.mutation(api.sync.push, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     workspace_item_capability: input.workspaceItemCapability,
+                    stored_record_capability: input.storedRecordCapability,
+                    history_incarnation: input.historyIncarnation,
+                    history_incarnation_capability: 'incarnation-v1',
+                    unavailable_record_capability: 'unavailable-v1',
                     ops: input.ops.map((op) => ({
                         op_id: op.stamp.opId,
                         table_name: op.tableName,
@@ -714,7 +763,7 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 
     async updateCursor(
         event: H3Event,
-        input: { scope: { workspaceId: string }; deviceId: string; version: number }
+        input: { scope: { workspaceId: string }; deviceId: string; version: number; historyIncarnation?: string | null }
     ): Promise<void> {
         const client = await getSyncGatewayClient(event);
         try {
@@ -723,6 +772,9 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     device_id: input.deviceId,
                     last_seen_version: input.version,
+                    history_incarnation: input.historyIncarnation,
+                    history_incarnation_capability: 'incarnation-v1',
+                    unavailable_record_capability: 'unavailable-v1',
                 })
             );
         } catch (error) {
@@ -776,6 +828,6 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 /**
  * Factory function for creating Convex SyncGatewayAdapter instances.
  */
-export function createConvexSyncGatewayAdapter(): SyncGatewayAdapter {
+export function createConvexSyncGatewayAdapter(): ConvexSyncGatewayAdapter {
     return new ConvexSyncGatewayAdapter();
 }

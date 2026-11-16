@@ -70,7 +70,7 @@ let realtime: { client: ConvexClient; key: string; watchers: number } | undefine
 /** One connection per host, SDK-deduplicated by workspace. It exists only while
  * authenticated host SSE listeners need it; no idle HTTP polling or sockets.
  */
-export function watchConvexVersion(workspaceId: string, onVersion: (version: number) => void,
+export function watchConvexVersion(workspaceId: string, onVersion: (position: { historyIncarnation: string; version: number }) => void,
     onError: (error: unknown) => void): () => void {
     const config = useRuntimeConfig();
     const url = config.sync.convexUrl;
@@ -96,8 +96,8 @@ export function watchConvexVersion(workspaceId: string, onVersion: (version: num
     let unsubscribe: () => void;
     try {
         unsubscribe = connection.client.onUpdate(convexInternalApi.sync.watchVersion, { workspace_id: workspaceId },
-            version => { if (Number.isSafeInteger(version) && version >= 0) onVersion(version); else onError(new Error('Invalid workspace version')); }, onError);
+            position => { if (typeof position?.historyIncarnation === 'string' && Number.isSafeInteger(position.version) && position.version >= 0) onVersion(position); else onError(new Error('Invalid workspace version')); }, onError);
     } catch (error) { release(); throw error; }
     let stopped = false;
-    return () => { if (stopped) return; stopped = true; unsubscribe(); release(); };
+    return () => { if (stopped) return; stopped = true; try { unsubscribe(); } finally { release(); } };
 }

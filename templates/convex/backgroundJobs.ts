@@ -1,3 +1,4 @@
+import { prepareSyncWrite, nextSyncClock } from './syncContract/shared/sync/prepare_sync_write';
 /**
  * @module convex/backgroundJobs
  *
@@ -192,6 +193,24 @@ export const create = internalMutation({
             if (cancel && cancel.expires_at > Date.now()) {
                 // A Stop was recorded before this admission committed.
                 return { kind: 'cancelled' as const };
+            }
+        }
+
+        // Validate only new envelopes. Replays above retain their original
+        // admission identity; this view never rewrites persisted receipt input.
+        const history = args.execution?.history;
+        if (history !== undefined) {
+            if (!history || typeof history.generationId !== 'string' || !history.generationId || !history.assistantMessage) throw new Error('Invalid background history record');
+            for (const [tableName, row] of [['threads', history.thread], ['messages', history.userMessage],
+                ['messages', history.assistantMessage]] as const) {
+                if (row === undefined) continue;
+                if (!row || typeof row !== 'object') throw new Error('Invalid background history record');
+                nextSyncClock(row.clock);
+                const hlc = row.hlc ?? 'background';
+                const opId = '00000000-0000-4000-8000-000000000000';
+                prepareSyncWrite({ tableName, pk: row.id, operation: 'put',
+                    payload: { ...row, ...(tableName === 'messages' && !row.order_key ? { order_key: hlc } : {}), op_id: opId },
+                    stamp: { deviceId: `background:${history.generationId}`, opId, hlc, clock: row.clock } });
             }
         }
 

@@ -11,10 +11,11 @@ import * as backgroundFunctions from '../../../templates/convex/backgroundJobs';
 import * as storageFunctions from '../../../templates/convex/storage';
 
 type Handler = (ctx: any, args: any) => Promise<any>;
-const handler = (fn: unknown): Handler => (fn as { _handler: Handler })._handler;
+const handler = (fn: unknown): Handler => (ctx, args) => (fn as { _handler: Handler })._handler(ctx, { history_incarnation: 'fixture-history', history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', ...args });
 
 function fixture() {
   const tables: Record<string, any[]> = {
+    sync_history: [{ _id: 'history', key: 'history', incarnation: 'fixture-history', phase: 'ready' }],
     auth_accounts: [{ _id: 'account-1', provider: 'clerk', provider_user_id: 'subject-1', user_id: 'user-1' }],
     workspaces: [{ _id: 'ws-1', name: 'Workspace', owner_user_id: 'user-1', created_at: 1, deleted: false }],
     workspace_members: [{ _id: 'member-1', workspace_id: 'ws-1', user_id: 'user-1', role: 'editor' }],
@@ -62,6 +63,7 @@ function fixture() {
               neq: (field: (row: any) => unknown, value: unknown) => (row: any) => field(row) !== value });
             rows = rows.filter(predicate); return builder;
           },
+          unique: async () => rows[0] ?? null,
           first: async () => rows[0] ?? null,
           collect: async () => [...rows],
           paginate: async ({ cursor, numItems }: any) => {

@@ -1,6 +1,6 @@
 {
     "name": "or3-provider-convex",
-    "version": "0.0.26",
+    "version": "0.0.27",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/Saluana/or3-provider-convex.git"
@@ -38,7 +38,8 @@
         "templates/convex.contract.json",
         "templates/convex.previous.json",
         "scripts/init.mjs",
-        "scripts/backend.mjs"
+        "scripts/backend.mjs",
+        "scripts/history.mjs"
     ],
     "bin": {
         "or3-provider-convex": "./scripts/init.mjs"

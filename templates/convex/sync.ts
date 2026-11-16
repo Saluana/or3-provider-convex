@@ -1,3 +1,7 @@
+import { isSyncUuid } from './syncAuthoring';
+import { historyArgs, readHistory, fenceHistory, changedHistory, requireHistoryCapability } from './syncHistory';
+import { assertIdentity, readDefect, retainEvidence } from './syncUnavailable';
+import { PullResponseSchema, SnapshotResponseSchema, PushResultItemSchema } from './syncContract/shared/sync/schemas';
 import { assertStorageNotDeleted } from './storageDeletion';
 import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './workspaceItemCapability';
 /**
@@ -24,7 +28,7 @@ import { hasWorkspaceItemSemantics, requireWorkspaceItemCapability } from './wor
  * - Per-table cursors or server-side merge strategies beyond LWW
  * - Server-side merge strategies beyond complete-record LWW
  */
-import { ConvexError, v } from 'convex/values';
+import { ConvexError, v, convexToJson, type Value, type Infer } from 'convex/values';
 import { makeFunctionReference } from 'convex/server';
 import schema from './schema';
 import { recordRetainedStorage } from './storageUsage';
@@ -47,7 +51,11 @@ import {
     type SnapshotCandidate,
     type SnapshotRevision,
 } from './snapshot';
-import { isSyncUuid } from './syncAuthoring';
+import { prepareSyncWrite, nextSyncClock } from './syncContract/shared/sync/prepare_sync_write';
+import { compareSyncTuple, syncJsonByteLength } from './syncContract/shared/sync/schemas';
+import { normalizeHistoricalSyncPayload } from './snapshot';
+import { getConvexSize } from 'convex/values';
+import { newSyncReadBudget, readSyncBatch, canReadSyncDocument, type SyncReadBudget } from './syncReadBudget';
 import { readRequestUsage } from './requestUsage';
 import { parseChatSeek, encodeChatSeek } from './historySeek';
 
@@ -195,8 +203,9 @@ async function allocateServerVersions(
         .first();
 
     if (existing) {
-        const start = existing.value + 1;
+        const start = nextSyncClock(existing.value);
         const end = existing.value + count;
+        if (!Number.isSafeInteger(end)) throw new Error('Sync version exhausted');
         await ctx.db.patch(existing._id, { value: end });
         return start;
     } else {
@@ -256,6 +265,7 @@ type SnapshotHistoryDoc = {
 type DynamicIndexBuilder = {
     eq: (field: string, value: unknown) => DynamicIndexBuilder;
     gt: (field: string, value: unknown) => DynamicIndexBuilder;
+    gte: (field: string, value: unknown) => DynamicIndexBuilder;
     lte: (field: string, value: unknown) => DynamicIndexBuilder;
 };
 
@@ -364,11 +374,12 @@ function tombstoneSnapshotCandidate(
     tombstone: TombstoneDoc
 ): SnapshotCandidate {
     return {
+        source: tombstone,
         kind: 'tombstone',
         tableName,
         pk,
         revision: legacySnapshotRevision(tableName, pk, tombstone),
-        serverDeletedAt: Math.max(0, Math.floor(tombstone.server_deleted_at ?? tombstone.deleted_at)),
+        serverDeletedAt: tombstone.server_deleted_at ?? tombstone.deleted_at,
         serverVersion: tombstone.server_version,
     };
 }
@@ -382,19 +393,21 @@ function historySnapshotCandidate(history: SnapshotHistoryDoc): SnapshotCandidat
     if (history.kind === 'tombstone') {
         return {
             kind: 'tombstone',
+            source: history,
             tableName: history.table_name,
             pk: history.pk,
             revision,
             ...(history.table_name === 'file_meta' && history.payload ? { payload: history.payload } : {}),
-            serverDeletedAt: Math.max(0, Math.floor(history.server_deleted_at ?? 0)),
+            serverDeletedAt: history.server_deleted_at ?? 0,
             serverVersion: history.server_version,
         };
     }
     return {
         kind: 'row',
+        source: history,
         tableName: history.table_name,
         pk: history.pk,
-        payload: history.payload,
+        payload: normalizeHistoricalSyncPayload(history.table_name, history.payload),
         revision,
         serverVersion: history.server_version,
     };
@@ -405,7 +418,8 @@ async function readSnapshotHistory(
     workspaceId: Id<'workspaces'>,
     tableName: string,
     pk: string,
-    highWatermark: number
+    highWatermark: number,
+    budget?: SyncReadBudget
 ): Promise<SnapshotCandidate | null> {
     const history = (await ctx.db
         .query('sync_record_versions')
@@ -417,6 +431,7 @@ async function readSnapshotHistory(
         )
         .order('desc')
         .first()) as SnapshotHistoryDoc | null;
+    if (history && budget) { budget.bytes -= getConvexSize(history as import('convex/values').Value); budget.reads--; }
     return history ? historySnapshotCandidate(history) : null;
 }
 
@@ -425,23 +440,26 @@ async function readMaterializedSnapshotRows(
     workspaceId: Id<'workspaces'>,
     tableName: string,
     afterPk: string | null,
-    limit: number
-): Promise<MaterializedDoc[]> {
+    limit: number,
+    budget: SyncReadBudget
+) {
     const tableInfo = TABLE_INDEX_MAP[tableName];
-    if (!tableInfo) return [];
+    if (!tableInfo) throw new Error('Invalid snapshot table');
     const pkField = getPkField(tableName);
     type DynamicQuery = {
         withIndex: (
             indexName: string,
             build: (q: DynamicIndexBuilder) => DynamicIndexBuilder
-        ) => { take: (count: number) => Promise<MaterializedDoc[]> };
+        ) => AsyncIterable<MaterializedDoc>;
     };
-    return (ctx.db.query(tableInfo.table as TableNames) as unknown as DynamicQuery)
+    // Strict Convex string bounds skip NUL extensions of the boundary key.
+    // Seek inclusively and discard only the exact boundary, charging its read.
+    return readSyncBatch((ctx.db.query(tableInfo.table as TableNames) as unknown as DynamicQuery)
         .withIndex(tableInfo.indexName, (q) => {
             const scoped = q.eq('workspace_id', workspaceId);
-            return afterPk === null ? scoped : scoped.gt(pkField, afterPk);
+            return afterPk === null ? scoped : scoped.gte(pkField, afterPk);
         })
-        .take(limit);
+        , limit, budget, row => afterPk !== null && row[pkField] === afterPk);
 }
 
 async function readSnapshotTombstones(
@@ -449,17 +467,18 @@ async function readSnapshotTombstones(
     workspaceId: Id<'workspaces'>,
     tableName: string,
     afterPk: string | null,
-    limit: number
-): Promise<TombstoneDoc[]> {
-    return (await ctx.db
+    limit: number,
+    budget: SyncReadBudget
+) {
+    return readSyncBatch(ctx.db
         .query('tombstones')
         .withIndex('by_workspace_table_pk', (q) => {
             const scoped = q
                 .eq('workspace_id', workspaceId)
                 .eq('table_name', tableName);
-            return afterPk === null ? scoped : scoped.gt('pk', afterPk);
+            return afterPk === null ? scoped : scoped.gte('pk', afterPk);
         })
-        .take(limit)) as TombstoneDoc[];
+        , limit, budget, row => afterPk !== null && row.pk === afterPk);
 }
 
 async function resolveSnapshotKey(
@@ -471,14 +490,16 @@ async function resolveSnapshotKey(
     row: MaterializedDoc | undefined,
     tombstone: TombstoneDoc | undefined,
     callerUserId: Id<'users'>,
-    retainedFiles = false
+    retainedFiles = false,
+    budget?: SyncReadBudget
 ): Promise<SnapshotCandidate | null> {
     if (
         tableName === 'notifications' &&
         (!row || row.user_id !== String(callerUserId))
     ) {
-        // Orphan tombstones do not carry an owner, so fail closed rather than
-        // expose another user's notification existence.
+        // Unknown ownership is private evidence, never a workspace marker.
+        if (row && (typeof row.user_id !== 'string' || !row.user_id.length)) await retainEvidence(ctx, workspaceId, await readHistory(ctx), tableName, pk, row, 'unknown_notification_owner');
+        if (!row && tombstone) await retainEvidence(ctx, workspaceId, await readHistory(ctx), tableName, pk, tombstone, 'unknown_notification_owner');
         return null;
     }
     const candidates: SnapshotCandidate[] = [];
@@ -487,18 +508,27 @@ async function resolveSnapshotKey(
         workspaceId,
         tableName,
         pk,
-        highWatermark
+        highWatermark,
+        budget
     );
     if (history) candidates.push(history);
     if (row) candidates.push(materializedSnapshotCandidate(tableName, pk, row));
     if (tombstone) candidates.push(tombstoneSnapshotCandidate(tableName, pk, tombstone));
-    const winner = resolveSnapshotWinner(candidates, highWatermark);
+    for (const candidate of candidates) {
+        if (!Number.isSafeInteger(candidate.serverVersion) || (candidate.serverVersion as number) < 0) throw new Error('Snapshot coverage version failure');
+    }
+    const eligible = candidates.filter(candidate => (candidate.serverVersion ?? 0) <= highWatermark);
+    const latestVersion = Math.max(...eligible.map(candidate => candidate.serverVersion ?? 0));
+    // An unusable latest revision cannot authorize replay of an older preimage.
+    const uncertain = eligible.find(candidate => candidate.serverVersion === latestVersion &&
+        (!Number.isSafeInteger(candidate.revision.clock) || candidate.revision.clock < 0 || !candidate.revision.hlc || !candidate.revision.opId));
+    const winner = uncertain ?? resolveSnapshotWinner(eligible, highWatermark);
     if (retainedFiles && tableName === 'file_meta' && winner?.kind === 'tombstone') {
         const retained = candidates.find(candidate => candidate.kind === 'tombstone' && candidate.payload &&
             candidate.serverVersion !== undefined && candidate.serverVersion <= highWatermark &&
             compareSnapshotRevisions(candidate.revision, winner.revision) === 0);
         if (retained?.kind === 'tombstone') return {
-            kind: 'row', tableName, pk, payload: retained.payload, revision: winner.revision, serverVersion: winner.serverVersion,
+            source: retained.source, kind: 'row', tableName, pk, payload: retained.payload, revision: winner.revision, serverVersion: winner.serverVersion,
         };
         // Old pre-images may lack retained metadata. Never label a concurrent
         // replacement as the original or silently omit an ambiguous original.
@@ -677,6 +707,15 @@ function changeLogFingerprint(change: Record<string, unknown>): string {
     });
 }
 
+function prepareOperation(op: SyncOperation): SyncOperation {
+    const payload = op.operation === 'put' && op.payload && typeof op.payload === 'object'
+        ? { ...op.payload as Record<string, unknown>, clock: op.clock, hlc: op.hlc, op_id: op.op_id }
+        : op.payload;
+    const prepared = prepareSyncWrite({ tableName: op.table_name, pk: op.pk, operation: op.operation,
+        payload, stamp: { clock: op.clock, hlc: op.hlc, opId: op.op_id, deviceId: op.device_id } });
+    return { ...op, payload: prepared.payload };
+}
+
 function validateSyncOperation(
     workspaceId: Id<'workspaces'>,
     op: SyncOperation
@@ -687,7 +726,7 @@ function validateSyncOperation(
     if (!TABLE_INDEX_MAP[op.table_name]) return `Invalid table: ${op.table_name}`;
     if (!Number.isSafeInteger(op.clock) || op.clock < 0) return 'Invalid clock';
     for (const [name, value, maximum] of [['hlc', op.hlc, 512], ['device_id', op.device_id, 256], ['pk', op.pk, 1024]] as const) {
-        if (!value.trim() || value.length > maximum) return `Invalid ${name}`;
+        if (!(name === 'device_id' ? value.trim() : value) || value.length > maximum) return `Invalid ${name}`;
     }
     const reservedKey = reservedKvSettingKey(op);
     if (reservedKey) {
@@ -713,13 +752,22 @@ function validateSyncOperation(
     }
 
     const payload = op.payload as Record<string, unknown> | undefined;
+    if (op.operation === 'delete') {
+        try { prepareOperation(op); }
+        catch (error) { return error instanceof Error ? error.message : 'Invalid sync write'; }
+        return undefined;
+    }
     try {
         validatePayload(op.table_name, payload);
     } catch (error) {
         return error instanceof Error ? error.message : String(error);
     }
     if (!payload && op.operation === 'put') return `Invalid payload for ${op.table_name}: put requires a complete record`;
-    if (!payload) return undefined;
+    if (!payload) {
+        try { prepareOperation(op); }
+        catch (error) { return error instanceof Error ? error.message : 'Invalid sync write'; }
+        return undefined;
+    }
     if ('_id' in payload) return `Invalid payload for ${op.table_name}: '_id' is immutable`;
     if ('workspace_id' in payload && String(payload.workspace_id) !== String(workspaceId)) {
         return `Invalid payload for ${op.table_name}: 'workspace_id' is immutable`;
@@ -728,13 +776,15 @@ function validateSyncOperation(
     if (pkField in payload && payload[pkField] !== op.pk) {
         return `Invalid payload for ${op.table_name}: '${pkField}' must match operation pk`;
     }
+    try { op.payload = prepareOperation(op).payload; }
+    catch (error) { return error instanceof Error ? error.message : 'Invalid sync write'; }
     const tables = schema.tables as unknown as Record<string, { validator: { json: any } }>;
     if (op.operation === 'put') {
         if (op.table_name === 'file_meta' && (!Number.isSafeInteger(payload.size_bytes) || (payload.size_bytes as number) < 0)) {
             return 'Invalid payload for file_meta: size_bytes must be a nonnegative integer';
         }
         const canonical = {
-            ...sanitizePayload(op.table_name, payload),
+            ...sanitizePayload(op.table_name, op.payload as Record<string, unknown>),
             ...(op.table_name === 'file_meta' ? { ref_count: 0 } : {}),
             workspace_id: workspaceId,
             [pkField]: op.pk,
@@ -745,19 +795,54 @@ function validateSyncOperation(
         if (!matchesDocumentValidator(tables[op.table_name]!.validator.json, canonical)) {
             return `Invalid payload for ${op.table_name}: record does not match the canonical schema`;
         }
-    } else {
-        const definition = tables[op.table_name]!.validator.json;
-        const fields = Object.fromEntries(Object.entries(definition.value).map(([key, field]: [string, any]) =>
-            [key, { ...field, optional: true }]));
-        if (!matchesDocumentValidator({ type: 'object', value: fields }, sanitizePayload(op.table_name, payload))) {
-            return `Invalid payload for ${op.table_name}: delete fields do not match the canonical schema`;
-        }
     }
     return undefined;
 }
 
 type CurrentWinner = { kind: 'put'; payload: unknown; revision: SnapshotRevision } |
     { kind: 'delete'; revision: SnapshotRevision; serverDeletedAt: number };
+
+async function readPushReceipt(ctx: MutationCtx, opId: string) {
+    return ctx.db.query('change_log').withIndex('by_op_id', q => q.eq('op_id', opId)).first();
+}
+async function readPushSources(ctx: MutationCtx, workspace: Id<'workspaces'>, op: SyncOperation) {
+    const info = TABLE_INDEX_MAP[op.table_name]!;
+    const row = await (ctx.db.query(info.table as TableNames) as any).withIndex(info.indexName, (q: any) =>
+        q.eq('workspace_id', workspace).eq(getPkField(op.table_name), op.pk)).first() as MaterializedDoc | null;
+    const tombstone = await ctx.db.query('tombstones').withIndex('by_workspace_table_pk', q =>
+        q.eq('workspace_id', workspace).eq('table_name', op.table_name).eq('pk', op.pk)).first();
+    return { row, tombstone };
+}
+function pushStoredDefect(op: SyncOperation, receipt: Awaited<ReturnType<typeof readPushReceipt>>,
+    { row, tombstone }: Awaited<ReturnType<typeof readPushSources>>) {
+    const fault = (source: unknown, reason: string, hold = true) => ({ source, reason, hold });
+    if (op.table_name === 'notifications' && row && !row.user_id) return fault(row, 'unknown_notification_owner');
+    if (receipt) {
+        const reason = readDefect(toWireChange(receipt), false);
+        if (reason) return fault(receipt, reason);
+    }
+    const candidates = [row ? materializedSnapshotCandidate(op.table_name, op.pk, row) : null,
+        tombstone ? tombstoneSnapshotCandidate(op.table_name, op.pk, tombstone) : null]
+        .filter((value): value is SnapshotCandidate => value !== null);
+    // Invalid explicit ordering cannot authorize replacing a corrupt record.
+    for (const candidate of candidates) {
+        if (!Number.isSafeInteger(candidate.serverVersion) || (candidate.serverVersion as number) < 0) {
+            return fault(candidate.source, 'invalid_server_version');
+        }
+        const revisionDefect = readDefect({ kind: 'tombstone', tableName: op.table_name, pk: op.pk,
+            revision: candidate.revision, serverDeletedAt: 0 }, true);
+        if (revisionDefect) return fault(candidate.source, revisionDefect);
+    }
+    const winner = resolveSnapshotWinner(candidates, Number.MAX_SAFE_INTEGER);
+    if (!winner) return receipt ? fault(receipt, 'missing_current_winner') : null;
+    const { source, serverVersion: _version, ...wire } = winner;
+    const reason = readDefect(wire, true);
+    if (!reason) return null;
+    const incoming = { clock: op.clock, hlc: op.hlc, opId: op.op_id };
+    const replaces = !receipt && (!row || incomingWinsStoredRevision(incoming, row)) &&
+        (!tombstone || incomingWinsStoredRevision(incoming, tombstone));
+    return fault(source, reason, !replaces);
+}
 
 async function currentWinner(ctx: MutationCtx, workspaceId: Id<'workspaces'>, tableName: string, pk: string): Promise<CurrentWinner | undefined> {
     const table = TABLE_INDEX_MAP[tableName]!;
@@ -795,10 +880,12 @@ async function applyOpToTable(
         clock: number;
         hlc: string;
         op_id: string;
+        device_id: string;
     },
     serverVersion: number,
     preimageVersion: number
 ): Promise<{ wasExisting: boolean; applied: boolean }> {
+    op = prepareOperation(op);
     const tableInfo = TABLE_INDEX_MAP[op.table_name];
     if (!tableInfo) {
         console.warn(`Unknown table: ${op.table_name}`);
@@ -814,7 +901,7 @@ async function applyOpToTable(
         op.payload as Record<string, unknown> | undefined
     );
 
-    validatePayload(op.table_name, payload);
+    if (op.operation === 'put') validatePayload(op.table_name, payload);
     const payloadCreatedAt =
         typeof payload?.created_at === 'number' ? (payload.created_at as number) : undefined;
     const payloadUpdatedAt =
@@ -917,7 +1004,9 @@ async function applyOpToTable(
                 { clock: op.clock, hlc: op.hlc, opId: op.op_id }, existingTombstone));
             // LWW with deterministic HLC tie-break on equal clocks.
             if (shouldApply) {
-                await assertStorageNotDeleted(ctx, workspaceId, table, { ...existing, ...(payload ?? {}) });
+                // Puts replace the complete record. Obsolete attachment JSON in
+                // the stored row is neither retained nor new-write authority.
+                await assertStorageNotDeleted(ctx, workspaceId, table, { ...(payload ?? {}), [pkField]: op.pk });
                 console.debug('[sync] apply put', {
                     table: op.table_name,
                     pk: op.pk,
@@ -1043,12 +1132,11 @@ type SyncOperation = {
 };
 
 /** Derives notification ownership from the authenticated sync subject. */
-async function scopeNotificationWrite(
-    ctx: MutationCtx,
-    workspaceId: Id<'workspaces'>,
+function scopeNotificationWrite(
     callerUserId: Id<'users'>,
-    op: SyncOperation
-): Promise<SyncOperation> {
+    op: SyncOperation,
+    existing: MaterializedDoc | null
+): SyncOperation {
     if (op.table_name !== 'notifications') return op;
 
     const callerId = String(callerUserId);
@@ -1060,14 +1148,7 @@ async function scopeNotificationWrite(
         throw new Error('Forbidden: notification owner mismatch');
     }
 
-    const existing = await ctx.db
-        .query('notifications')
-        .withIndex('by_workspace_id', (q) =>
-            q.eq('workspace_id', workspaceId).eq('id', op.pk)
-        )
-        .first();
-
-    if (existing && existing.user_id !== callerId) {
+    if (existing && existing.user_id && existing.user_id !== callerId) {
         throw new Error('Forbidden: notification owner mismatch');
     }
     if (!existing && op.operation === 'delete') {
@@ -1110,7 +1191,7 @@ function toWireChange(c: {
         tableName: c.table_name,
         pk: c.pk,
         op: c.op,
-        payload: c.payload,
+        payload: normalizeHistoricalSyncPayload(c.table_name, c.payload),
         stamp: {
             clock: c.clock,
             hlc: c.hlc,
@@ -1118,10 +1199,6 @@ function toWireChange(c: {
             opId: c.op_id,
         },
     };
-}
-
-function isWireCompatibleChange(change: { op_id: string }): boolean {
-    return isSyncUuid(change.op_id);
 }
 
 async function pullRetentionForWorkspace(
@@ -1138,11 +1215,15 @@ async function pullRetentionForWorkspace(
         .query('server_version_counter')
         .withIndex('by_workspace', (q) => q.eq('workspace_id', workspaceId))
         .first();
-    return computePullRetention({
+    assertSafeNonnegativeInteger(cursor, 'pull cursor');
+    const head = counter?.value ?? 0;
+    assertSafeNonnegativeInteger(head, 'workspace head');
+    if (!Number.isSafeInteger(head + 1) || oldest && (!Number.isSafeInteger(oldest.server_version) || oldest.server_version < 1 || oldest.server_version > head)) throw new Error('Sync coverage retention failure');
+    return { head, retention: computePullRetention({
         cursor,
         oldestLogVersion: oldest?.server_version ?? null,
-        highWatermark: counter?.value ?? 0,
-    });
+        highWatermark: head,
+    }) };
 }
 
 // ============================================================
@@ -1166,9 +1247,10 @@ async function pullRetentionForWorkspace(
  * - Only allowlisted table names are accepted
  * - Viewer memberships cannot push workspace changes
  */
-export const push = mutation({
-    args: {
+const pushArgs = {
         workspace_id: v.id('workspaces'),
+        ...historyArgs,
+        stored_record_capability: v.optional(v.string()),
         workspace_item_capability: v.optional(v.literal('v1')),
         ops: v.array(
             v.object({
@@ -1182,8 +1264,10 @@ export const push = mutation({
                 device_id: v.string(),
             })
         ),
-    },
-    handler: async (ctx, args) => {
+    };
+const pushArgumentValidator = v.object(pushArgs);
+export const push = mutation({ args: pushArgs, handler: applyPush });
+async function applyPush(ctx: MutationCtx, args: Infer<typeof pushArgumentValidator>) {
         console.debug('[sync] push', {
             workspace: args.workspace_id,
             ops: args.ops.length,
@@ -1195,16 +1279,8 @@ export const push = mutation({
 
         // Verify workspace membership
         const callerUserId = await requireSyncWriteAccess(ctx, args.workspace_id);
-        if (args.workspace_item_capability !== 'v1') {
-            for (const op of args.ops) {
-                if (op.table_name !== 'posts' && op.table_name !== 'projects') continue;
-                const canonical = await ctx.db.query(op.table_name).withIndex('by_workspace_id', q =>
-                    q.eq('workspace_id', args.workspace_id).eq('id', op.pk)).first();
-                if (hasWorkspaceItemSemantics(op.table_name, op.payload) || hasWorkspaceItemSemantics(op.table_name, canonical)) {
-                    requireWorkspaceItemCapability(args.workspace_item_capability);
-                }
-            }
-        }
+        requireHistoryCapability(args);
+        const historyIncarnation = await fenceHistory(ctx, args.history_incarnation);
 
         type Result = {
             opId: string;
@@ -1212,6 +1288,7 @@ export const push = mutation({
             serverVersion?: number;
             error?: string;
             errorCode?:
+                | 'STORED_RECORD_UNAVAILABLE'
                 | 'VALIDATION_ERROR'
                 | 'UNAUTHORIZED'
                 | 'CONFLICT'
@@ -1221,6 +1298,7 @@ export const push = mutation({
                 | 'NETWORK_ERROR'
                 | 'SERVER_ERROR'
                 | 'UNKNOWN';
+            evidenceRef?: string;
             tableName?: string;
             operation?: 'put' | 'delete';
             payload?: unknown;
@@ -1271,47 +1349,72 @@ export const push = mutation({
             if (group.fingerprint !== fingerprint) group.conflicting = true;
         });
 
-        const candidates: Array<{ op: SyncOperation; indices: number[] }> = [];
+        const candidates: Array<{ op: SyncOperation; indices: number[]; fingerprint: string }> = [];
+        // A native stored document can be 1 MiB, including a corrupt tombstone.
+        // Reserve the worst-case point reads BEFORE each op; charge repeated
+        // apply/winner reads and preimages conservatively against the same cap.
+        // Keep 2 MiB for bounded authorization/counter/evidence headers.
+        let remainingBytes = 14 * 1024 * 1024;
+        const existingLogs: Array<Awaited<ReturnType<typeof readPushReceipt>>> = [];
         for (const group of groups.values()) {
             if (group.conflicting) {
-                failGroup(
-                    group.indices,
-                    group.op,
-                    `Conflicting operations reuse op_id ${group.op.op_id}`,
-                    'CONFLICT'
-                );
+                failGroup(group.indices, group.op, 'Conflicting operations reuse op_id', 'CONFLICT');
                 continue;
             }
-            try {
-                const scopedOp = await scopeNotificationWrite(
-                    ctx,
-                    args.workspace_id,
-                    callerUserId,
-                    group.op
-                );
-                const validationError = validateSyncOperation(args.workspace_id, scopedOp);
-                if (validationError) {
-                    failGroup(group.indices, group.op, validationError);
+            if (remainingBytes < 12 * 1024 * 1024) {
+                failGroup(group.indices, group.op, 'Sync batch storage budget reached; retry this operation', 'RATE_LIMITED');
+                continue;
+            }
+            // Only known tables have canonical storage. Invalid input remains
+            // the ordinary per-op validation disposition, never stored evidence.
+            if (!Object.hasOwn(TABLE_INDEX_MAP, group.op.table_name)) {
+                failGroup(group.indices, group.op, `Invalid table: ${group.op.table_name}`); continue;
+            }
+            const receipt = await readPushReceipt(ctx, group.op.op_id);
+            remainingBytes -= receipt ? getConvexSize(receipt) : 0;
+            // Never inspect/retain another workspace's receipt.
+            if (receipt && String(receipt.workspace_id) !== String(args.workspace_id)) {
+                failGroup(group.indices, group.op, 'Conflicting operation reuses processed op_id', 'CONFLICT'); continue;
+            }
+            const sources = await readPushSources(ctx, args.workspace_id, group.op);
+            if (args.workspace_item_capability !== 'v1' &&
+                (hasWorkspaceItemSemantics(group.op.table_name, group.op.payload) || hasWorkspaceItemSemantics(group.op.table_name, sources.row))) {
+                requireWorkspaceItemCapability(args.workspace_item_capability);
+            }
+            remainingBytes -= (sources.row ? 6 * getConvexSize(sources.row as Value) : 0) +
+                (sources.tombstone ? 4 * getConvexSize(sources.tombstone) : 0) +
+                4 * getConvexSize(group.op as Value);
+            // Known foreign ownership is an authorization failure, never an
+            // evidence reference or a winner containing another user's data.
+            if (group.op.table_name === 'notifications' && sources.row?.user_id && sources.row.user_id !== String(callerUserId)) {
+                failGroup(group.indices, group.op, 'Forbidden: notification owner mismatch'); continue;
+            }
+            const defect = pushStoredDefect(group.op, receipt, sources);
+            if (defect) {
+                if (args.stored_record_capability !== 'stored-record-v1') {
+                    throw new ConvexError({ code: 'OR3_SYNC_UPDATE_REQUIRED', statusCode: 426, requiredCapability: 'stored-record-v1' });
+                }
+                const sourceRef = await retainEvidence(ctx, args.workspace_id, historyIncarnation,
+                    group.op.table_name, group.op.pk, defect.source, defect.reason);
+                if (defect.hold) {
+                    // The returned reference exports both immutable intent and
+                    // its source link. The source itself is copied only once.
+                    const evidenceRef = await retainEvidence(ctx, args.workspace_id, historyIncarnation,
+                        group.op.table_name, group.op.pk, { intent: group.op, evidence_ref: sourceRef }, 'push_stored_record');
+                    for (const index of group.indices) results[index] = { opId: group.op.op_id, success: false,
+                        errorCode: 'STORED_RECORD_UNAVAILABLE', evidenceRef, error: 'Stored sync record unavailable; retained for manual recovery' };
                     continue;
                 }
-                candidates.push({ op: scopedOp, indices: group.indices });
+            }
+            try {
+                const scopedOp = scopeNotificationWrite(callerUserId, group.op, sources.row);
+                candidates.push({ op: scopedOp, indices: group.indices, fingerprint: operationFingerprint(scopedOp) });
+                existingLogs.push(receipt);
             } catch (error) {
-                failGroup(
-                    group.indices,
-                    group.op,
-                    error instanceof Error ? error.message : String(error)
-                );
+                failGroup(group.indices, group.op, error instanceof Error ? error.message : String(error));
             }
         }
 
-        const existingLogs = await Promise.all(
-            candidates.map(({ op }) =>
-                ctx.db
-                    .query('change_log')
-                    .withIndex('by_op_id', (q) => q.eq('op_id', op.op_id))
-                    .first()
-            )
-        );
         const unprocessedOps: typeof candidates = [];
         for (const [index, candidate] of candidates.entries()) {
             const existing = existingLogs[index];
@@ -1321,7 +1424,7 @@ export const push = mutation({
             }
             if (
                 String(existing.workspace_id) !== String(args.workspace_id) ||
-                (existing.request_fingerprint ?? changeLogFingerprint(existing)) !== operationFingerprint(candidate.op)
+                (existing.request_fingerprint ?? changeLogFingerprint(existing)) !== candidate.fingerprint
             ) {
                 failGroup(
                     candidate.indices,
@@ -1352,6 +1455,8 @@ export const push = mutation({
         for (const candidate of unprocessedOps) {
             const { op, indices } = candidate;
             try {
+                const validationError = validateSyncOperation(args.workspace_id, op);
+                if (validationError) { failGroup(indices, op, validationError); continue; }
                 if (op.operation === 'put') await assertStorageNotDeleted(ctx, args.workspace_id, op.table_name, {
                     ...sanitizePayload(op.table_name, op.payload as Record<string, unknown>),
                     [getPkField(op.table_name)]: op.pk,
@@ -1369,7 +1474,7 @@ export const push = mutation({
 
             // Apply unique ops sequentially in allocated server-version order.
             for (let offset = 0; offset < newOps.length; offset += 1) {
-                const { op, indices } = newOps[offset]!;
+                const { op, indices, fingerprint } = newOps[offset]!;
                 const serverVersion = startVersion + offset;
                 console.debug('[sync] push apply', {
                     table: op.table_name,
@@ -1406,7 +1511,7 @@ export const push = mutation({
                     device_id: op.device_id,
                     op_id: op.op_id,
                     created_at: nowSec(),
-                    request_fingerprint: operationFingerprint(op),
+                    request_fingerprint: fingerprint,
                 });
 
                 if (op.operation === 'delete') {
@@ -1439,12 +1544,15 @@ export const push = mutation({
             }
         }
 
-        return {
+        const response = {
             results: results.filter((result): result is Result => Boolean(result)),
             serverVersion: latestVersion,
+            historyIncarnation,
         };
-    },
-});
+        for (const result of response.results) PushResultItemSchema.parse(result);
+        return response;
+
+}
 
 async function requireCanonicalGenerationActor(
     ctx: MutationCtx | QueryCtx,
@@ -1628,7 +1736,7 @@ export const retainChatToolResult = internalMutation({
             const payload = { id: row.id, name: row.name, value: row.value, clock: 1, deleted: false,
                 created_at: row.created_at, updated_at: row.updated_at, hlc, op_id: entry.op_id };
             await applyOpToTable(ctx, args.workspace_id, { table_name: 'kv', operation: 'put', pk: row.id,
-                payload, clock: 1, hlc, op_id: entry.op_id }, start + index, start - 1);
+                payload, clock: 1, hlc, op_id: entry.op_id, device_id: args.device_id }, start + index, start - 1);
             await ctx.db.insert('change_log', { workspace_id: args.workspace_id, server_version: start + index,
                 table_name: 'kv', pk: row.id, op: 'put', payload, clock: 1, hlc, device_id: args.device_id,
                 op_id: entry.op_id, created_at: nowSec() });
@@ -1734,15 +1842,7 @@ export const admitChatGeneration = internalMutation({
         if (args.records.length < 1 || args.records.length > 3) {
             throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background history records' });
         }
-        const startVersion = await allocateServerVersions(
-            ctx,
-            args.workspace_id,
-            args.records.length
-        );
-        const preimageVersion = startVersion - 1;
-        const hookRows: Array<{ tableName: 'threads' | 'messages'; payload: Record<string, unknown>; wasExisting: boolean; applied: boolean }> = [];
-        for (let offset = 0; offset < args.records.length; offset += 1) {
-            const entry = args.records[offset]!;
+        const preparedRecords = args.records.map((entry) => {
             const record = entry.record as Record<string, unknown>;
             const pk = typeof record.id === 'string' ? record.id : '';
             const clock = record.clock;
@@ -1758,10 +1858,21 @@ export const admitChatGeneration = internalMutation({
             if (entry.table_name === 'messages' && !payload.order_key) {
                 payload.order_key = hlc;
             }
-            const encoded = JSON.stringify(payload);
-            if (new TextEncoder().encode(encoded).byteLength > MAX_PAYLOAD_SIZE_BYTES) {
-                throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background history payload size' });
-            }
+            const op = { table_name: entry.table_name, operation: 'put' as const, pk, payload,
+                clock: clock as number, hlc, op_id: entry.op_id, device_id: args.device_id };
+            const validationError = validateSyncOperation(args.workspace_id, op);
+            if (validationError) throw new ConvexError({ code: 'VALIDATION_ERROR', message: validationError });
+            return { entry, pk, clock: clock as number, hlc, payload: op.payload as Record<string, unknown> };
+        });
+        const startVersion = await allocateServerVersions(
+            ctx,
+            args.workspace_id,
+            preparedRecords.length
+        );
+        const preimageVersion = startVersion - 1;
+        const hookRows: Array<{ tableName: 'threads' | 'messages'; payload: Record<string, unknown>; wasExisting: boolean; applied: boolean }> = [];
+        for (let offset = 0; offset < args.records.length; offset += 1) {
+            const { entry, pk, clock, hlc, payload } = preparedRecords[offset]!;
             const serverVersion = startVersion + offset;
             const applyResult = await applyOpToTable(ctx, args.workspace_id, {
                 table_name: entry.table_name,
@@ -1771,6 +1882,7 @@ export const admitChatGeneration = internalMutation({
                 clock: clock as number,
                 hlc,
                 op_id: entry.op_id,
+                device_id: args.device_id,
             }, serverVersion, preimageVersion);
             if (entry.table_name === 'threads' || pk !== args.message_id) {
                 hookRows.push({ tableName: entry.table_name, payload, ...applyResult });
@@ -1892,7 +2004,9 @@ export const finalizeChatGeneration = internalMutation({
             !Number.isFinite(snapshot.completedAt)) {
             throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background terminal snapshot' });
         }
-        const clock = current!.clock + 1;
+        let clock: number;
+        try { clock = nextSyncClock(current!.clock); }
+        catch { throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Sync clock exhausted or invalid' }); }
         const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
         const {
             _id: _currentId,
@@ -1906,7 +2020,7 @@ export const finalizeChatGeneration = internalMutation({
             ? 'complete'
             : snapshot.status === 'aborted' ? 'aborted' : 'failed';
         const usage = readRequestUsage(snapshot.usage);
-        const payload = {
+        let payload = {
             ...currentWithoutError,
             ...(snapshot.error ? { error: snapshot.error } : {}),
             pending: false,
@@ -1926,13 +2040,12 @@ export const finalizeChatGeneration = internalMutation({
                 error: snapshot.error ?? null,
             },
         };
-        if (new TextEncoder().encode(JSON.stringify(payload)).byteLength > MAX_PAYLOAD_SIZE_BYTES) {
-            throw new ConvexError({ code: 'VALIDATION_ERROR', message: 'Invalid background history payload size' });
-        }
+        payload = prepareOperation({ table_name: 'messages', pk: args.message_id, operation: 'put',
+            payload, clock, hlc, op_id: args.op_id, device_id: args.device_id }).payload as typeof payload;
         const serverVersion = await allocateServerVersions(ctx, args.workspace_id, 1);
         await applyOpToTable(ctx, args.workspace_id, {
             table_name: 'messages', operation: 'put', pk: args.message_id,
-            payload, clock, hlc, op_id: args.op_id,
+            payload, clock, hlc, op_id: args.op_id, device_id: args.device_id,
         }, serverVersion, serverVersion - 1);
         await ctx.db.insert('change_log', {
             workspace_id: args.workspace_id,
@@ -2044,11 +2157,14 @@ export const repairLegacyTombstones = internalMutation({
 export const updateDeviceCursor = mutation({
     args: {
         workspace_id: v.id('workspaces'),
+        ...historyArgs,
         device_id: v.string(),
         last_seen_version: v.number(),
     },
     handler: async (ctx, args) => {
         const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
+        requireHistoryCapability(args);
+        const historyIncarnation = await fenceHistory(ctx, args.history_incarnation);
         const deviceId = args.device_id.trim();
         if (!deviceId || deviceId.length > 256) throw new Error('Invalid device_id');
         assertSafeNonnegativeInteger(args.last_seen_version, 'last_seen_version');
@@ -2086,6 +2202,7 @@ export const updateDeviceCursor = mutation({
                 updated_at: nowSec(),
             });
         }
+        return { ok: true, historyIncarnation };
     },
 });
 
@@ -2098,6 +2215,7 @@ export const updateDeviceCursor = mutation({
  * pre-image lookups if writes occurred after the first page.
  */
 const snapshotArgs = {
+    ...historyArgs,
     workspace_id: v.id('workspaces'),
     workspace_item_capability: v.optional(v.literal('v1')),
     page_size: v.number(),
@@ -2114,9 +2232,37 @@ export const backupSnapshot = internalMutation({
     handler: (ctx, args) => captureSnapshot(ctx, args, true),
 });
 
+type PageItem =
+    | {
+          kind: 'row';
+          tableName: string;
+          pk: string;
+          payload: unknown;
+          revision: SnapshotRevision;
+      }
+    | {
+          kind: 'tombstone';
+          tableName: string;
+          pk: string;
+          revision: SnapshotRevision;
+          serverDeletedAt: number;
+      };
+type SnapshotPageResponse = {
+    historyIncarnation: string;
+    unavailable: import('./syncContract/shared/sync/types').SnapshotUnavailableRecord[];
+    workspaceId: string;
+    snapshotId: string;
+    highWatermark: number;
+    items: PageItem[];
+    nextPageToken: string | null;
+};
+
 async function captureSnapshot(ctx: MutationCtx, args: {
     workspace_id: Id<'workspaces'>;
     workspace_item_capability?: 'v1';
+    history_incarnation?: string | null;
+    history_incarnation_capability?: string;
+    unavailable_record_capability?: string;
     page_size: number;
     page_token?: string;
     tables?: string[];
@@ -2134,14 +2280,21 @@ async function captureSnapshot(ctx: MutationCtx, args: {
     const tables = normalizeSnapshotTables(args.tables, Object.keys(TABLE_INDEX_MAP));
     const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
 
+    if (!retainedFiles) requireHistoryCapability(args);
+    const historyIncarnation = await readHistory(ctx);
+    const expected = retainedFiles && args.history_incarnation === undefined
+        ? (args.page_token ? decodeSnapshotCursor(args.page_token).historyIncarnation : null) : args.history_incarnation;
+    if (!(expected === null && !args.page_token) && expected !== historyIncarnation) changedHistory(historyIncarnation);
     const now = nowSec();
     let snapshotId: string;
     let highWatermark: number;
     let tableIndex = 0;
     let afterPk: string | null = null;
+    let expiresAt = now + SNAPSHOT_TTL_SECONDS;
 
     if (args.page_token) {
         const cursor = decodeSnapshotCursor(args.page_token);
+        if (cursor.historyIncarnation !== historyIncarnation) changedHistory(historyIncarnation);
         let session: {
             workspace_id: Id<'workspaces'>;
             user_id: string;
@@ -2176,6 +2329,20 @@ async function captureSnapshot(ctx: MutationCtx, args: {
         highWatermark = session.high_watermark;
         tableIndex = cursor.tableIndex;
         afterPk = cursor.afterPk;
+        expiresAt = session.expires_at;
+        // Authorization, mode, tables and expiry were checked before replay.
+        // A response fits in 2 MiB, hence at most four 512 KiB chunks.
+        const cached = await ctx.db.query('sync_snapshot_pages').withIndex('by_page', q =>
+            q.eq('session_id', cursor.snapshotId as Id<'sync_snapshot_sessions'>)
+                .eq('table_index', tableIndex).eq('after_pk', afterPk).eq('page_size', args.page_size)).take(4);
+        if (cached.length) {
+            const bytes = new Uint8Array(cached.reduce((total, chunk) => total + chunk.data.byteLength, 0));
+            let offset = 0;
+            for (const chunk of cached) { bytes.set(new Uint8Array(chunk.data), offset); offset += chunk.data.byteLength; }
+            const response = JSON.parse(new TextDecoder().decode(bytes)) as SnapshotPageResponse;
+            if (response.items.some((item) => item.kind === 'row' && hasWorkspaceItemSemantics(item.tableName, item.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
+            return response;
+        }
     } else {
         const counter = await ctx.db
             .query('server_version_counter')
@@ -2191,63 +2358,66 @@ async function captureSnapshot(ctx: MutationCtx, args: {
             tables,
             retained_files: retainedFiles,
             created_at: now,
-            expires_at: now + SNAPSHOT_TTL_SECONDS,
+            expires_at: expiresAt,
         }));
     }
 
-    type PageItem =
-        | {
-              kind: 'row';
-              tableName: string;
-              pk: string;
-              payload: unknown;
-              revision: SnapshotRevision;
-          }
-        | {
-              kind: 'tombstone';
-              tableName: string;
-              pk: string;
-              revision: SnapshotRevision;
-              serverDeletedAt: number;
-          };
+    const requestPosition = { tableIndex, afterPk };
+
     const items: PageItem[] = [];
+    const unavailable: SnapshotPageResponse['unavailable'] = [];
+    const budget = newSyncReadBudget();
+    let responseBytes = 0;
     let examined = 0;
     let stoppedWithinTable = false;
 
-    while (tableIndex < tables.length && examined < args.page_size) {
+    while (tableIndex < tables.length && examined < args.page_size && budget.bytes >= 5 * 1024 * 1024) {
         const tableName = tables[tableIndex];
         if (!tableName) break;
         const remaining = args.page_size - examined;
-        const [rows, tombstones] = await Promise.all([
-            readMaterializedSnapshotRows(
+        const rowPage = await readMaterializedSnapshotRows(
                 ctx,
                 args.workspace_id,
                 tableName,
                 afterPk,
-                remaining + 1
-            ),
-            readSnapshotTombstones(
+                remaining + 1,
+                budget
+            );
+        const tombstonePage = await readSnapshotTombstones(
                 ctx,
                 args.workspace_id,
                 tableName,
                 afterPk,
-                remaining + 1
-            ),
-        ]);
+                remaining + 1,
+                budget
+            );
 
+        const rows = rowPage.rows;
+        const tombstones = tombstonePage.rows;
         const pkField = getPkField(tableName);
         const rowsByPk = new Map<string, MaterializedDoc>();
         for (const row of rows) {
             const pk = row[pkField];
-            if (typeof pk === 'string' && pk.length > 0) rowsByPk.set(pk, row);
+            assertIdentity(tableName, pk);
+            if (rowsByPk.has(pk)) throw new Error('Duplicate snapshot logical key');
+            rowsByPk.set(pk, row);
         }
+        for (const row of tombstones) assertIdentity(tableName, row.pk);
         const tombstonesByPk = new Map(tombstones.map((row) => [row.pk, row]));
+        if (tombstonesByPk.size !== tombstones.length) throw new Error('Duplicate snapshot logical key');
         const orderedPks = [
             ...new Set([...rowsByPk.keys(), ...tombstonesByPk.keys()]),
-        ].sort();
-        const pagePks = orderedPks.slice(0, remaining);
+        ].sort((a, b) => compareSyncTuple([a], [b]));
+        // A truncated source proves coverage only through its last fetched key.
+        // Never seek past unseen rows merely because the other source read ahead.
+        const frontiers = [rowPage.hasMore ? rows.at(-1)?.[pkField] : undefined,
+            tombstonePage.hasMore ? tombstones.at(-1)?.pk : undefined]
+            .filter((pk): pk is string => typeof pk === 'string');
+        const pagePks = orderedPks.filter(pk => frontiers.every(last => compareSyncTuple([pk], [last]) <= 0)).slice(0, remaining);
 
+        let consumed = 0;
         for (const pk of pagePks) {
+            if (!canReadSyncDocument(budget)) break;
             const winner = await resolveSnapshotKey(
                 ctx,
                 args.workspace_id,
@@ -2257,31 +2427,30 @@ async function captureSnapshot(ctx: MutationCtx, args: {
                 rowsByPk.get(pk),
                 tombstonesByPk.get(pk),
                 callerUserId,
-                retainedFiles
+                retainedFiles,
+                budget
             );
-            if (!winner) continue;
-            if (winner.kind === 'row') {
-                items.push({
-                    kind: 'row',
-                    tableName: winner.tableName,
-                    pk: winner.pk,
-                    payload: winner.payload,
-                    revision: winner.revision,
-                });
-            } else {
-                items.push({
-                    kind: 'tombstone',
-                    tableName: winner.tableName,
-                    pk: winner.pk,
-                    revision: winner.revision,
-                    serverDeletedAt: winner.serverDeletedAt,
-                });
-            }
+            assertIdentity(tableName, pk);
+            if (!winner) { consumed++; continue; }
+            const { serverVersion: _version, source: _source, ...item } = winner;
+            const reason = readDefect(item, true);
+            // Estimate marker BEFORE retention; do not persist unconsumed entries.
+            const marker = { tableName, pk, originalKind: winner.kind, snapshotId, highWatermark,
+                evidenceRef: 'x'.repeat(64), reason: reason ?? 'invalid_record' };
+            const itemBytes = syncJsonByteLength(reason ? marker : item);
+            if (itemBytes > 1536 * 1024) throw new Error('Snapshot identity exceeds coverage byte ceiling');
+            if (responseBytes + itemBytes > 1536 * 1024) break;
+            responseBytes += itemBytes;
+            consumed++;
+            if (reason) {
+                marker.evidenceRef = await retainEvidence(ctx, args.workspace_id, historyIncarnation, tableName, pk, winner.source, reason);
+                unavailable.push(marker);
+            } else items.push(item as PageItem);
         }
 
-        examined += pagePks.length;
-        if (orderedPks.length > pagePks.length) {
-            afterPk = pagePks[pagePks.length - 1] ?? afterPk;
+        examined += consumed;
+        if (orderedPks.length > consumed || rowPage.hasMore || tombstonePage.hasMore) {
+            afterPk = pagePks[consumed - 1] ?? afterPk;
             stoppedWithinTable = true;
             break;
         }
@@ -2295,19 +2464,40 @@ async function captureSnapshot(ctx: MutationCtx, args: {
         ? encodeSnapshotCursor({
               version: 1,
               snapshotId,
+              historyIncarnation,
               tableIndex,
               afterPk,
           })
         : null;
 
     if (items.some(item => item.kind === 'row' && hasWorkspaceItemSemantics(item.tableName, item.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
-    return {
+    const response: SnapshotPageResponse = {
+        historyIncarnation,
+        unavailable,
         workspaceId: String(args.workspace_id),
         snapshotId,
         highWatermark,
         items,
         nextPageToken,
     };
+    SnapshotResponseSchema.parse(response);
+    if (args.page_token) {
+        const bytes = new TextEncoder().encode(JSON.stringify(response));
+        if (bytes.byteLength > 2 * 1024 * 1024) throw new Error('Snapshot response exceeds byte ceiling');
+        for (let offset = 0, chunk = 0; offset < bytes.byteLength; offset += 512 * 1024, chunk++) {
+            await ctx.db.insert('sync_snapshot_pages', {
+                workspace_id: args.workspace_id,
+                session_id: snapshotId as Id<'sync_snapshot_sessions'>,
+                table_index: requestPosition.tableIndex,
+                after_pk: requestPosition.afterPk,
+                page_size: args.page_size,
+                chunk,
+                data: bytes.slice(offset, offset + 512 * 1024).buffer,
+                expires_at: expiresAt,
+            });
+        }
+    }
+    return response;
 }
 
 /**
@@ -2603,7 +2793,7 @@ export const queryCanonicalStorage = query({
 // ============================================================
 
 /**
- * `sync.pull` (query)
+ * `sync.pullChecked` (mutation)
  *
  * Purpose:
  * Returns a page of changes after a given server_version cursor.
@@ -2612,167 +2802,85 @@ export const queryCanonicalStorage = query({
  * - Results are ordered by `server_version` ascending
  * - `tables` can be used to filter specific tables
  */
-export const pull = query({
-    args: {
-        workspace_id: v.id('workspaces'),
-        workspace_item_capability: v.optional(v.literal('v1')),
-        cursor: v.number(),
-        limit: v.number(),
-        tables: v.optional(v.array(v.string())),
-    },
+const pullArgs = { workspace_id: v.id('workspaces'), workspace_item_capability: v.optional(v.literal('v1')),
+    ...historyArgs, cursor: v.number(), limit: v.number(), tables: v.optional(v.array(v.string())) };
+/** Preserve the old query address solely as an explicit client update boundary. */
+export const pull = query({ args: pullArgs, handler: async (ctx, args) => {
+    await requireSyncReadAccess(ctx, args.workspace_id);
+    throw new ConvexError({ code: 'OR3_SYNC_UPDATE_REQUIRED', statusCode: 426, requiredCapability: 'unavailable-v1' });
+} });
+export const pullChecked = mutation({
+    args: pullArgs,
     handler: async (ctx, args) => {
-        const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
-        const retention = await pullRetentionForWorkspace(
-            ctx,
-            args.workspace_id,
-            args.cursor
-        );
-        if (retention.requiresSnapshot) {
-            return {
-                changes: [],
-                nextCursor: args.cursor,
-                hasMore: false,
-                ...retention,
-            };
-        }
-
-        // Cap limit to prevent abuse
+        const caller = await requireSyncReadAccess(ctx, args.workspace_id);
+        requireHistoryCapability(args);
+        const historyIncarnation = await readHistory(ctx);
+        const { head, retention } = await pullRetentionForWorkspace(ctx, args.workspace_id, args.cursor);
+        if (args.history_incarnation !== historyIncarnation || retention.requiresSnapshot) return {
+            historyIncarnation, changes: [], unavailable: [], nextCursor: args.cursor, hasMore: false,
+            ...retention, requiresSnapshot: true,
+        };
+        if (!Number.isSafeInteger(args.limit) || args.limit < 1) throw new Error('Invalid pull limit');
         const limit = Math.min(args.limit, MAX_PULL_LIMIT);
-
-        type ChangeLogRow = {
-            server_version: number;
-            table_name: string;
-            pk: string;
-            op: string;
-            payload?: unknown;
-            clock: number;
-            hlc: string;
-            device_id: string;
-            op_id: string;
-        };
-        const rawResults = (await ctx.db
-            .query('change_log')
-            .withIndex('by_workspace_version', (q) =>
-                q.eq('workspace_id', args.workspace_id).gt('server_version', args.cursor)
-            )
-            .order('asc')
-            .take(limit + 1)) as ChangeLogRow[];
-
-        const hasMore = rawResults.length > limit;
-        const window = hasMore ? rawResults.slice(0, -1) : rawResults;
-        const tableFilter: string[] = Array.isArray(args.tables) ? args.tables : [];
-        const visibleWindow = window.filter((change) =>
-            isChangeVisibleToUser(change, callerUserId)
-        );
-        const compatibleWindow = visibleWindow.filter(isWireCompatibleChange);
-        const changes =
-            tableFilter.length > 0
-                ? compatibleWindow.filter((c) => tableFilter.includes(c.table_name))
-                : compatibleWindow;
-
-        const lastChange = window[window.length - 1];
-        const nextCursor = lastChange ? lastChange.server_version : args.cursor;
-
-        console.debug('[sync] pull', {
-            workspace: args.workspace_id,
-            cursor: args.cursor,
-            limit,
-            returned: changes.length,
-            nextCursor,
-            hasMore,
-        });
-
-        if (changes.some(change => hasWorkspaceItemSemantics(change.table_name, change.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
-        return {
-            changes: changes.map(toWireChange),
-            nextCursor,
-            hasMore,
-            ...retention,
-        };
+        const budget = newSyncReadBudget();
+        const page = await readSyncBatch(ctx.db.query('change_log').withIndex('by_workspace_version', q =>
+            q.eq('workspace_id', args.workspace_id).gt('server_version', args.cursor)).order('asc'), limit + 1, budget);
+        let previous = args.cursor;
+        // Include metadata lookahead, preventing a duplicated boundary version from disappearing.
+        for (const row of page.rows) {
+            if (!Number.isSafeInteger(row.server_version) || row.server_version <= previous || row.server_version > head) throw new Error('Sync coverage version failure');
+            previous = row.server_version;
+        }
+        const changes = [], unavailable = [];
+        let nextCursor = args.cursor, consumed = 0, bytes = 0;
+        for (const row of page.rows.slice(0, limit)) {
+            assertIdentity(row.table_name, row.pk);
+            if (row.op !== 'put' && row.op !== 'delete') throw new Error('Sync coverage operation failure');
+            const wire = toWireChange(row);
+            const reason = readDefect(wire, false);
+            const visible = isChangeVisibleToUser(row, caller);
+            const selected = !args.tables?.length || args.tables.includes(row.table_name);
+            const marker = { tableName: row.table_name, pk: row.pk, originalKind: row.op,
+                serverVersion: row.server_version, evidenceRef: 'x'.repeat(64), reason: reason ?? 'invalid_record' };
+            const size = visible && selected ? syncJsonByteLength(reason ? marker : wire) : 0;
+            if (size > 1536 * 1024) throw new Error('Pull identity exceeds coverage byte ceiling');
+            if (bytes + size > 1536 * 1024) break;
+            bytes += size;
+            if (reason) {
+                // Even unknown-owner notification defects are retained privately.
+                marker.evidenceRef = await retainEvidence(ctx, args.workspace_id, historyIncarnation, row.table_name, row.pk, row, reason);
+                if (visible && selected) unavailable.push(marker);
+            } else if (visible && selected) changes.push(wire);
+            nextCursor = row.server_version; consumed++;
+        }
+        if (changes.some(change => hasWorkspaceItemSemantics(change.tableName, change.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
+        const response = { historyIncarnation, changes, unavailable, nextCursor,
+            hasMore: consumed < page.rows.length || page.hasMore, ...retention };
+        PullResponseSchema.parse(response);
+        return response;
     },
 });
-
-/**
- * `sync.watchChanges` (query)
- *
- * Purpose:
- * Reactive subscription endpoint that re-runs when new changes arrive.
- *
- * Behavior:
- * - Returns changes after an optional cursor
- * - Caller controls the page size via `limit`
- */
+/** Reactive, content-free wakeups. Delivery MUST use the evidence-writing pull mutation. */
 export const watchChanges = query({
-    args: {
-        workspace_id: v.id('workspaces'),
-        workspace_item_capability: v.optional(v.literal('v1')),
-        cursor: v.optional(v.number()),
-        limit: v.optional(v.number()),
-    },
-    handler: async (ctx, args) => {
-        const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
-        const since = args.cursor ?? 0;
-        const limit = args.limit ?? 100;
-
-        type ChangeLogRow = {
-            server_version: number;
-            table_name: string;
-            pk: string;
-            op: string;
-            payload?: unknown;
-            clock: number;
-            hlc: string;
-            device_id: string;
-            op_id: string;
-        };
-        const changes = (await ctx.db
-            .query('change_log')
-            .withIndex('by_workspace_version', (q) =>
-                q.eq('workspace_id', args.workspace_id).gt('server_version', since)
-            )
-            .order('asc')
-            .take(limit)) as ChangeLogRow[];
-
-        const latestChange = changes[changes.length - 1];
-        const latestVersion = latestChange ? latestChange.server_version : since;
-        const visibleChanges = changes.filter((change) =>
-            isChangeVisibleToUser(change, callerUserId)
-        ).filter(isWireCompatibleChange);
-
-        console.debug('[sync] watchChanges', {
-            workspace: args.workspace_id,
-            cursor: since,
-            limit,
-            returned: visibleChanges.length,
-            latestVersion,
-        });
-
-        if (visibleChanges.some(change => hasWorkspaceItemSemantics(change.table_name, change.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
-        return {
-            changes: visibleChanges.map(toWireChange),
-            latestVersion,
-        };
-    },
-});
-
-/**
- * `sync.getServerVersion` (query)
- *
- * Purpose:
- * Returns the current server version counter for a workspace.
- */
-export const getServerVersion = query({
-    args: {
-        workspace_id: v.id('workspaces'),
-    },
+    args: { workspace_id: v.id('workspaces'), ...historyArgs,
+        workspace_item_capability: v.optional(v.literal('v1')), cursor: v.optional(v.number()), limit: v.optional(v.number()), tables: v.optional(v.array(v.string())) },
     handler: async (ctx, args) => {
         await requireSyncReadAccess(ctx, args.workspace_id);
-        const counter = await ctx.db
-            .query('server_version_counter')
-            .withIndex('by_workspace', (q) => q.eq('workspace_id', args.workspace_id))
-            .first();
+        requireHistoryCapability(args);
+        const historyIncarnation = await readHistory(ctx);
+        const counter = await ctx.db.query('server_version_counter').withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id)).first();
+        return { historyIncarnation, version: counter?.value ?? 0 };
+    },
+});
 
-        return counter?.value ?? 0;
+export const getServerVersion = query({
+    args: { workspace_id: v.id('workspaces'), ...historyArgs },
+    handler: async (ctx, args) => {
+        await requireSyncReadAccess(ctx, args.workspace_id);
+        requireHistoryCapability(args);
+        const historyIncarnation = await fenceHistory(ctx, args.history_incarnation);
+        const counter = await ctx.db.query('server_version_counter').withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id)).first();
+        return { historyIncarnation, version: counter?.value ?? 0 };
     },
 });
 
@@ -2787,15 +2895,38 @@ export const getServerVersion = query({
  * - Is unavailable to public Convex callers
  * - Scans and deletes at most `batch_size` records
  */
+/** Workspace deletion schedules this separately: cached responses can be much
+ * larger than the workspace's current records and must not share its deletion
+ * transaction. The function remains internal and uses indexed bounded pages. */
+export const purgeSnapshotPages = internalMutation({
+    args: { workspace_id: v.id('workspaces') },
+    handler: async (ctx, args) => {
+        const page = await readSyncBatch(ctx.db.query('sync_snapshot_pages')
+            .withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id)), 100, newSyncReadBudget());
+        for (const row of page.rows) await ctx.db.delete(row._id);
+        if (page.hasMore) await ctx.scheduler.runAfter(0, makeFunctionReference<'mutation'>('sync:purgeSnapshotPages'), args);
+    },
+});
+
 /** Bounded maintenance. A pre-image can only serve snapshots begun before its
  * write, so its one-hour lease outlives every session that could need it. */
-async function collectSyncState(ctx: MutationCtx, workspaceId: Id<'workspaces'>, retentionSeconds: number, batchSize: number) {
+async function collectSyncState(ctx: MutationCtx, workspaceId: Id<'workspaces'>, retentionSeconds: number, batchSize: number, budget: SyncReadBudget) {
+    let budgetHasMore = false;
+    const read = async <T extends import('convex/values').Value>(query: AsyncIterable<T>) => {
+        const page = await readSyncBatch(query, batchSize + 1, budget);
+        budgetHasMore ||= page.hasMore;
+        return page.rows;
+    };
     const now = nowSec();
-    const expiredDevices = await ctx.db.query('device_cursors').withIndex('by_workspace_updated', q =>
-        q.eq('workspace_id', workspaceId).lt('updated_at', now - retentionSeconds)).take(batchSize + 1);
-    const expiredSessions = await ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace_expiry', q =>
-        q.eq('workspace_id', workspaceId).lte('expires_at', now)).take(batchSize + 1);
+    const expiredDevices = await read(ctx.db.query('device_cursors').withIndex('by_workspace_updated', q =>
+        q.eq('workspace_id', workspaceId).lt('updated_at', now - retentionSeconds)));
+    const expiredSessions = await read(ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace_expiry', q =>
+        q.eq('workspace_id', workspaceId).lte('expires_at', now)));
     for (const row of [...expiredDevices.slice(0, batchSize), ...expiredSessions.slice(0, batchSize)]) await ctx.db.delete(row._id);
+
+    const expiredPages = await read(ctx.db.query('sync_snapshot_pages').withIndex('by_workspace_expiry', q =>
+        q.eq('workspace_id', workspaceId).lte('expires_at', now)));
+    for (const row of expiredPages.slice(0, batchSize)) await ctx.db.delete(row._id);
 
     const active = await ctx.db.query('sync_snapshot_sessions').withIndex('by_workspace_expiry', q =>
         q.eq('workspace_id', workspaceId).gt('expires_at', now)).first();
@@ -2803,23 +2934,46 @@ async function collectSyncState(ctx: MutationCtx, workspaceId: Id<'workspaces'>,
     if (active) {
         // Add leases to pre-upgrade history in bounded pages. Extending a legacy
         // lease for one hour is conservative and needs no destructive migration.
-        const legacy = await ctx.db.query('sync_record_versions').withIndex('by_workspace_expiry', q =>
-            q.eq('workspace_id', workspaceId).eq('retain_until', undefined)).take(batchSize + 1);
+        const legacy = await read(ctx.db.query('sync_record_versions').withIndex('by_workspace_expiry', q =>
+            q.eq('workspace_id', workspaceId).eq('retain_until', undefined)));
         for (const row of legacy.slice(0, batchSize)) await ctx.db.patch(row._id, { retain_until: now + SNAPSHOT_TTL_SECONDS });
         legacyHasMore = legacy.length > batchSize;
     }
     const history = active
-        ? await ctx.db.query('sync_record_versions').withIndex('by_workspace_expiry', q =>
-            q.eq('workspace_id', workspaceId).gt('retain_until', 0).lte('retain_until', now)).take(batchSize + 1)
-        : await ctx.db.query('sync_record_versions').withIndex('by_workspace_version', q =>
-            q.eq('workspace_id', workspaceId)).take(batchSize + 1);
+        ? await read(ctx.db.query('sync_record_versions').withIndex('by_workspace_expiry', q =>
+            q.eq('workspace_id', workspaceId).gt('retain_until', 0).lte('retain_until', now)))
+        : await read(ctx.db.query('sync_record_versions').withIndex('by_workspace_version', q =>
+            q.eq('workspace_id', workspaceId)));
     for (const row of history.slice(0, batchSize)) await ctx.db.delete(row._id);
     const minimum = await ctx.db.query('device_cursors').withIndex('by_workspace_version', q =>
         q.eq('workspace_id', workspaceId)).order('asc').first();
     const counter = minimum ? null : await ctx.db.query('server_version_counter').withIndex('by_workspace', q =>
         q.eq('workspace_id', workspaceId)).first();
     return { minimumVersion: minimum?.last_seen_version ?? counter?.value ?? 0,
-        hasMore: expiredDevices.length > batchSize || expiredSessions.length > batchSize || history.length > batchSize || legacyHasMore };
+        hasMore: budgetHasMore || expiredDevices.length > batchSize || expiredSessions.length > batchSize || expiredPages.length > batchSize || history.length > batchSize || legacyHasMore };
+}
+
+async function gcTombstonesPage(ctx: MutationCtx, args: { workspace_id: Id<'workspaces'>; retention_seconds: number; batch_size?: number; cursor?: number }, budget = newSyncReadBudget(), state?: Awaited<ReturnType<typeof collectSyncState>>) {
+    validateGcArguments(args);
+    const startCursor = args.cursor ?? 0;
+    if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
+        return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: true, reason: SYNC_HISTORY_GC_POLICY.reason };
+    }
+    const batchSize = args.batch_size ?? 100;
+    state ??= await collectSyncState(ctx, args.workspace_id, args.retention_seconds, batchSize, budget);
+    const page = await readSyncBatch(ctx.db.query('tombstones')
+        .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id).gt('server_version', startCursor))
+        .order('asc'), batchSize + 1, budget);
+    const scanned = page.rows.slice(0, batchSize);
+    const cutoff = nowSec() - args.retention_seconds;
+    let purged = 0;
+    for (const tombstone of scanned) {
+        if (tombstone.server_version <= state.minimumVersion && typeof tombstone.server_deleted_at === 'number' && tombstone.server_deleted_at < cutoff) {
+            await ctx.db.delete(tombstone._id);
+            purged += 1;
+        }
+    }
+    return { purged, hasMore: page.rows.length > batchSize || page.hasMore || state.hasMore, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
 }
 
 export const gcTombstones = internalMutation({
@@ -2829,28 +2983,7 @@ export const gcTombstones = internalMutation({
         batch_size: v.optional(v.number()),
         cursor: v.optional(v.number()),
     },
-    handler: async (ctx, args) => {
-        validateGcArguments(args);
-        const startCursor = args.cursor ?? 0;
-        if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
-            return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: true, reason: SYNC_HISTORY_GC_POLICY.reason };
-        }
-        const batchSize = args.batch_size ?? 100;
-        const state = await collectSyncState(ctx, args.workspace_id, args.retention_seconds, batchSize);
-        const page = await ctx.db.query('tombstones')
-            .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id).gt('server_version', startCursor))
-            .order('asc').take(batchSize + 1);
-        const scanned = page.slice(0, batchSize);
-        const cutoff = nowSec() - args.retention_seconds;
-        let purged = 0;
-        for (const tombstone of scanned) {
-            if (tombstone.server_version <= state.minimumVersion && typeof tombstone.server_deleted_at === 'number' && tombstone.server_deleted_at < cutoff) {
-                await ctx.db.delete(tombstone._id);
-                purged += 1;
-            }
-        }
-        return { purged, hasMore: page.length > batchSize || state.hasMore, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
-    },
+    handler: (ctx, args) => gcTombstonesPage(ctx, args),
 });
 
 /**
@@ -2864,6 +2997,29 @@ export const gcTombstones = internalMutation({
  * - Is unavailable to public Convex callers
  * - Returns a disabled result without querying or deleting sync history
  */
+async function gcChangeLogPage(ctx: MutationCtx, args: { workspace_id: Id<'workspaces'>; retention_seconds: number; batch_size?: number; cursor?: number }, budget = newSyncReadBudget(), state?: Awaited<ReturnType<typeof collectSyncState>>) {
+    validateGcArguments(args);
+    const startCursor = args.cursor ?? 0;
+    if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
+        return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: true, reason: SYNC_HISTORY_GC_POLICY.reason };
+    }
+    const batchSize = args.batch_size ?? 100;
+    state ??= await collectSyncState(ctx, args.workspace_id, args.retention_seconds, batchSize, budget);
+    const page = await readSyncBatch(ctx.db.query('change_log')
+        .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id).gt('server_version', startCursor))
+        .order('asc'), batchSize + 1, budget);
+    const scanned = page.rows.slice(0, batchSize);
+    const cutoff = nowSec() - args.retention_seconds;
+    let purged = 0;
+    for (const change of scanned) {
+        if (change.server_version <= state.minimumVersion && change.created_at < cutoff) {
+            await ctx.db.delete(change._id);
+            purged += 1;
+        }
+    }
+    return { purged, hasMore: page.rows.length > batchSize || page.hasMore || state.hasMore, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
+}
+
 export const gcChangeLog = internalMutation({
     args: {
         workspace_id: v.id('workspaces'),
@@ -2871,28 +3027,7 @@ export const gcChangeLog = internalMutation({
         batch_size: v.optional(v.number()),
         cursor: v.optional(v.number()),
     },
-    handler: async (ctx, args) => {
-        validateGcArguments(args);
-        const startCursor = args.cursor ?? 0;
-        if (!SYNC_HISTORY_GC_POLICY.enabled || !SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified) {
-            return { purged: 0, hasMore: false, nextCursor: startCursor, disabled: true, reason: SYNC_HISTORY_GC_POLICY.reason };
-        }
-        const batchSize = args.batch_size ?? 100;
-        const state = await collectSyncState(ctx, args.workspace_id, args.retention_seconds, batchSize);
-        const page = await ctx.db.query('change_log')
-            .withIndex('by_workspace_version', (q) => q.eq('workspace_id', args.workspace_id).gt('server_version', startCursor))
-            .order('asc').take(batchSize + 1);
-        const scanned = page.slice(0, batchSize);
-        const cutoff = nowSec() - args.retention_seconds;
-        let purged = 0;
-        for (const change of scanned) {
-            if (change.server_version <= state.minimumVersion && change.created_at < cutoff) {
-                await ctx.db.delete(change._id);
-                purged += 1;
-            }
-        }
-        return { purged, hasMore: page.length > batchSize || state.hasMore, nextCursor: scanned.at(-1)?.server_version ?? startCursor, disabled: false };
-    },
+    handler: (ctx, args) => gcChangeLogPage(ctx, args),
 });
 
 // ============================================================
@@ -2934,26 +3069,13 @@ export const runWorkspaceGc = internalMutation({
         let continuation = args.continuation_count ?? 0;
         let hasMore = true;
         if (continuation < MAX_SYNC_GC_CONTINUATIONS) {
-            const tomb = await (gcTombstones as unknown as {
-                _handler: (ctx: MutationCtx, args: Record<string, unknown>) => Promise<{
-                    purged: number; hasMore: boolean; nextCursor: number;
-                }>;
-            })._handler(ctx, {
-                workspace_id: args.workspace_id,
-                retention_seconds: args.retention_seconds ?? MIN_SYNC_RETENTION_SECONDS,
-                batch_size: args.batch_size,
-                cursor: tombstoneCursor,
-            });
-            const log = await (gcChangeLog as unknown as {
-                _handler: (ctx: MutationCtx, args: Record<string, unknown>) => Promise<{
-                    purged: number; hasMore: boolean; nextCursor: number;
-                }>;
-            })._handler(ctx, {
-                workspace_id: args.workspace_id,
-                retention_seconds: args.retention_seconds ?? MIN_SYNC_RETENTION_SECONDS,
-                batch_size: args.batch_size,
-                cursor: changelogCursor,
-            });
+            const budget = newSyncReadBudget();
+            const retentionSeconds = args.retention_seconds ?? MIN_SYNC_RETENTION_SECONDS;
+            const state = await collectSyncState(ctx, args.workspace_id, retentionSeconds, args.batch_size ?? 100, budget);
+            const tomb = await gcTombstonesPage(ctx, { workspace_id: args.workspace_id,
+                retention_seconds: retentionSeconds, batch_size: args.batch_size, cursor: tombstoneCursor }, budget, state);
+            const log = await gcChangeLogPage(ctx, { workspace_id: args.workspace_id,
+                retention_seconds: retentionSeconds, batch_size: args.batch_size, cursor: changelogCursor }, budget, state);
             purged += tomb.purged + log.purged;
             tombstoneCursor = tomb.nextCursor;
             changelogCursor = log.nextCursor;
@@ -3018,6 +3140,133 @@ export const watchVersion = internalQuery({
     handler: async (ctx, args) => {
         const counter = await ctx.db.query('server_version_counter')
             .withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id)).first();
-        return counter?.value ?? 0;
+        return { historyIncarnation: await readHistory(ctx), version: counter?.value ?? 0 };
+    },
+});
+
+/** Privileged operator surfaces. Internal functions require deployment admin auth,
+ * plus the impersonated caller's current workspace access. No automatic repair. */
+const evidenceArgs = { workspace_id: v.id('workspaces'), evidence_ref: v.string() };
+async function authorizedEvidence(ctx: MutationCtx | QueryCtx, workspace: Id<'workspaces'>, ref: string) {
+    await requireSyncReadAccess(ctx, workspace);
+    const row = await ctx.db.get(ref as Id<'sync_unavailable_records'>);
+    if (!row || row.workspace_id !== workspace) throw new Error('Evidence not found');
+    return row;
+}
+export const inspectUnavailable = internalQuery({
+    args: { workspace_id: v.id('workspaces'), cursor: v.optional(v.string()) }, handler: async (ctx, args) => {
+        await requireSyncReadAccess(ctx, args.workspace_id);
+        const page = await ctx.db.query('sync_unavailable_records').withIndex('by_workspace', q => q.eq('workspace_id', args.workspace_id))
+            .paginate({ numItems: 25, cursor: args.cursor ?? null });
+        return { items: page.page.map(row => ({ evidenceRef: String(row._id), historyIncarnation: row.history_incarnation,
+            tableName: row.table_name.slice(0, 128), pk: row.pk.slice(0, 256), reason: row.reason, status: row.status, chunks: row.chunks })),
+            nextCursor: page.isDone ? null : page.continueCursor };
+    },
+});
+export const exportUnavailable = internalQuery({
+    args: { ...evidenceArgs, chunk: v.number() }, handler: async (ctx, args) => {
+        const row = await authorizedEvidence(ctx, args.workspace_id, args.evidence_ref);
+        if (!Number.isSafeInteger(args.chunk) || args.chunk < 0 || args.chunk >= row.chunks) throw new Error('Invalid evidence chunk');
+        const source = await ctx.db.get(row.source_document_id);
+        if (!source) throw new Error('Evidence source missing');
+        const { _id, _creationTime, ...fields } = source;
+        const original = { ...fields, _id: row.source_id, ...(row.source_creation_time !== undefined ? { _creationTime: row.source_creation_time } : {}) };
+        const bytes = new TextEncoder().encode(JSON.stringify(convexToJson(original as Value)));
+        return { data: bytes.slice(args.chunk * 32768, (args.chunk + 1) * 32768).buffer, chunks: row.chunks, encoding: 'convex-json-utf8' };
+    },
+});
+export const revalidateUnavailable = internalQuery({
+    args: evidenceArgs, handler: async (ctx, args) => {
+        const row = await authorizedEvidence(ctx, args.workspace_id, args.evidence_ref);
+        // Original defect stays retained; validate only the CURRENT wire record.
+        const candidate = await currentEvidenceCandidate(ctx, args.workspace_id, row.table_name, row.pk);
+        let currentDefect: string | null = 'missing_current';
+        if (candidate) {
+            const { source: _source, serverVersion: _version, ...wire } = candidate;
+            currentDefect = readDefect(wire, true);
+        }
+        return { historyIncarnation: await readHistory(ctx), status: row.status, reason: row.reason, currentDefect };
+    },
+});
+async function currentEvidenceCandidate(ctx: MutationCtx | QueryCtx, workspace: Id<'workspaces'>, table: string, pk: string) {
+    const info = TABLE_INDEX_MAP[table];
+    if (!info) return null;
+    const row = await (ctx.db.query(info.table as TableNames) as any).withIndex(info.indexName, (q: any) =>
+        q.eq('workspace_id', workspace).eq(getPkField(table), pk)).unique() as MaterializedDoc | null;
+    const tombstone = await ctx.db.query('tombstones').withIndex('by_workspace_table_pk', q =>
+        q.eq('workspace_id', workspace).eq('table_name', table).eq('pk', pk)).unique();
+    const candidates = [row ? materializedSnapshotCandidate(table, pk, row) : null,
+        tombstone ? tombstoneSnapshotCandidate(table, pk, tombstone) : null].filter((value): value is SnapshotCandidate => value !== null);
+    return resolveSnapshotWinner(candidates, Number.MAX_SAFE_INTEGER);
+}
+export const repairUnavailable = internalMutation({
+    args: { ...evidenceArgs, history_incarnation: v.string(), replacement: v.optional(v.any()), operation: v.optional(v.union(v.literal('put'), v.literal('delete'))) },
+    handler: async (ctx, args) => {
+        await requireSyncWriteAccess(ctx, args.workspace_id);
+        const historyIncarnation = await fenceHistory(ctx, args.history_incarnation);
+        const evidence = await authorizedEvidence(ctx, args.workspace_id, args.evidence_ref);
+        if (evidence.history_incarnation !== historyIncarnation) changedHistory(historyIncarnation);
+        if (evidence.status !== 'unresolved') return { status: evidence.status };
+        const current = await currentEvidenceCandidate(ctx, args.workspace_id, evidence.table_name, evidence.pk);
+        if (!current) throw new Error('Current canonical state unavailable; explicit offline recovery required');
+        if (current.serverVersion !== evidence.source_version || current.revision.clock !== evidence.source_clock ||
+            (evidence.source_op_id !== undefined && current.revision.opId !== evidence.source_op_id)) {
+            await ctx.db.patch(evidence._id, { status: 'superseded' });
+            return { status: 'superseded' };
+        }
+        const clock = nextSyncClock(current.revision.clock);
+        const opId = crypto.randomUUID();
+        const hlc = `${Date.now()}:0:repair`;
+        const operation = args.operation ?? 'put';
+        const replacement = args.replacement;
+        const payload = operation === 'put' && replacement && typeof replacement === 'object' && !Array.isArray(replacement)
+            ? { ...replacement, [getPkField(evidence.table_name)]: evidence.pk, clock, hlc, op_id: opId } : replacement;
+        const result = await applyPush(ctx, { workspace_id: args.workspace_id, history_incarnation: historyIncarnation,
+            history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', stored_record_capability: 'stored-record-v1', workspace_item_capability: 'v1',
+            ops: [{ op_id: opId, table_name: evidence.table_name, pk: evidence.pk, operation, payload, clock, hlc, device_id: 'operator-repair' }] });
+        if (!result.results[0]?.success || !result.results[0]?.applied) throw new Error('Repair rejected; evidence remains unresolved');
+        await ctx.db.patch(evidence._id, { status: 'repaired', repaired_op_id: opId });
+        return { status: 'repaired', opId, serverVersion: result.serverVersion, historyIncarnation };
+    },
+});
+
+export const getHistoryIncarnation = query({
+    args: { workspace_id: v.id('workspaces') }, handler: async (ctx, args) => {
+        await requireSyncReadAccess(ctx, args.workspace_id);
+        return readHistory(ctx);
+    },
+});
+/** Host reader fallback. Verify the actual source, frozen scope and visibility;
+ * a caller-supplied key or bytes alone can never authorize a marker. */
+export const retainUnavailableRecord = mutation({
+    args: { workspace_id: v.id('workspaces'), ...historyArgs, source: v.union(v.literal('pull'), v.literal('snapshot')), record: v.any(), marker: v.any() },
+    handler: async (ctx, args) => {
+        const caller = await requireSyncReadAccess(ctx, args.workspace_id);
+        requireHistoryCapability(args);
+        const history = await fenceHistory(ctx, args.history_incarnation);
+        const marker = args.marker as Record<string, any>;
+        assertIdentity(marker.tableName, marker.pk);
+        let candidate: unknown, original: unknown;
+        if (args.source === 'pull') {
+            if (!Number.isSafeInteger(marker.serverVersion) || marker.serverVersion <= 0) throw new Error('Invalid source version');
+            const row = await ctx.db.query('change_log').withIndex('by_workspace_version', q => q.eq('workspace_id', args.workspace_id).eq('server_version', marker.serverVersion)).unique();
+            if (!row || !isChangeVisibleToUser(row, caller) || row.table_name !== marker.tableName || row.pk !== marker.pk || row.op !== marker.originalKind) throw new Error('Unavailable source mismatch');
+            candidate = toWireChange(row); original = row;
+        } else {
+            const session = await ctx.db.get(marker.snapshotId as Id<'sync_snapshot_sessions'>);
+            if (!session || session.workspace_id !== args.workspace_id || session.user_id !== caller || session.expires_at <= nowSec() || session.high_watermark !== marker.highWatermark || !session.tables.includes(marker.tableName)) throw new Error('Unavailable source mismatch');
+            const winner = await currentEvidenceCandidate(ctx, args.workspace_id, marker.tableName, marker.pk);
+            // A changed canonical key needs the frozen preimage, never a newly read replacement.
+            const selected = !winner || (winner.serverVersion ?? 0) > session.high_watermark
+                ? await readSnapshotHistory(ctx, args.workspace_id, marker.tableName, marker.pk, session.high_watermark) : winner;
+            if (!selected || selected.kind !== marker.originalKind || (marker.tableName === 'notifications' &&
+                (!(selected.source as MaterializedDoc)?.user_id || (selected.source as MaterializedDoc).user_id !== caller))) throw new Error('Unavailable source mismatch');
+            const { source, serverVersion: _version, ...wire } = selected;
+            candidate = wire; original = source;
+        }
+        if (stableJson(candidate) !== stableJson(args.record)) throw new Error('Unavailable original mismatch');
+        const reason = readDefect(candidate, args.source === 'snapshot');
+        if (!reason) throw new Error('Reader/provider validation disagreement; fail closed');
+        return { evidenceRef: await retainEvidence(ctx, args.workspace_id, history, marker.tableName, marker.pk, original, reason) };
     },
 });

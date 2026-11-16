@@ -23,12 +23,11 @@ import type {
 import { useRuntimeConfig } from '#imports';
 import { SYNC_HISTORY_GC_POLICY, canRunSyncHistoryGc } from '../../../utils/sync-history-gc-policy';
 import { createConvexSyncGatewayAdapter } from '../../sync/convex-sync-gateway-adapter';
-import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 
 const SYNC_MAINTENANCE_RETENTION_SECONDS = 7 * 24 * 60 * 60;
-let gatewayInstance: SyncGatewayAdapter | undefined;
+let gatewayInstance: ReturnType<typeof createConvexSyncGatewayAdapter> | undefined;
 
-function getGateway(): SyncGatewayAdapter {
+function getGateway(): ReturnType<typeof createConvexSyncGatewayAdapter> {
     gatewayInstance ??= createConvexSyncGatewayAdapter();
     return gatewayInstance;
 }
@@ -81,8 +80,12 @@ export const convexSyncAdminAdapter: ProviderAdminAdapter = {
                 convexUrl: config.sync.convexUrl,
             },
             warnings,
-            actions: canRunSyncHistoryGc()
-                ? [
+            actions: [
+                ...(['inspect', 'export', 'revalidate', 'repair'] as const).map(action => ({
+                    id: `sync.unavailable.${action}`, label: `${action[0]!.toUpperCase()}${action.slice(1)} unavailable sync records`,
+                    description: 'Inspect retained sync evidence or deliberately publish a validated repair.', danger: action === 'repair',
+                })),
+                ...(canRunSyncHistoryGc() ? [
                     {
                         id: 'sync.gc-change-log',
                         label: 'Clear old sync history',
@@ -96,7 +99,8 @@ export const convexSyncAdminAdapter: ProviderAdminAdapter = {
                         danger: true,
                     },
                 ]
-                : [],
+                : []),
+            ],
         };
     },
 
@@ -107,7 +111,7 @@ export const convexSyncAdminAdapter: ProviderAdminAdapter = {
     async runAction(
         event: H3Event,
         actionId: string,
-        _payload: Record<string, unknown> | undefined,
+        payload: Record<string, unknown> | undefined,
         ctx: ProviderActionContext
     ): Promise<unknown> {
         if (!ctx.session.workspace?.id) {
@@ -115,6 +119,13 @@ export const convexSyncAdminAdapter: ProviderAdminAdapter = {
                 statusCode: 400,
                 statusMessage: 'Workspace not resolved',
             });
+        }
+
+        const evidenceActions = { 'sync.unavailable.inspect': 'inspect', 'sync.unavailable.export': 'export',
+            'sync.unavailable.revalidate': 'revalidate', 'sync.unavailable.repair': 'repair' } as const;
+        if (Object.hasOwn(evidenceActions, actionId)) {
+            return getGateway().manageUnavailable(event, ctx.session.workspace.id,
+                evidenceActions[actionId as keyof typeof evidenceActions], payload);
         }
 
         if (

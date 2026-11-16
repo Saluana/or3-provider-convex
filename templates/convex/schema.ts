@@ -179,6 +179,25 @@ export default defineSchema({
     /**
      * Server version counter - atomic increment per workspace
      */
+    // Identity is initialized explicitly once, never minted by readers/startup.
+    sync_history: defineTable({
+        key: v.literal('history'), incarnation: v.string(), phase: v.union(v.literal('ready'), v.literal('resetting')),
+        attempt_id: v.string(), target: v.string(),
+    }).index('by_key', ['key']),
+    // No source foreign keys or GC: unresolved evidence outlives source history.
+    sync_unavailable_records: defineTable({
+        workspace_id: v.id('workspaces'), history_incarnation: v.string(), source_key: v.string(),
+        table_name: v.string(), pk: v.string(), reason: v.string(), status: v.string(),
+        source_id: v.string(), source_version: v.optional(v.number()), source_op_id: v.optional(v.string()),
+        source_clock: v.optional(v.number()), created_at: v.number(), chunks: v.number(),
+        repaired_op_id: v.optional(v.string()),
+        source_document_id: v.id('sync_unavailable_sources'), source_creation_time: v.optional(v.number()),
+    }).index('by_source', ['workspace_id', 'history_incarnation', 'source_key'])
+      .index('by_workspace', ['workspace_id']),
+    // Exact original user fields, with no wrapper/depth/size expansion. Original
+    // system ID/time live in the evidence header. No GC or public query surface.
+    sync_unavailable_sources: defineTable(v.any()),
+
     server_version_counter: defineTable({
         workspace_id: v.id('workspaces'),
         value: v.number(),
@@ -230,6 +249,22 @@ export default defineSchema({
         .index('by_workspace', ['workspace_id'])
         .index('by_workspace_expiry', ['workspace_id', 'expires_at'])
         .index('by_expires_at', ['expires_at']),
+
+    /** Continuation responses are immutable for the lifetime of their session.
+     * Split UTF-8 bytes keep each document below Convex's 1 MiB ceiling. */
+    sync_snapshot_pages: defineTable({
+        workspace_id: v.id('workspaces'),
+        session_id: v.id('sync_snapshot_sessions'),
+        table_index: v.number(),
+        after_pk: v.union(v.string(), v.null()),
+        page_size: v.number(),
+        chunk: v.number(),
+        data: v.bytes(),
+        expires_at: v.number(),
+    })
+        .index('by_page', ['session_id', 'table_index', 'after_pk', 'page_size', 'chunk'])
+        .index('by_workspace', ['workspace_id'])
+        .index('by_workspace_expiry', ['workspace_id', 'expires_at']),
 
     /**
      * Applied materialized pre-images used only when a later write occurs
