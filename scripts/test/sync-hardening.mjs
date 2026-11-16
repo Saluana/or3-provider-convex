@@ -76,6 +76,7 @@ export const invoke=internalMutation({args:{workspace:v.id('workspaces'),name:v.
 export const authored=internalMutation({args:{workspace:v.id('workspaces'),op:v.any()},handler:(ctx,args)=>applyServerAuthoredOp(ctx,args.workspace,args.op)});
 export const patch=internalMutation({args:{id:v.string(),value:v.any()},handler:(ctx,args)=>ctx.db.patch(args.id as any,args.value)});
 export const insert=internalMutation({args:{table:v.string(),value:v.any()},handler:(ctx,args)=>ctx.db.insert(args.table as any,args.value)});
+export const clearHistory=internalMutation({args:{},handler:async ctx=>{for(const row of await (ctx.db as any).query('sync_history').collect())await ctx.db.delete(row._id);}});
 export const poisonReceipt=internalMutation({args:{id:v.id('change_log')},handler:(ctx,args)=>ctx.db.patch(args.id,{request_fingerprint:undefined,payload:{value:1n}})});
 export const dropKey=internalMutation({args:{workspace:v.id('workspaces'),pk:v.string()},handler:async(ctx,args)=>{
  for(const row of await ctx.db.query('tombstones').withIndex('by_workspace_table_pk',q=>q.eq('workspace_id',args.workspace).eq('table_name','kv').eq('pk',args.pk)).collect())await ctx.db.delete(row._id);
@@ -279,6 +280,26 @@ try {
   }
   assert.equal(remaining.length,0);assert.equal((await client.query(anyApi.syncProbe.upgradeState,{workspace:f.workspace})).server_version_counter[0].value,5);
   await writeFile(join(evidence,'rc2-push-budgets.json'),JSON.stringify(metrics,null,2));
+ });
+ await check('RC2 lifecycle: initial upgrade preserves data and deploy/init/restart/GC never rotates', async () => {
+  const f=await client.mutation(anyApi.syncProbe.seed,{});
+  const dataBefore=await read(f);
+  await invoke(f,'snapshot',{page_size:1,tables:['kv']});
+  await invoke(f,'updateDeviceCursor',{device_id:'upgrade',last_seen_version:5});
+  await client.mutation(anyApi.syncProbe.clearHistory,{});
+  // Missing capability takes priority even while history is uninitialized.
+  await assert.rejects(invoke(f,'snapshot',{page_size:1,history_incarnation_capability:'old'}),e=>e.data?.code==='OR3_SYNC_UPDATE_REQUIRED');
+  const token=crypto.randomUUID();const init=await client.mutation(anyApi.syncHistory.initialize,{incarnation:token});
+  while(!(await client.mutation(anyApi.syncHistory.finishReplacement,{attempt_id:init.attemptId})).ready){}
+  const dataAfter=await read(f);
+  for(const table of ['kv','change_log','server_version_counter'])assert.deepEqual(dataAfter[table],dataBefore[table]);
+  assert.equal(dataAfter.sync_snapshot_sessions.length,0);assert.equal(dataAfter.device_cursors.length,0);
+  const again=await client.mutation(anyApi.syncHistory.initialize,{incarnation:crypto.randomUUID()});assert.equal(again.incarnation,token);
+  const deploy=Bun.spawn([process.execPath,join(provider,'node_modules/convex/bin/main.js'),'deploy','--yes','--typecheck','enable','--env-file',envPath],{cwd:root,env,stdout:Bun.file(join(root,'redeploy.log')),stderr:Bun.file(join(root,'redeploy-errors.log'))});assert.equal(await deploy.exited,0);
+  backend.kill('SIGKILL');await backend.exited;backend=start();await ready();
+  await invoke(f,'runWorkspaceGc',{retention_seconds:3600,batch_size:1});
+  assert.equal((await client.query(anyApi.syncHistory.status,{})).incarnation,token);
+  await writeFile(join(evidence,'rc2-stable-history.json'),JSON.stringify({token,preservedData:true,redeployRestartGc:true}));
  });
  await check('C2 incarnation: stale pushes and ACKs never mutate replacement and old snapshots reject', async () => {
   const f=await client.mutation(anyApi.syncProbe.seed,{});

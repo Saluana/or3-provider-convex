@@ -2280,8 +2280,8 @@ async function captureSnapshot(ctx: MutationCtx, args: {
     const tables = normalizeSnapshotTables(args.tables, Object.keys(TABLE_INDEX_MAP));
     const callerUserId = await requireSyncReadAccess(ctx, args.workspace_id);
 
-    const historyIncarnation = await readHistory(ctx);
     if (!retainedFiles) requireHistoryCapability(args);
+    const historyIncarnation = await readHistory(ctx);
     const expected = retainedFiles && args.history_incarnation === undefined
         ? (args.page_token ? decodeSnapshotCursor(args.page_token).historyIncarnation : null) : args.history_incarnation;
     if (!(expected === null && !args.page_token) && expected !== historyIncarnation) changedHistory(historyIncarnation);
