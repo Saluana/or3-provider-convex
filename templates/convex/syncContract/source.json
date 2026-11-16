@@ -1,9 +1,9 @@
 {
-  "hostCommit": "f0d0a393f8a140f196e1dccb26df9d169643adac",
+  "hostCommit": "08e19b677af0de3667b4dc4bc2db4d075ee7b995",
   "files": {
     "shared/sync/prepare-sync-write.ts": {
-      "source": "7a25ef53bf3049dc4d698846ff73634b7f79a90268af391f6c52848261f61596",
-      "generated": "03d35001700c4c0653f6b463003d826a08a563b14057fcc443f2fb543a8bb289"
+      "source": "b2f10e44e11897d33bec316b0248b32a254430e17d729e4c4cf6450948ecd216",
+      "generated": "648dc3b2c44298b46dc71e3ed015cab5811e8d99f04eafe7fd4d063b9679c688"
     },
     "shared/sync/schemas.ts": {
       "source": "a4c37e78996c449623fcfd86458ba2a424564df676489095a7eb2c06203b9542",
