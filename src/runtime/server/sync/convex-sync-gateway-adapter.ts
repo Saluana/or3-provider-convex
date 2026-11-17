@@ -1,3 +1,4 @@
+import { hasExplorerSemantics } from '../../shared/explorer-contract';
 /**
  * @module server/sync/gateway/impls/convex-sync-gateway-adapter.ts
  *
@@ -569,6 +570,13 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         } catch (error) { throwAsConvexServiceUnavailable(error, 'Evidence repair unavailable'); }
     }
 
+    async getExplorerCapability(event: H3Event, scope: { workspaceId: string }): Promise<'v1' | undefined> {
+        const client = await getSyncGatewayClient(event);
+        const capability = await client.query(api.sync.explorerCapability, { workspace_id: toWorkspaceId(scope.workspaceId) })
+            .catch(() => undefined);
+        return capability === 'v1' ? 'v1' : undefined;
+    }
+
     async getHistoryIncarnation(event: H3Event, scope: { workspaceId: string }): Promise<string> {
         const client = await getSyncGatewayClient(event);
         return await client.query(api.sync.getHistoryIncarnation, { workspace_id: toWorkspaceId(scope.workspaceId) });
@@ -576,11 +584,13 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 
     async pull(event: H3Event, input: PullRequest): Promise<PullResponse> {
         const client = await getSyncGatewayClient(event);
+        const explorerCapability = input.explorerCapability && await this.getExplorerCapability(event, input.scope);
         try {
             const result = await withConvexTransportRetry('sync.pullChecked', () =>
                 client.mutation(api.sync.pullChecked, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     workspace_item_capability: input.workspaceItemCapability,
+                    ...(explorerCapability ? { explorer_capability: explorerCapability } : {}),
                     history_incarnation: input.historyIncarnation,
                     history_incarnation_capability: 'incarnation-v1',
                     unavailable_record_capability: 'unavailable-v1',
@@ -615,11 +625,13 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 
     async snapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
         const client = await getSyncGatewayClient(event);
+        const explorerCapability = input.explorerCapability && await this.getExplorerCapability(event, input.scope);
         try {
             return await withConvexTransportRetry('sync.snapshot', () =>
                 client.mutation(api.sync.snapshot, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     workspace_item_capability: input.workspaceItemCapability,
+                    ...(explorerCapability ? { explorer_capability: explorerCapability } : {}),
                     history_incarnation: input.historyIncarnation,
                     history_incarnation_capability: 'incarnation-v1',
                     unavailable_record_capability: 'unavailable-v1',
@@ -637,11 +649,13 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
         // Backups always use a server-authenticated internal mutation. Browser
         // JWTs cannot select the retained-file snapshot mode.
         const client = await getSyncGcAdminClient(event);
+        const explorerCapability = input.explorerCapability && await this.getExplorerCapability(event, input.scope);
         try {
             return await withConvexTransportRetry('sync.backupSnapshot', () =>
                 client.mutation(internalApi.sync.backupSnapshot, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     workspace_item_capability: input.workspaceItemCapability,
+                    ...(explorerCapability ? { explorer_capability: explorerCapability } : {}),
                     history_incarnation: input.historyIncarnation,
                     history_incarnation_capability: 'incarnation-v1',
                     unavailable_record_capability: 'unavailable-v1',
@@ -678,11 +692,16 @@ export class ConvexSyncGatewayAdapter implements SyncGatewayAdapter {
 
     async push(event: H3Event, input: PushBatch): Promise<PushResult> {
         const client = await getSyncGatewayClient(event);
+        const explorerCapability = input.explorerCapability && await this.getExplorerCapability(event, input.scope);
+        if (!explorerCapability && input.ops.some(op => hasExplorerSemantics(op.tableName, op.pk, op.payload))) {
+            throw createError({ statusCode: 503, statusMessage: 'The deployed sync backend does not support workspace folders' });
+        }
         try {
             const result = await withConvexTransportRetry('sync.push', () =>
                 client.mutation(api.sync.push, {
                     workspace_id: toWorkspaceId(input.scope.workspaceId),
                     workspace_item_capability: input.workspaceItemCapability,
+                    ...(explorerCapability ? { explorer_capability: explorerCapability } : {}),
                     stored_record_capability: input.storedRecordCapability,
                     history_incarnation: input.historyIncarnation,
                     history_incarnation_capability: 'incarnation-v1',

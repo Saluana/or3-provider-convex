@@ -1,12 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createConvexSyncProvider } from '../convex-sync-provider';
-vi.mock('convex/server', () => ({ anyApi: { sync: Object.fromEntries(['watchChanges', 'pullChecked', 'snapshot', 'push', 'updateDeviceCursor'].map(name => [name, `sync.${name}`])) } }));
+vi.mock('convex/server', () => ({ anyApi: { sync: Object.fromEntries(['watchChanges', 'pullChecked', 'snapshot', 'push', 'updateDeviceCursor', 'explorerCapability'].map(name => [name, `sync.${name}`])) } }));
 const history = 'fixture-history';
 const empty = { historyIncarnation: history, changes: [], unavailable: [], nextCursor: 0, hasMore: false, oldestRetainedVersion: 1, requiresSnapshot: false };
 describe('Convex direct checked delivery', () => {
-    const mutation = vi.fn(), onUpdate = vi.fn();
-    const client = { mutation, onUpdate };
-    beforeEach(() => { vi.restoreAllMocks(); mutation.mockReset(); onUpdate.mockReset(); });
+    const mutation = vi.fn(), onUpdate = vi.fn(), query = vi.fn();
+    const client = { mutation, onUpdate, query };
+    beforeEach(() => { vi.restoreAllMocks(); mutation.mockReset(); onUpdate.mockReset(); query.mockReset(); });
+    it('only sends Explorer protocol fields after the deployed backend confirms support', async () => {
+        const request = { scope: { workspaceId: 'ws' }, cursor: 0, limit: 10 };
+        query.mockRejectedValueOnce(new Error('Could not find public function sync:explorerCapability'));
+        mutation.mockResolvedValue(empty);
+        await createConvexSyncProvider(client as any).pull(request);
+        expect(mutation.mock.lastCall?.[1]).not.toHaveProperty('explorer_capability');
+        query.mockResolvedValueOnce('v1');
+        await createConvexSyncProvider(client as any).pull(request);
+        expect(mutation.mock.lastCall?.[1]).toHaveProperty('explorer_capability', 'v1');
+    });
     it('preserves identity, unavailable markers and structured reset errors across transport', async () => {
         const provider = createConvexSyncProvider(client as any);
         const marker = { tableName: 'kv', pk: 'bad', originalKind: 'put', serverVersion: 2, evidenceRef: 'e1', reason: 'invalid_payload' };
@@ -40,7 +50,9 @@ describe('Convex direct checked delivery', () => {
         mutation.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
         const controller = new AbortController();
         const waiting = provider.pull({ scope: { workspaceId: 'ws' }, cursor: 0, limit: 10 }, { signal: controller.signal });
-        controller.abort(); await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
+        const cancelled = expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
+        await vi.waitFor(() => expect(mutation).toHaveBeenCalledTimes(1));
+        controller.abort(); await cancelled;
         finish(empty);
         vi.useFakeTimers();
         try {

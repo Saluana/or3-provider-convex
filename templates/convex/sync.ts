@@ -1,3 +1,4 @@
+import { EXPLORER_CAPABILITY, hasExplorerSemantics, explorerIdentity, explorerMutationIdentity, explorerIdentityMatches } from './explorerContract';
 import { isSyncUuid } from './syncAuthoring';
 import { historyArgs, readHistory, fenceHistory, changedHistory, requireHistoryCapability } from './syncHistory';
 import { assertIdentity, readDefect, retainEvidence } from './syncUnavailable';
@@ -523,8 +524,11 @@ async function resolveSnapshotKey(
     const uncertain = eligible.find(candidate => candidate.serverVersion === latestVersion &&
         (!Number.isSafeInteger(candidate.revision.clock) || candidate.revision.clock < 0 || !candidate.revision.hlc || !candidate.revision.opId));
     const winner = uncertain ?? resolveSnapshotWinner(eligible, highWatermark);
-    if (retainedFiles && tableName === 'file_meta' && winner?.kind === 'tombstone') {
+    const retainedFile = retainedFiles && tableName === 'file_meta';
+    const explorerRecord = tableName === 'posts' && hasExplorerSemantics(tableName, pk, row);
+    if ((retainedFile || explorerRecord) && winner?.kind === 'tombstone') {
         const retained = candidates.find(candidate => candidate.kind === 'tombstone' && candidate.payload &&
+            (retainedFile || explorerIdentity(pk, candidate.payload)) &&
             candidate.serverVersion !== undefined && candidate.serverVersion <= highWatermark &&
             compareSnapshotRevisions(candidate.revision, winner.revision) === 0);
         if (retained?.kind === 'tombstone') return {
@@ -532,7 +536,7 @@ async function resolveSnapshotKey(
         };
         // Old pre-images may lack retained metadata. Never label a concurrent
         // replacement as the original or silently omit an ambiguous original.
-        if (row && (row.server_version ?? 0) > highWatermark) throw new Error('Retained backup metadata is unavailable; retry the backup');
+        if (retainedFile && row && (row.server_version ?? 0) > highWatermark) throw new Error('Retained backup metadata is unavailable; retry the backup');
     }
     return winner;
 }
@@ -1251,7 +1255,7 @@ const pushArgs = {
         workspace_id: v.id('workspaces'),
         ...historyArgs,
         stored_record_capability: v.optional(v.string()),
-        workspace_item_capability: v.optional(v.literal('v1')),
+        workspace_item_capability: v.optional(v.literal('v1')), explorer_capability: v.optional(v.literal(EXPLORER_CAPABILITY)),
         ops: v.array(
             v.object({
                 op_id: v.string(),
@@ -1380,6 +1384,20 @@ async function applyPush(ctx: MutationCtx, args: Infer<typeof pushArgumentValida
             if (args.workspace_item_capability !== 'v1' &&
                 (hasWorkspaceItemSemantics(group.op.table_name, group.op.payload) || hasWorkspaceItemSemantics(group.op.table_name, sources.row))) {
                 requireWorkspaceItemCapability(args.workspace_item_capability);
+            }
+            const { table_name: tableName, pk, operation, payload } = group.op;
+            assertExplorerPage(args.explorer_capability, [{ tableName, pk, payload }, { tableName, pk, payload: sources.row }]);
+            const organization = explorerMutationIdentity(tableName, pk, operation, payload, sources.row);
+            let valid = organization.valid;
+            for (const identity of [organization.incoming, organization.existing]) {
+                if (!identity?.hashInput) continue;
+                const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity.hashInput));
+                const hex = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
+                valid &&= explorerIdentityMatches(pk, identity, hex);
+            }
+            if (!valid) {
+                failGroup(group.indices, group.op, 'Invalid workspace folder record');
+                continue;
             }
             remainingBytes -= (sources.row ? 6 * getConvexSize(sources.row as Value) : 0) +
                 (sources.tombstone ? 4 * getConvexSize(sources.tombstone) : 0) +
@@ -2217,7 +2235,7 @@ export const updateDeviceCursor = mutation({
 const snapshotArgs = {
     ...historyArgs,
     workspace_id: v.id('workspaces'),
-    workspace_item_capability: v.optional(v.literal('v1')),
+    workspace_item_capability: v.optional(v.literal('v1')), explorer_capability: v.optional(v.literal(EXPLORER_CAPABILITY)),
     page_size: v.number(),
     page_token: v.optional(v.string()),
     tables: v.optional(v.array(v.string())),
@@ -2260,6 +2278,7 @@ type SnapshotPageResponse = {
 async function captureSnapshot(ctx: MutationCtx, args: {
     workspace_id: Id<'workspaces'>;
     workspace_item_capability?: 'v1';
+    explorer_capability?: 'v1';
     history_incarnation?: string | null;
     history_incarnation_capability?: string;
     unavailable_record_capability?: string;
@@ -2340,6 +2359,7 @@ async function captureSnapshot(ctx: MutationCtx, args: {
             let offset = 0;
             for (const chunk of cached) { bytes.set(new Uint8Array(chunk.data), offset); offset += chunk.data.byteLength; }
             const response = JSON.parse(new TextDecoder().decode(bytes)) as SnapshotPageResponse;
+            assertExplorerPage(args.explorer_capability, response.items, response.unavailable);
             if (response.items.some((item) => item.kind === 'row' && hasWorkspaceItemSemantics(item.tableName, item.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
             return response;
         }
@@ -2471,6 +2491,7 @@ async function captureSnapshot(ctx: MutationCtx, args: {
         : null;
 
     if (items.some(item => item.kind === 'row' && hasWorkspaceItemSemantics(item.tableName, item.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
+    assertExplorerPage(args.explorer_capability, items, unavailable);
     const response: SnapshotPageResponse = {
         historyIncarnation,
         unavailable,
@@ -2802,7 +2823,24 @@ export const queryCanonicalStorage = query({
  * - Results are ordered by `server_version` ascending
  * - `tables` can be used to filter specific tables
  */
-const pullArgs = { workspace_id: v.id('workspaces'), workspace_item_capability: v.optional(v.literal('v1')),
+export const explorerCapability = query({
+    args: { workspace_id: v.id('workspaces') },
+    handler: async (ctx, args) => {
+        await requireSyncReadAccess(ctx, args.workspace_id);
+        return EXPLORER_CAPABILITY;
+    },
+});
+
+function assertExplorerPage(capability: unknown, ...pages: ReadonlyArray<
+    readonly { tableName: string; pk: string; payload?: unknown }[]
+>) {
+    if (capability !== EXPLORER_CAPABILITY && pages.some(page => page.some(row =>
+        hasExplorerSemantics(row.tableName, row.pk, row.payload)))) {
+        throw new ConvexError({ code: 'OR3_EXPLORER_UPDATE_REQUIRED', statusCode: 426,
+            requiredCapability: EXPLORER_CAPABILITY });
+    }
+}
+const pullArgs = { workspace_id: v.id('workspaces'), workspace_item_capability: v.optional(v.literal('v1')), explorer_capability: v.optional(v.literal(EXPLORER_CAPABILITY)),
     ...historyArgs, cursor: v.number(), limit: v.number(), tables: v.optional(v.array(v.string())) };
 /** Preserve the old query address solely as an explicit client update boundary. */
 export const pull = query({ args: pullArgs, handler: async (ctx, args) => {
@@ -2854,6 +2892,7 @@ export const pullChecked = mutation({
             nextCursor = row.server_version; consumed++;
         }
         if (changes.some(change => hasWorkspaceItemSemantics(change.tableName, change.payload))) requireWorkspaceItemCapability(args.workspace_item_capability);
+        assertExplorerPage(args.explorer_capability, changes, unavailable);
         const response = { historyIncarnation, changes, unavailable, nextCursor,
             hasMore: consumed < page.rows.length || page.hasMore, ...retention };
         PullResponseSchema.parse(response);
@@ -2863,7 +2902,7 @@ export const pullChecked = mutation({
 /** Reactive, content-free wakeups. Delivery MUST use the evidence-writing pull mutation. */
 export const watchChanges = query({
     args: { workspace_id: v.id('workspaces'), ...historyArgs,
-        workspace_item_capability: v.optional(v.literal('v1')), cursor: v.optional(v.number()), limit: v.optional(v.number()), tables: v.optional(v.array(v.string())) },
+        workspace_item_capability: v.optional(v.literal('v1')), explorer_capability: v.optional(v.literal(EXPLORER_CAPABILITY)), cursor: v.optional(v.number()), limit: v.optional(v.number()), tables: v.optional(v.array(v.string())) },
     handler: async (ctx, args) => {
         await requireSyncReadAccess(ctx, args.workspace_id);
         requireHistoryCapability(args);
@@ -3222,7 +3261,7 @@ export const repairUnavailable = internalMutation({
         const payload = operation === 'put' && replacement && typeof replacement === 'object' && !Array.isArray(replacement)
             ? { ...replacement, [getPkField(evidence.table_name)]: evidence.pk, clock, hlc, op_id: opId } : replacement;
         const result = await applyPush(ctx, { workspace_id: args.workspace_id, history_incarnation: historyIncarnation,
-            history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', stored_record_capability: 'stored-record-v1', workspace_item_capability: 'v1',
+            history_incarnation_capability: 'incarnation-v1', unavailable_record_capability: 'unavailable-v1', stored_record_capability: 'stored-record-v1', workspace_item_capability: 'v1', explorer_capability: EXPLORER_CAPABILITY,
             ops: [{ op_id: opId, table_name: evidence.table_name, pk: evidence.pk, operation, payload, clock, hlc, device_id: 'operator-repair' }] });
         if (!result.results[0]?.success || !result.results[0]?.applied) throw new Error('Repair rejected; evidence remains unresolved');
         await ctx.db.patch(evidence._id, { status: 'repaired', repaired_op_id: opId });

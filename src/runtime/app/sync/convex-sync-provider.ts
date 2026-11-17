@@ -1,3 +1,4 @@
+import { hasExplorerSemantics } from '../../shared/explorer-contract';
 /**
  * @module app/core/sync/providers/convex-sync-provider
  *
@@ -91,6 +92,19 @@ function assertHistoryResponse(value: { historyIncarnation?: unknown }) {
  * - Intended for deployments where the client can reach Convex directly
  */
 export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
+    const explorerReadiness = new Map<string, { expires: number; supported: Promise<boolean> }>();
+    function explorerSupported(workspaceId: string): Promise<boolean> {
+        const entry = explorerReadiness.get(workspaceId);
+        if (entry && entry.expires > Date.now()) return entry.supported;
+        // Let a deployment or session change take effect without a page reload.
+        if (explorerReadiness.size > 32) explorerReadiness.clear();
+        const supported = Promise.resolve().then(() => client.query(api.sync.explorerCapability, {
+            workspace_id: workspaceId as Id<'workspaces'>,
+        })).then(value => value === 'v1', () => false);
+        explorerReadiness.set(workspaceId, { expires: Date.now() + 30_000, supported });
+        return supported;
+    }
+
     const subscriptions = new Map<string, () => void>();
 
     const thisProvider: SyncProvider = {
@@ -118,6 +132,7 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
             const limit = options?.limit ?? 200;
             let unwatch: (() => void) | undefined;
 
+            const explorer = await explorerSupported(scope.workspaceId);
             let generation = 0;
             let delivering = false;
             let pending = false;
@@ -147,12 +162,14 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
                 return client.onUpdate(api.sync.watchChanges, {
                     workspace_id: scope.workspaceId as Id<'workspaces'>,
                     ...protocolArgs(options?.historyIncarnation),
+                    ...(explorer ? { explorer_capability: 'v1' as const } : {}),
                 }, () => {
                     if (disposed || generation !== watchGeneration) return;
                     pending = true; void deliver();
                 }, error => { console.error('[convex-sync] Watch failed:', error); });
             };
 
+            if (disposed) return () => {};
             unwatch = startWatch();
 
             const key = `${scope.workspaceId}:${tablesToWatch.join(',')}:${options?.cursor ?? 0}:${limit}`;
@@ -184,14 +201,19 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         },
 
         async pull(request: PullRequest, options?: SyncRequestOptions): Promise<PullResponse> {
-            const result = await requestWithSignal(() => client.mutation(api.sync.pullChecked, {
+            const result = await requestWithSignal(async () => {
+                const explorer = await explorerSupported(request.scope.workspaceId);
+                if (options?.signal?.aborted) throw new DOMException('Sync request aborted', 'AbortError');
+                return client.mutation(api.sync.pullChecked, {
                 workspace_id: request.scope.workspaceId as Id<'workspaces'>,
                 workspace_item_capability: 'v1',
+                ...(explorer ? { explorer_capability: 'v1' as const } : {}),
                 ...protocolArgs(request.historyIncarnation),
                 cursor: request.cursor,
                 limit: request.limit,
                 tables: request.tables,
-            }), options?.signal);
+                });
+            }, options?.signal);
 
             // Validate response to catch malformed server data
             assertHistoryResponse(result);
@@ -214,14 +236,19 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         },
 
         async snapshot(request: SnapshotRequest, options?: SyncRequestOptions): Promise<SnapshotResponse> {
-            const result = await requestWithSignal(() => client.mutation(api.sync.snapshot, {
+            const result = await requestWithSignal(async () => {
+                const explorer = await explorerSupported(request.scope.workspaceId);
+                if (options?.signal?.aborted) throw new DOMException('Sync request aborted', 'AbortError');
+                return client.mutation(api.sync.snapshot, {
                 workspace_id: request.scope.workspaceId as Id<'workspaces'>,
                 workspace_item_capability: 'v1',
+                ...(explorer ? { explorer_capability: 'v1' as const } : {}),
                 ...protocolArgs(request.historyIncarnation),
                 page_size: request.pageSize,
                 page_token: request.pageToken,
                 tables: request.tables,
-            }), options?.signal);
+                });
+            }, options?.signal);
 
             assertHistoryResponse(result);
             const parsed = SnapshotResponseSchema.safeParse(result);
@@ -234,9 +261,14 @@ export function createConvexSyncProvider(client: ConvexClient): SyncProvider {
         },
 
         async push(batch: PushBatch, options?: SyncRequestOptions): Promise<PushResult> {
+            const explorer = await explorerSupported(batch.scope.workspaceId);
+            if (!explorer && batch.ops.some(op => hasExplorerSemantics(op.tableName, op.pk, op.payload))) {
+                throw new Error('The deployed sync backend does not support workspace folders.');
+            }
             const result = await requestWithSignal(() => client.mutation(api.sync.push, {
                 workspace_id: batch.scope.workspaceId as Id<'workspaces'>,
                 workspace_item_capability: 'v1',
+                ...(explorer ? { explorer_capability: 'v1' as const } : {}),
                 stored_record_capability: 'stored-record-v1',
                 ...protocolArgs(batch.historyIncarnation),
                 ops: batch.ops.map((op: PendingOp) => ({

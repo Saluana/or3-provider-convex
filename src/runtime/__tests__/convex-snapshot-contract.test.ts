@@ -854,6 +854,38 @@ describe("Convex materialized snapshot contract", () => {
     expect(fixture.tables.change_log).toHaveLength(0);
   });
 
+  it('requires Explorer capability for writes, pull, and a new snapshot', async () => {
+    const fixture = createFixture('editor');
+    const viewer = createFixture('viewer');
+    const id = 'explorer-folder-0483f8df-cab7-4f34-aec5-32c325058bbd';
+    const push = (syncFunctions.push as RegisteredFunction)._handler;
+    const pull = (syncFunctions.pullChecked as RegisteredFunction)._handler;
+    const snapshot = (syncFunctions.snapshot as RegisteredFunction)._handler;
+    const support = (syncFunctions.explorerCapability as RegisteredFunction)._handler;
+    const target = { workspace_id: 'ws-1' };
+    const capable = { ...target, explorer_capability: 'v1' };
+    const payload = { id, title: '["files"]', post_type: 'or3:explorer-folder', deleted: false, clock: 1, created_at: 1, updated_at: 1,
+      content: JSON.stringify({ version: 1, scope: { kind: 'files' }, name: 'Research', parent_id: null }) };
+    const put = { op_id: uuidOp('explorer-first'), table_name: 'posts', pk: id, operation: 'put', payload,
+      clock: 1, hlc: '1:0:dev', device_id: 'dev' };
+    await expect(support(viewer.ctx, target)).resolves.toBe('v1');
+    await expect(push(fixture.ctx, { ...target, ops: [put] })).rejects.toThrow('OR3_EXPLORER_UPDATE_REQUIRED');
+    await expect(push(viewer.ctx, { ...capable, ops: [put] })).rejects.toThrow();
+    expect(fixture.tables.change_log).toHaveLength(0);
+    const saved = await push(fixture.ctx, { ...capable, ops: [put] });
+    expect(saved, JSON.stringify(saved)).toMatchObject({ results: [{ success: true, serverVersion: 6 }] });
+    const staleWriter = { ...put, op_id: uuidOp('explorer-legacy'), clock: 2, payload: { id, post_type: 'doc' } };
+    await expect(push(fixture.ctx, { ...target, ops: [staleWriter] })).rejects.toThrow('OR3_EXPLORER_UPDATE_REQUIRED');
+    expect(await push(fixture.ctx, { ...capable, ops: [staleWriter] })).toMatchObject({ results: [{ success: false }] });
+    const reader = { ...target, cursor: 5, limit: 10, tables: ['posts'] };
+    await expect(pull(fixture.ctx, reader)).rejects.toThrow('OR3_EXPLORER_UPDATE_REQUIRED');
+    expect(await pull(fixture.ctx, { ...reader, explorer_capability: 'v1' })).toMatchObject({ nextCursor: 6, changes: [{ pk: id }] });
+    await expect(snapshot(fixture.ctx, { ...target, page_size: 100 })).rejects.toThrow('OR3_EXPLORER_UPDATE_REQUIRED');
+    expect(await snapshot(fixture.ctx, { ...capable, page_size: 100 })).toMatchObject({
+      items: expect.arrayContaining([expect.objectContaining({ pk: id, kind: 'row' })]),
+    });
+  });
+
   it("fresh-device snapshot remains complete after verified retention deletes old history", async () => {
     const fixture = createFixture();
     fixture.tables.device_cursors.push({

@@ -3,6 +3,7 @@ import { MAX_SYNC_SNAPSHOT_TOKEN_LENGTH, compareSyncTuple } from './syncContract
 import type { MutationCtx } from './_generated/server';
 import type { Id, TableNames } from './_generated/dataModel';
 import { getPkField } from './tableMetadata';
+import { explorerIdentity } from './explorerContract';
 const nowSec = (): number => Math.floor(Date.now() / 1000);
 export const SNAPSHOT_TTL_SECONDS = 60 * 60;
 
@@ -201,7 +202,8 @@ export function materializedSnapshotCandidate(
             tableName,
             pk,
             revision,
-            ...(tableName === 'file_meta' ? { payload: snapshotPayloadFromDoc(doc, tableName, getPkField(tableName), pk, revision) } : {}),
+            ...(tableName === 'file_meta' || tableName === 'posts' && explorerIdentity(pk, doc)
+                ? { payload: snapshotPayloadFromDoc(doc, tableName, getPkField(tableName), pk, revision) } : {}),
             serverDeletedAt:
                 typeof doc.deleted_at === 'number'
                     ? doc.deleted_at

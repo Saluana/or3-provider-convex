@@ -887,3 +887,14 @@ certify the archive. Hosted replacement remains unqualified until those external
 controls and exact import codecs are demonstrated. See the official
 [import guide](https://docs.convex.dev/database/import-export/import) and
 [CLI reference](https://docs.convex.dev/cli/reference/import).
+
+## Workspace folder compatibility
+
+The deployed templates expose `sync:explorerCapability` to authorized workspace
+members. Update the backend templates together with the provider and host. The
+direct client and gateway probe the backend before sending
+`explorer_capability: 'v1'`. A provider package connected to an older deployment
+leaves folder organization unavailable. The checked pull and snapshot refuse an
+incompatible page before a cursor can advance. The canonical push verifies the
+folder shape, scope, placement identity, and write authority. The folder UI
+and local migration live in `or3-chat`.
